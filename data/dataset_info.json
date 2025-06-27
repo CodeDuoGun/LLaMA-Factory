@@ -714,5 +714,8 @@
       "prompt": "content"
     },
     "folder": "python"
+  },
+  "medical": {
+    "file_name": "medical_case.json"
   }
 }
