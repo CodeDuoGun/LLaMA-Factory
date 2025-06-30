@@ -5,7 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
-
+logs/*
+TCM_SD_train_dev/*
 # Distribution / packaging
 .Python
 build/
