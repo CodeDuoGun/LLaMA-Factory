@@ -20,7 +20,7 @@ def preprocess(example):
     )
 
 # 使用你的 Qwen tokenizer
-model_name = "Qwen/Qwen2.5-32B-Instruct"
+model_name = "Qwen/Qwen2.5-14B"
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
 # 加载和处理数据集
