@@ -26,6 +26,7 @@ def convert_case_to_sample(case):
 #         "causes": "从【病因病机】获取内容",
 #     }
 # ]
+samples = []
 
 def call_llm_api(prompt, doc):
     """"""
