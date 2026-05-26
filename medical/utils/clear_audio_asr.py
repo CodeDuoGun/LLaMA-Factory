@@ -133,7 +133,7 @@ def call_llm_api(data, record_info):
 - 医生问题后必须标注意图标签。
 - 保持对话的逻辑连贯性，不要遗漏关键诊疗信息。
 """
-    client = OpenAI(api_key="sk-124584cb3b4646d4a97cdaa19f516cbc", base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",)
+    client = OpenAI(api_key="", base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",)
     content = ""
     response = client.chat.completions.create(
         model="qwen-plus", 

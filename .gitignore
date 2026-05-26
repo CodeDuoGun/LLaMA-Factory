@@ -180,3 +180,4 @@ generated_predictions.jsonl
 predictions_score.json
 
 *.DS_Store
+medical/data/AI医生分身问诊数据-吴卫平_20260525142743.json
