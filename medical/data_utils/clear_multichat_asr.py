@@ -28,7 +28,6 @@ def get_record_info_by_id(record_id:str):
         if str(item["id"]) == record_id:
             record_info = item
             break
-        
     record_text = ",".join([f"{k}:{v}" for k, v in record_info.items() if k in ("is_first", "patient_sex", "patient_age", "patient_height", "patient_weight", "doc_ass_stu_appeal","new_medical_history")])
     print(f"recordtext {record_text[:100]}")
     return record_text, record_info.get("is_first")
@@ -110,6 +109,9 @@ def call_llm_api(data, record_info):
 """
     prompt = f"""你是一位资深中医知识结构化专家，擅长从医患对话中提取结构化信息，用于构建中医智能诊断大模型。
 
+## 背景
+视频通话场景下的医患对话内容的清洗。
+
 ## 任务
 请对以下医患对话进行清洗和结构化处理，返回清洗后的医患对话内容。
 
@@ -121,7 +123,7 @@ def call_llm_api(data, record_info):
 4. **去除无意义语气词**：去掉"嗯嗯嗯"、"啊啊啊啊"、"哦哦哦"、"好好好"、以及各类无意义的语气词和停顿。
 5. **统一专业术语**：出现的报告名称、指标名称、药物名称、检查名称、治疗名称等，如果患者病历中有提及，必须严格和病历内容保持一致，纠正ASR错误。
 6. **标注医生问题意图**：对于医生的每个问题（非回答），在问题后附加且仅加一个意图标签。意图标签可选范围为：{intent_labels}。格式示例：医生：您最近睡眠怎么样？[意图: 睡眠]
-7. **删除**
+7. **删除无意义的对话**: 注意对话开头通常以打招呼开头，删除对话开头的干扰内容，如上一次的问诊内容，或者医生问候患者的话术等。
 
 ## 患者病历信息
 {record_info}
@@ -133,8 +135,9 @@ def call_llm_api(data, record_info):
 - 仅输出清洗后的医患对话内容json格式，无需额外解释。
 - 医生问题后必须标注意图标签。
 - 保持对话的逻辑连贯性，不要遗漏关键诊疗信息。
+- 如果无任何有效问诊对话内容，返回空字典。
 """
-    client = OpenAI(api_key="", base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",)
+    client = OpenAI(api_key=os.getenv("DASHSCOPE_API_KEY"), base_url=os.getenv("DASHSCOPE_BASE_URL"),)
     content = ""
     response = client.chat.completions.create(
         model="qwen-plus", 

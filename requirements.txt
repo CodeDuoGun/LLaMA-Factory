@@ -1,0 +1,10 @@
+openai
+dashscope
+qiniu
+python-dotenv
+loguru
+ffmpeg-python
+sqlalchemy
+pydantic-settings
+dynaconf
+pymysql
