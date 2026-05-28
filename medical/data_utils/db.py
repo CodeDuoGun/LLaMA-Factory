@@ -3,11 +3,6 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-# Base 必须在最前面定义，audio_db_schema 依赖它
-from sqlalchemy.ext.declarative import declarative_base
-Base = declarative_base()
-
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from medical.data_utils.config import config
@@ -58,6 +53,52 @@ def insert_audio_label(audio_file: str, aduio_json: dict = None) -> bool:
         return False
     finally:
         db.close()
+
+
+def get_all_audio_labels(limit: int = None, offset: int = 0) -> list:
+    """查询 audio_lable 表所有记录，可选分页"""
+    from medical.data_utils.audio_db_schema import AudioLable
+    db = SessionLocal()
+    try:
+        query = db.query(AudioLable).offset(offset)
+        if limit is not None:
+            query = query.limit(limit)
+        return query.all()
+    finally:
+        db.close()
+
+
+def count_audio_labels() -> int:
+    """查询 audio_lable 表总记录数"""
+    from medical.data_utils.audio_db_schema import AudioLable
+    db = SessionLocal()
+    try:
+        return db.query(AudioLable).count()
+    finally:
+        db.close()
+
+
+def fix_audio_file_prefix(start_id: int = 1305) -> int:
+    """将 audio_file 字段从 start_id 到最新记录中缺少前缀的补上"""
+    from medical.data_utils.audio_db_schema import AudioLable
+    PREFIX = "https://nlp-audio.sihuiyiliao.com/"
+    db = SessionLocal()
+    updated = 0
+    try:
+        records = db.query(AudioLable).filter(AudioLable.id >= start_id).all()
+        for r in records:
+            if r.audio_file and not r.audio_file.startswith("http"):
+                r.audio_file = PREFIX + r.audio_file
+                updated += 1
+        db.commit()
+        return updated
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[DB] 修复 audio_file 前缀失败: {e}")
+        return updated
+    finally:
+        db.close()
+
 
 
 def check_database_connection():

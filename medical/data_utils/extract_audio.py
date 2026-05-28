@@ -37,29 +37,40 @@ QINIU_KEY_PREFIX = "tcm/"
 
 
 
-def download_video(url: str, save_path) -> str:
+def download_video(url: str, save_path, max_retries: int = 3) -> str:
     """
-    从 HTTP(S) URL 下载视频文件到本地路径。
+    从 HTTP(S) URL 下载视频文件到本地路径，支持重试。
 
     Args:
-        url:       视频的公网 URL
-        save_path: 本地保存路径（str 或 Path）
+        url:        视频的公网 URL
+        save_path:  本地保存路径（str 或 Path）
+        max_retries: 最大重试次数
 
     Returns:
         保存文件的绝对路径字符串
     """
+    import time
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    logger.debug(f"[下载视频] {url}  ->  {save_path.name}")
-    with requests.get(url, stream=True, timeout=120) as resp:
-        resp.raise_for_status()
-        with open(save_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                f.write(chunk)
-
-    logger.debug(f"[下载完成] {save_path.name}  ({save_path.stat().st_size / 1024 / 1024:.1f} MB)")
-    return str(save_path.resolve())
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.debug(f"[下载视频] {url}  ->  {save_path.name}  (attempt {attempt})")
+            with requests.get(url, stream=True, timeout=(30, 600)) as resp:
+                resp.raise_for_status()
+                with open(save_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        f.write(chunk)
+            size_mb = save_path.stat().st_size / 1024 / 1024
+            logger.debug(f"[下载完成] {save_path.name}  ({size_mb:.1f} MB)")
+            return str(save_path.resolve())
+        except Exception as e:
+            last_err = e
+            logger.warning(f"[下载失败] attempt {attempt}/{max_retries}: {e}")
+            if attempt < max_retries:
+                time.sleep(5)
+    raise RuntimeError(f"视频下载失败（已重试 {max_retries} 次）: {last_err}")
 
 
 def extract_wav_16k(input_path: str, output_path: str = None) -> str:
@@ -249,7 +260,7 @@ def batch_process(video_files: dict) -> list:
                     json_ret = qiniu.upload(str(json_path), key=json_key, overwrite=True)
                     json_url = json_ret["url"]
 
-                    insert_audio_label(audio_key, json_data)
+                    insert_audio_label(f"https://nlp-audio.sihuiyiliao.com/{audio_key}", json_data)
                     logger.debug(f"[DB] 已插入 audio_lable: {audio_key}")
 
                     results.append({

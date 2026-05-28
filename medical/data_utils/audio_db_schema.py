@@ -1,7 +1,9 @@
 """app/models/audio_label.py - 音频标签模型"""
 from sqlalchemy import Column, Integer, String, Boolean, TIMESTAMP, text
 from sqlalchemy.dialects.mysql import JSON
-from medical.data_utils.db import Base
+from sqlalchemy.orm import declarative_base
+
+Base = declarative_base()
 
 
 class AudioLable(Base):
