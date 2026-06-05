@@ -747,7 +747,22 @@
     "folder": "python"
   },
   "identity_wuweiping": {
-  "file_name": "identity_wuweiping.json",
-  "formatting": "alpaca"
-}
+    "file_name": "identity_wuweiping.json",
+    "formatting": "alpaca"
+  },
+  "medical_consult": {
+    "file_name": "medical_consult_sharegpt.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "system": "system"
+    },
+    "tags": {
+      "role_tag": "from",
+      "content_tag": "value",
+      "user_tag": "human",
+      "assistant_tag": "gpt"
+    },
+    "description": "中医玫瑰痤疮多轮问诊数据集，含初诊210条、复诊644条，医生只问诊不给诊断。"
+  }
 }

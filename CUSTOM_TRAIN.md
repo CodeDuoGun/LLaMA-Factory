@@ -76,4 +76,8 @@ asr 识别错误数据id：587、255、455、825（日语）、858无asr结果�
 3、speaker name
 
 二次清洗：
-1、医患对话一问一答、偶数、对话合并 进度到（ 744057 ）
+1、医患对话一问一答、偶数、对话合并 进度到（ 743524 ）
+4、
+
+# sft train
+llamafactory-cli train examples/train_lora/qwen3_lora_sft.yaml 
