@@ -12,7 +12,7 @@ llamafactory-cli train \
     --finetuning_type lora \
     --lora_rank 8 \
     --lora_target all \
-    --dataset identity,alpaca_en_demo \
+    --dataset identity_wuweiping,alpaca_en_demo \
     --template qwen3_nothink \
     --cutoff_len 2048 \
     --max_samples 1000 \
