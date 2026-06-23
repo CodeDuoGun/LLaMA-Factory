@@ -62,6 +62,14 @@ def create_ui(demo_mode: bool = False) -> "gr.Blocks":
             with gr.Tab("Export"):
                 engine.manager.add_elems("export", create_export_tab(engine))
 
+            with gr.Tab("Prescription RAG"):
+                try:
+                    from medical.rag.es.prescription_rag_ui import create_prescription_rag_tab
+
+                    engine.manager.add_elems("prescription_rag", create_prescription_rag_tab())
+                except Exception as err:
+                    gr.Markdown(f"Prescription RAG 页面加载失败：`{err}`")
+
         engine.manager.add_elems("footer", create_footer())
         demo.load(engine.resume, outputs=engine.manager.get_elem_list(), concurrency_limit=None)
         lang.change(engine.change_lang, [lang], engine.manager.get_elem_list(), queue=False)

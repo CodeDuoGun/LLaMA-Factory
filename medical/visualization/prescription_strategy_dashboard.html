@@ -1,0 +1,934 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>吴卫平医生开方规律分析</title>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --line: #d9dee7;
+        --text: #1d2430;
+        --muted: #647082;
+        --accent: #0f766e;
+        --accent-soft: #d9f1ee;
+        --warn: #b45309;
+        --warn-soft: #f9e7c6;
+        --blue: #2563eb;
+        --blue-soft: #dbe7ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+          "Microsoft YaHei", sans-serif;
+        letter-spacing: 0;
+      }
+
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+
+      .app {
+        min-height: 100vh;
+        display: grid;
+        grid-template-columns: 320px minmax(0, 1fr);
+      }
+
+      aside {
+        border-right: 1px solid var(--line);
+        background: var(--panel);
+        min-height: 100vh;
+        padding: 18px;
+        position: sticky;
+        top: 0;
+        align-self: start;
+      }
+
+      main {
+        min-width: 0;
+        padding: 22px 28px 36px;
+      }
+
+      .brand {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        margin-bottom: 16px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 20px;
+        line-height: 1.3;
+      }
+
+      .subtle {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .search {
+        width: 100%;
+        height: 38px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0 10px;
+        outline: none;
+        background: #fff;
+      }
+
+      .search:focus {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+
+      .disease-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 14px;
+        max-height: calc(100vh - 120px);
+        overflow: auto;
+        padding-right: 4px;
+      }
+
+      .disease-item {
+        width: 100%;
+        min-height: 54px;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text);
+        text-align: left;
+        padding: 9px 10px;
+        cursor: pointer;
+        display: grid;
+        gap: 3px;
+      }
+
+      .disease-item:hover {
+        background: #f1f4f8;
+      }
+
+      .disease-item.active {
+        background: var(--accent-soft);
+        border-color: #8fd7ce;
+      }
+
+      .disease-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+      }
+
+      .disease-name {
+        font-weight: 700;
+      }
+
+      .count {
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .topbar {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: flex-start;
+        margin-bottom: 18px;
+      }
+
+      .title-block h2 {
+        margin: 0 0 6px;
+        font-size: 26px;
+        line-height: 1.2;
+      }
+
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+
+      .select {
+        height: 36px;
+        min-width: 180px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0 9px;
+        background: #fff;
+        color: var(--text);
+      }
+
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(130px, 1fr));
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+
+      .metric,
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+      }
+
+      .metric {
+        padding: 14px;
+      }
+
+      .metric-label {
+        color: var(--muted);
+        font-size: 12px;
+        margin-bottom: 8px;
+      }
+
+      .metric-value {
+        font-size: 24px;
+        font-weight: 760;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .panel {
+        min-width: 0;
+        overflow: hidden;
+      }
+
+      .panel.full {
+        grid-column: 1 / -1;
+      }
+
+      .panel-header {
+        min-height: 48px;
+        padding: 13px 15px;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .panel-title {
+        margin: 0;
+        font-size: 15px;
+        line-height: 1.2;
+      }
+
+      .panel-body {
+        padding: 14px 15px 16px;
+      }
+
+      .bar-list {
+        display: grid;
+        gap: 9px;
+      }
+
+      .template-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .template-card {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: #fff;
+        overflow: hidden;
+      }
+
+      .template-toggle {
+        width: 100%;
+        border: 0;
+        background: #fff;
+        color: var(--text);
+        padding: 10px;
+        cursor: pointer;
+        display: grid;
+        grid-template-columns: minmax(86px, 150px) minmax(0, 1fr) 58px;
+        gap: 10px;
+        align-items: center;
+        text-align: left;
+      }
+
+      .template-toggle:hover {
+        background: #f7f9fb;
+      }
+
+      .template-drugs {
+        border-top: 1px solid var(--line);
+        padding: 10px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 7px;
+        background: #fbfcfd;
+      }
+
+      .template-drug {
+        display: inline-flex;
+        min-height: 26px;
+        align-items: center;
+        border-radius: 999px;
+        background: var(--blue-soft);
+        color: #1847a7;
+        padding: 3px 8px;
+        font-size: 12px;
+      }
+
+      .bar-row {
+        display: grid;
+        grid-template-columns: minmax(86px, 150px) minmax(0, 1fr) 58px;
+        gap: 10px;
+        align-items: center;
+        min-height: 26px;
+        font-size: 13px;
+      }
+
+      .bar-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .track {
+        height: 9px;
+        border-radius: 999px;
+        background: #edf1f5;
+        overflow: hidden;
+      }
+
+      .fill {
+        height: 100%;
+        border-radius: inherit;
+        background: var(--accent);
+      }
+
+      .fill.blue {
+        background: var(--blue);
+      }
+
+      .fill.warn {
+        background: var(--warn);
+      }
+
+      .rate {
+        color: var(--muted);
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .tag-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        min-height: 28px;
+        border-radius: 999px;
+        padding: 4px 9px;
+        background: #eef2f7;
+        color: #2f3a4a;
+        font-size: 13px;
+      }
+
+      .tag.accent {
+        background: var(--accent-soft);
+        color: #0b5f59;
+      }
+
+      .tag.warn {
+        background: var(--warn-soft);
+        color: #7a3d04;
+      }
+
+      .tag.blue {
+        background: var(--blue-soft);
+        color: #1847a7;
+      }
+
+      .case-list {
+        display: grid;
+        gap: 10px;
+        max-height: 560px;
+        overflow: auto;
+      }
+
+      .case-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        overflow: hidden;
+      }
+
+      .case-card-head {
+        min-height: 38px;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        background: #fbfcfd;
+      }
+
+      .case-id {
+        font-weight: 700;
+      }
+
+      .case-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        padding: 12px;
+      }
+
+      .case-field {
+        min-width: 0;
+        display: grid;
+        gap: 5px;
+      }
+
+      .case-field.wide {
+        grid-column: span 2;
+      }
+
+      .case-field.full {
+        grid-column: 1 / -1;
+      }
+
+      .case-label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .case-text {
+        line-height: 1.55;
+        color: var(--text);
+        overflow-wrap: anywhere;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+
+      th,
+      td {
+        border-bottom: 1px solid var(--line);
+        padding: 10px 8px;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        background: #fafbfc;
+        position: sticky;
+        top: 0;
+      }
+
+      .table-wrap {
+        max-height: 460px;
+        overflow: auto;
+      }
+
+      .empty,
+      .error {
+        padding: 24px;
+        color: var(--muted);
+      }
+
+      .error {
+        color: #991b1b;
+      }
+
+      @media (max-width: 980px) {
+        .app {
+          grid-template-columns: 1fr;
+        }
+
+        aside {
+          min-height: auto;
+          position: relative;
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+
+        .disease-list {
+          max-height: 260px;
+        }
+
+        main {
+          padding: 18px;
+        }
+
+        .topbar {
+          flex-direction: column;
+        }
+
+        .controls {
+          justify-content: flex-start;
+        }
+
+        .metrics,
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        .bar-row {
+          grid-template-columns: minmax(72px, 110px) minmax(0, 1fr) 52px;
+        }
+
+        .case-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .case-field.wide,
+        .case-field.full {
+          grid-column: auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <aside>
+        <div class="brand">
+          <h1>开方规律分析</h1>
+          <div class="subtle" id="globalMeta">正在加载数据</div>
+        </div>
+        <input class="search" id="searchInput" type="search" placeholder="搜索疾病" />
+        <div class="disease-list" id="diseaseList"></div>
+      </aside>
+      <main>
+        <div id="content" class="empty">正在加载分析结果...</div>
+      </main>
+    </div>
+
+    <script>
+      const state = {
+        data: null,
+        selectedDisease: "",
+        selectedSyndrome: "__all__",
+        search: "",
+      };
+
+      const fmtPct = (value) => `${Math.round((Number(value) || 0) * 100)}%`;
+      const clip = (value, max = 120) => {
+        const text = String(value || "").trim();
+        return text.length > max ? `${text.slice(0, max)}...` : text;
+      };
+      const clinicalText = (info) => {
+        const parts = [
+          info?.doctor_symptom_summary,
+          info?.patient_symptoms,
+          info?.present_history,
+        ].filter(Boolean);
+        return parts.join("；");
+      };
+      const examText = (info) => {
+        const parts = [];
+        if (info?.inspection_abnormalities) parts.push(info.inspection_abnormalities);
+        if (info?.exam_findings) parts.push(info.exam_findings);
+        if (info?.report_image_count) parts.push(`报告图片 ${info.report_image_count} 张`);
+        if (info?.face_tongue_image_count) parts.push(`面舌图片 ${info.face_tongue_image_count} 张`);
+        return parts.join("；");
+      };
+      const tongueFaceText = (info) => {
+        const parts = [];
+        if (info?.tongue_face_findings) parts.push(info.tongue_face_findings);
+        if (info?.admin_face_describe) parts.push(info.admin_face_describe);
+        if (info?.face_tongue_image_count) parts.push(`面舌图片 ${info.face_tongue_image_count} 张`);
+        if (Array.isArray(info?.face_tongue_images) && info.face_tongue_images.length) {
+          parts.push(`面舌图片 ${info.face_tongue_images.length} 张`);
+        }
+        return parts.join("；") || "未记录";
+      };
+      const symptomChangeText = (info) => {
+        if (info?.symptom_changes) return info.symptom_changes;
+        if (info?.treatment_response) return info.treatment_response;
+        const text = [info?.present_history, info?.doctor_symptom_summary, info?.patient_symptoms].filter(Boolean).join("。");
+        const changes = text
+          .split(/[。；;，,\n]/)
+          .map((item) => item.trim())
+          .filter((item) => /(好转|缓解|减轻|减少|改善|加重|新增|新发|出现|仍有|尚有|反复|复发|消失|无新发|无明显不适|效果不佳)/.test(item));
+        return changes.length ? changes.slice(0, 4).join("；") : "未记录明确变化";
+      };
+      const prescriptionText = (item) =>
+        (item.drugs || [])
+          .slice(0, 24)
+          .map((drug) => {
+            const dose = drug.dose ?? drug.quantity ?? "";
+            const unit = drug.unit || "";
+            return `${drug.drug_name || ""}${dose}${unit}`;
+          })
+          .filter(Boolean)
+          .join("、");
+      const esc = (value) =>
+        String(value ?? "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;");
+
+      function itemsForCurrentScope() {
+        const disease = currentDisease();
+        if (!disease) return null;
+        if (state.selectedSyndrome === "__all__") return disease;
+        return disease.syndrome_summary.find((item) => item.diagnosis_syndrome === state.selectedSyndrome) || disease;
+      }
+
+      function currentDisease() {
+        return state.data?.disease_summary.find((item) => (item.diagnosis_name || "") === state.selectedDisease);
+      }
+
+      function scopedDetails() {
+        const disease = currentDisease();
+        if (!disease) return [];
+        return state.data.template_match_details.filter((item) => {
+          if (item.diagnosis_name !== disease.diagnosis_name) return false;
+          return state.selectedSyndrome === "__all__" || item.diagnosis_syndrome === state.selectedSyndrome;
+        });
+      }
+
+      function barList(items, labelKey, options = {}) {
+        const color = options.color || "";
+        const max = Math.max(...items.map((item) => item.rate || 0), 0.01);
+        if (!items.length) return '<div class="empty">暂无数据</div>';
+        return `
+          <div class="bar-list">
+            ${items
+              .map((item) => {
+                const width = Math.max(3, ((item.rate || 0) / max) * 100);
+                return `
+                  <div class="bar-row" title="${esc(item[labelKey])}">
+                    <div class="bar-label">${esc(item[labelKey])}</div>
+                    <div class="track"><div class="fill ${color}" style="width:${width}%"></div></div>
+                    <div class="rate">${esc(item.count)} · ${fmtPct(item.rate)}</div>
+                  </div>
+                `;
+              })
+              .join("")}
+          </div>
+        `;
+      }
+
+      function templateList(items) {
+        if (!items.length) return '<div class="empty">暂无数据</div>';
+        const max = Math.max(...items.map((item) => item.rate || 0), 0.01);
+        return `
+          <div class="template-list">
+            ${items
+              .map((item, index) => {
+                const width = Math.max(3, ((item.rate || 0) / max) * 100);
+                const drugs = item.drugs || [];
+                return `
+                  <div class="template-card">
+                    <button class="template-toggle" type="button" data-template-index="${index}" title="${esc(item.template_name)}">
+                      <div class="bar-label">${esc(item.template_name)}</div>
+                      <div class="track"><div class="fill blue" style="width:${width}%"></div></div>
+                      <div class="rate">${esc(item.count)} · ${fmtPct(item.rate)}</div>
+                    </button>
+                    <div class="template-drugs" data-template-detail="${index}" hidden>
+                      ${
+                        drugs.length
+                          ? drugs
+                              .map((drug) => {
+                                const quantity = drug.quantity ?? drug.dose ?? "";
+                                const unit = drug.unit || "";
+                                return `<span class="template-drug">${esc(drug.drug_name)} ${esc(quantity)}${esc(unit)}</span>`;
+                              })
+                              .join("")
+                          : '<span class="subtle">暂无模板处方明细</span>'
+                      }
+                    </div>
+                  </div>
+                `;
+              })
+              .join("")}
+          </div>
+        `;
+      }
+
+      function tags(items, key, cls = "") {
+        if (!items.length) return '<div class="empty">暂无数据</div>';
+        return `<div class="tag-list">${items
+          .map((item) => `<span class="tag ${cls}">${esc(item[key])}<span class="subtle">${fmtPct(item.rate)}</span></span>`)
+          .join("")}</div>`;
+      }
+
+      function sameScopeClinicalCards(items) {
+        if (!items.length) return '<div class="empty">暂无同病同证处方单</div>';
+        return `
+          <div class="case-list">
+            ${items
+              .map((item) => {
+                const info = item.clinical_info || {};
+                return `
+                  <article class="case-card">
+                    <div class="case-card-head">
+                      <div class="case-id">问诊单 ${esc(item.inquiry_id)} · 处方 ${esc(item.prescription_order_id || "")}</div>
+                      <div class="subtle">${esc(item.diagnosis_result || item.diagnosis_name || "")} · ${esc(item.diagnosis_syndrome || "")} · ${esc(item.matched_template_name || "未匹配模板")}</div>
+                    </div>
+                    <div class="case-grid">
+                      <div class="case-field wide">
+                        <div class="case-label">临床症状</div>
+                        <div class="case-text" title="${esc(clinicalText(info))}">${esc(clip(clinicalText(info), 220) || "未记录")}</div>
+                      </div>
+                      <div class="case-field">
+                        <div class="case-label">症状变化</div>
+                        <div class="case-text" title="${esc(symptomChangeText(info))}">${esc(clip(symptomChangeText(info), 140))}</div>
+                      </div>
+                      <div class="case-field">
+                        <div class="case-label">舌面信息</div>
+                        <div class="case-text" title="${esc(tongueFaceText(info))}">${esc(clip(tongueFaceText(info), 140))}</div>
+                      </div>
+                      <div class="case-field wide">
+                        <div class="case-label">检查所见</div>
+                        <div class="case-text" title="${esc(examText(info))}">${esc(clip(examText(info), 220) || "未记录")}</div>
+                      </div>
+                      <div class="case-field full">
+                        <div class="case-label">内服处方</div>
+                        <div class="case-text" title="${esc(prescriptionText(item))}">${esc(clip(prescriptionText(item), 360) || "未记录")}</div>
+                      </div>
+                    </div>
+                  </article>
+                `;
+              })
+              .join("")}
+          </div>
+        `;
+      }
+
+      function renderSidebar() {
+        const list = document.getElementById("diseaseList");
+        const query = state.search.trim();
+        const diseases = state.data.disease_summary.filter((item) => (item.diagnosis_name || "").includes(query));
+        list.innerHTML = diseases
+          .map(
+            (item) => `
+              <button class="disease-item ${(item.diagnosis_name || "") === state.selectedDisease ? "active" : ""}"
+                data-disease="${esc(item.diagnosis_name || "")}">
+                <div class="disease-row">
+                  <span class="disease-name">${esc(item.diagnosis_name || "未填写诊断")}</span>
+                  <span class="count">${esc(item.prescription_count)} 方</span>
+                </div>
+                <div class="subtle">${esc(item.record_count)} 份病历 · 核心药 ${esc(item.core_drugs.length)} 味</div>
+              </button>
+            `,
+          )
+          .join("");
+
+        list.querySelectorAll("button").forEach((button) => {
+          button.addEventListener("click", () => {
+            state.selectedDisease = button.dataset.disease;
+            state.selectedSyndrome = "__all__";
+            render();
+          });
+        });
+      }
+
+      function renderMain() {
+        const disease = currentDisease();
+        const scope = itemsForCurrentScope();
+        const content = document.getElementById("content");
+        if (!disease || !scope) {
+          content.className = "empty";
+          content.textContent = "请选择一个疾病";
+          return;
+        }
+        content.className = "";
+
+        const details = scopedDetails()
+          .sort(
+            (a, b) =>
+              String(b.inquiry_id || "").localeCompare(String(a.inquiry_id || "")) ||
+              String(b.prescription_order_id || "").localeCompare(String(a.prescription_order_id || "")),
+          );
+        const syndromeOptions = [
+          `<option value="__all__">全部证候</option>`,
+          ...disease.syndrome_summary.map(
+            (item) =>
+              `<option value="${esc(item.diagnosis_syndrome)}" ${
+                item.diagnosis_syndrome === state.selectedSyndrome ? "selected" : ""
+              }>${esc(item.diagnosis_syndrome || "未填写证候")} · ${esc(item.prescription_count)} 方</option>`,
+          ),
+        ].join("");
+
+        content.innerHTML = `
+          <div class="topbar">
+            <div class="title-block">
+              <h2>${esc(disease.diagnosis_name || "未填写诊断")}</h2>
+              <div class="subtle">按疾病与证候查看模板复用、核心药物、加减药和剂量变化</div>
+            </div>
+            <div class="controls">
+              <select class="select" id="syndromeSelect">${syndromeOptions}</select>
+            </div>
+          </div>
+
+          <section class="metrics">
+            <div class="metric"><div class="metric-label">病历数</div><div class="metric-value">${esc(scope.record_count)}</div></div>
+            <div class="metric"><div class="metric-label">内服处方数</div><div class="metric-value">${esc(scope.prescription_count)}</div></div>
+            <div class="metric"><div class="metric-label">核心药物数</div><div class="metric-value">${esc(scope.core_drugs.length)}</div></div>
+            <div class="metric"><div class="metric-label">常见模板数</div><div class="metric-value">${esc(scope.top_templates.length)}</div></div>
+          </section>
+
+          <section class="grid">
+            <div class="panel">
+              <div class="panel-header"><h3 class="panel-title">常用模板方</h3><span class="subtle">匹配占比</span></div>
+              <div class="panel-body">${templateList(scope.top_templates)}</div>
+            </div>
+            <div class="panel">
+              <div class="panel-header"><h3 class="panel-title">高频药物</h3><span class="subtle">处方出现率</span></div>
+              <div class="panel-body">${barList(scope.top_drugs.slice(0, 15), "drug_name")}</div>
+            </div>
+            <div class="panel">
+              <div class="panel-header">
+                <h3 class="panel-title">相似度分布</h3>
+                <span class="subtle">均值 ${fmtPct(scope.match_ratio_summary?.avg)} · 100% ${esc(scope.match_ratio_summary?.exact_count || 0)} 方</span>
+              </div>
+              <div class="panel-body">${barList(scope.match_ratio_summary?.buckets || [], "range", { color: "blue" })}</div>
+            </div>
+            <div class="panel">
+              <div class="panel-header"><h3 class="panel-title">核心药物</h3><span class="subtle">出现率 ≥ 30%</span></div>
+              <div class="panel-body">${tags(scope.core_drugs.slice(0, 30), "drug_name", "accent")}</div>
+            </div>
+            <div class="panel">
+              <div class="panel-header"><h3 class="panel-title">常见加药</h3><span class="subtle">相对模板方</span></div>
+              <div class="panel-body">${tags(scope.top_added_drugs.slice(0, 30), "drug_name", "warn")}</div>
+            </div>
+            <div class="panel">
+              <div class="panel-header"><h3 class="panel-title">常见减药</h3><span class="subtle">相对模板方</span></div>
+              <div class="panel-body">${tags(scope.top_removed_drugs.slice(0, 30), "drug_name", "blue")}</div>
+            </div>
+            <div class="panel">
+              <div class="panel-header"><h3 class="panel-title">高频药对</h3><span class="subtle">同方共现</span></div>
+              <div class="panel-body">${barList(scope.top_drug_pairs.slice(0, 12), "drug_pair", { color: "warn" })}</div>
+            </div>
+            <div class="panel full">
+              <div class="panel-header">
+                <h3 class="panel-title">同病同证处方临床项</h3>
+                <span class="subtle">临床症状、舌面信息、检查所见与症状变化 · ${esc(details.length)} 张处方</span>
+              </div>
+              <div class="panel-body">${sameScopeClinicalCards(details)}</div>
+            </div>
+            <div class="panel full">
+              <div class="panel-header"><h3 class="panel-title">处方匹配明细</h3><span class="subtle">按问诊单展示 ${esc(details.length)} 张处方与最相似模板方</span></div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>问诊单</th>
+                      <th>诊断结果</th>
+                      <th>证候</th>
+                      <th>患者症状</th>
+                      <th>检查所见</th>
+                      <th>匹配模板</th>
+                      <th>相似度</th>
+                      <th>药味匹配</th>
+                      <th>加药</th>
+                      <th>减药</th>
+                      <th>剂量变化</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${details
+                      .map(
+                        (item) => `
+                          <tr>
+                            <td>${esc(item.inquiry_id)}</td>
+                            <td>${esc(item.diagnosis_result || item.diagnosis_name || "")}</td>
+                            <td>${esc(item.diagnosis_syndrome || "")}</td>
+                            <td title="${esc(clinicalText(item.clinical_info))}">${esc(clip(clinicalText(item.clinical_info), 150))}</td>
+                            <td title="${esc(examText(item.clinical_info))}">${esc(clip(examText(item.clinical_info), 90))}</td>
+                            <td>${esc(item.matched_template_name || "")}</td>
+                            <td>${fmtPct(item.match_ratio)}</td>
+                            <td>${esc((item.common_drugs || []).length)}/${esc((item.common_drugs || []).length + (item.removed_drugs || []).length)}，加${esc((item.added_drugs || []).length)}，减${esc((item.removed_drugs || []).length)}</td>
+                            <td>${esc((item.added_drugs || []).slice(0, 8).join("、"))}</td>
+                            <td>${esc((item.removed_drugs || []).slice(0, 8).join("、"))}</td>
+                            <td>${esc((item.dose_changes || []).slice(0, 5).map((d) => `${d.drug_name}:${d.template_dose}->${d.record_dose}${d.unit || ""}`).join("；"))}</td>
+                          </tr>
+                        `,
+                      )
+                      .join("")}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        `;
+
+        document.getElementById("syndromeSelect").addEventListener("change", (event) => {
+          state.selectedSyndrome = event.target.value;
+          renderMain();
+        });
+        content.querySelectorAll("[data-template-index]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const detail = content.querySelector(`[data-template-detail="${button.dataset.templateIndex}"]`);
+            if (detail) detail.hidden = !detail.hidden;
+          });
+        });
+      }
+
+      function renderMeta() {
+        const meta = state.data.metadata;
+        document.getElementById("globalMeta").textContent =
+          `${meta.record_count} 份病历 · ${meta.prescription_count} 张内服处方 · ${meta.disease_count} 个疾病`;
+      }
+
+      function render() {
+        renderMeta();
+        renderSidebar();
+        renderMain();
+      }
+
+      async function boot() {
+        try {
+          const response = await fetch("../data/wuweiping_prescription_strategy_analysis.json", { cache: "no-store" });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          state.data = await response.json();
+          state.selectedDisease = state.data.disease_summary[0]?.diagnosis_name || "";
+          render();
+        } catch (error) {
+          const content = document.getElementById("content");
+          content.className = "error";
+          content.textContent = `无法读取分析结果：${error.message}`;
+        }
+      }
+
+      document.getElementById("searchInput").addEventListener("input", (event) => {
+        state.search = event.target.value;
+        renderSidebar();
+      });
+
+      boot();
+    </script>
+  </body>
+</html>

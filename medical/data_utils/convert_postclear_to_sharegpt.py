@@ -2,8 +2,8 @@
 将后清洗阶段的医患对话转换为 ShareGPT 格式的多轮对话数据集。
 
 当前适配两类输入：
-1. 结构化记录列表：[{record_id, is_first, record_text, cleared_data: {dialogue: [...]}}]
-2. 纯对话列表：[[{speaker, content}, ...], ...]
+1. JSON/JSONL 结构化记录：[{record_id, is_first, record_text, cleared_data: {dialogue: [...]}}]
+2. JSON/JSONL 纯对话：[[{speaker, content}, ...], ...]
 
 输出：
   medical/processed_data/medical_consult_sharegpt.json
@@ -13,26 +13,76 @@
 import json
 import os
 import re
-from tqdm import tqdm
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+    tqdm.write = print
+
+
+EXAM_KEYWORDS = (
+    "肝肾功能",
+    "血尿常规",
+    "尿常规",
+    "血常规",
+    "过敏原",
+    "皮肤镜",
+    "真菌",
+    "螨虫",
+    "B超",
+    "彩超",
+    "甲状腺",
+)
+
+EXAM_STOP_MARKERS = (
+    "刻下症",
+    "舌象",
+    "末次月经",
+    "剖腹产",
+    "顺产",
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. System Prompt
 # ──────────────────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """【角色】你是一位资深中医皮肤科医生，擅长通过视频问诊采集玫瑰痤疮患者的症状信息。
+SYSTEM_PROMPT = """【角色】你是一位资深中医皮肤科医生，擅长根据患者主诉、既往病史、舌面分析结果和检查报告结果，对玫瑰痤疮患者进行多轮问诊。
 
-【任务】进行结构化多轮问诊，主动、循序渐进地采集症状，不给出最终诊断结论。
+【总任务】根据就诊类型进行结构化多轮问诊。你需要主动追问、循序渐进地收集病情信息，并在信息充分后给出安全、谨慎、可执行的医嘱或随访安排。
 
-【问诊原则】
-1. 每次只问一个问题，避免一次抛出多个问题
-2. 初诊：先采集基本信息（年龄、性别、病程时长、主要症状及部位），再深入追问
-3. 复诊：先询问上次治疗后的用药反应和症状变化，再针对性追问当前症状
-4. 根据患者回答灵活调整追问方向，避免机械地走流程
-5. 涉及专业术语时用通俗易懂的语言解释
-6. 主动引导患者展示面部舌象（手机镜头指导）
-7. 问诊结束时不给出辨证结论或治疗方案，只表达"继续观察/下次复诊"等
+【通用问诊原则】
+1. 每轮只围绕一个重点提问，避免一次抛出多个无关问题。
+2. 先听患者当前最困扰的问题，再结合已提供的舌面分析结果、检查报告结果、病史和用药情况逐步追问。
+3. 舌面情况和检查报告已经提前获取，不要在问诊中重复采集影像或舌面资料。
+4. 围绕红斑、丘疹/脓疱、发烫、瘙痒、疼痛、肿胀、干紧、破溃流水、色沉等表现追问程度、频率、诱因和变化。
+5. 结合中医四诊追问食纳、大小便、睡眠、口干口苦、胃胀反酸等情况；舌面相关判断以已给出的舌面分析结果为准。
+6. 追问既往诊疗、外用/口服药、光电或美容项目、过敏史、肝肾功能、血尿常规、牙齿处理、鼻炎/咽炎、妇科和月经情况等与玫瑰痤疮相关的线索。
+7. 根据患者回答灵活调整追问方向，避免机械照读清单。
+8. 涉及专业术语时用通俗语言解释，表达要亲切、专业、有耐心。
 
-【沟通风格】亲切、专业、有耐心，问诊逻辑清晰。"""
+【初诊问诊流程】
+1. 开始先确认主诉：患者最想解决的问题、病程多久、最近是否加重。
+2. 根据患者描述明确皮损部位、范围、颜色、是否对称、是否有丘疹脓疱或肿胀破溃；不进行额外影像采集。
+3. 追问当前症状：红、烫、痒、痛、干紧、夜间发烫、遇热/情绪/饮食/口罩/护肤品后的变化。
+4. 追问既往治疗：在哪些医院诊治过，诊断为什么，用过哪些口服药、外用药、光电美容或护肤修复，疗效和不良反应如何。
+5. 补充基础病史：饮食二便睡眠、胃肠情况、牙齿情况、鼻炎咽炎、过敏史、肝肾功能和血尿常规；女性患者询问月经周期、经量、血块、经期前后皮肤变化和生育史。
+6. 信息充分后给出初诊医嘱：皮肤保护、饮食作息、检查建议、用药观察要点和复诊安排；避免武断保证疗效。
+
+【复诊问诊流程】
+1. 开始先复盘上次治疗：口服药、外洗/外敷/外涂药是否按医嘱使用，有无腹泻、胃痛、口干、瘙痒、红烫加重、过敏等异常反应。
+2. 对比上次和现在的症状变化：红斑面积和颜色、发烫频率、丘疹脓疱、瘙痒、肿胀、夜烫、干紧、睡眠和二便是否改善。
+3. 确认剩余药量和患者实际用法，区分中药、西药、抗过敏药、外用药、护肤品或自行加用药物。
+4. 追问复诊期间新增情况：检查复查结果、肝肾功能变化、其他医院处理、牙齿/鼻炎/胃肠/月经变化、饮食作息和环境诱因。
+5. 对女性患者重点追问近期月经：周期、经量、颜色、血块、经期前后面部红烫痒痛变化。
+6. 信息充分后给出复诊医嘱：是否继续、暂停或调整既有方案，外用药如何试用，何时复查，出现哪些情况需要停药或线下就诊。
+
+【输出边界】
+1. 可以进行病情解释、风险提醒、用药观察和生活方式医嘱，但不要给出绝对化诊断或保证疗效。
+2. 如果信息不足，应继续追问；不要在缺少关键病史时直接下结论。
+3. 涉及肝肾功能异常、明显过敏、破溃流脓、严重肿胀或全身不适时，要建议复查或线下就医。"""
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 2. 工具函数
@@ -80,6 +130,35 @@ def parse_record_text(record_text: str) -> dict:
         if m2:
             result['last_visit_symptoms'] = m2.group(1).strip()
 
+    tongue_matches = re.findall(r'舌(?:象)?[:：]?[淡红红胖嫩瘦紫暗苔薄白厚腻黄少齿痕裂纹点刺润燥，、；, ]+', record_text)
+    if tongue_matches:
+        result["tongue_analysis"] = "；".join(dict.fromkeys(item.strip(" ，,；") for item in tongue_matches if item.strip()))
+
+    reports = []
+    for sentence in re.split(r'[。\n]', record_text):
+        sentence = sentence.strip(" ，,；;")
+        if not sentence:
+            continue
+
+        keyword_positions = [
+            sentence.find(keyword)
+            for keyword in EXAM_KEYWORDS
+            if keyword in sentence
+        ]
+        if not keyword_positions:
+            continue
+
+        start = max(sentence.rfind(delimiter, 0, min(keyword_positions)) for delimiter in "，,；;。")
+        report = sentence[start + 1:].strip(" ，,；;")
+        for marker in EXAM_STOP_MARKERS:
+            marker_index = report.find(marker)
+            if marker_index > 0:
+                report = report[:marker_index].strip(" ，,；;")
+        reports.append(report)
+
+    if reports:
+        result["examination_report"] = "；".join(dict.fromkeys(reports))
+
     return result
 
 
@@ -90,6 +169,7 @@ def build_system(record: dict) -> str:
     """
     is_first = record.get("is_first", "")
     record_text = record.get("record_text", "")
+    pre_collected_info = record.get("pre_collected_info", {})
 
     if is_first in (True, "初诊", "first_visit"):
         visit_type_cn = "初诊"
@@ -101,10 +181,7 @@ def build_system(record: dict) -> str:
     parts = [SYSTEM_PROMPT]
     parts.append(f"\n## 就诊类型：{visit_type_cn}（{visit_type_en}）")
 
-    if not record_text:
-        return "".join(parts)
-
-    parsed = parse_record_text(record_text)
+    parsed = parse_record_text(record_text) if record_text else {}
 
     # 基本信息
     info_lines = []
@@ -120,12 +197,40 @@ def build_system(record: dict) -> str:
     if info_lines:
         parts.append("\n## 患者基本信息")
         for line in info_lines:
-            parts.append(f"- {line}")
+            parts.append(f"\n- {line}")
 
     if visit_type_cn == "复诊" and parsed.get("last_visit_symptoms"):
         parts.append(f"\n## 上次复诊时症状（参考）：{parsed['last_visit_symptoms']}")
 
+    tongue_analysis = pre_collected_info.get("tongue_analysis") or parsed.get("tongue_analysis")
+    examination_report = pre_collected_info.get("examination_report") or parsed.get("examination_report")
+
+    parts.append("\n## 已提前获取的信息")
+    parts.append(f"\n- 舌面分析结果：{tongue_analysis or '未提供'}")
+    parts.append(f"\n- 检查报告结果：{examination_report or '未提供'}")
+
     return "".join(parts)
+
+
+def load_records(input_path: str):
+    """
+    读取 JSON 数组或 JSONL 数据。
+    JSONL 每行可以是结构化 record，也可以是一段纯对话列表。
+    """
+    with open(input_path, "r", encoding="utf-8") as f:
+        if input_path.endswith(".jsonl"):
+            records = []
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSONL at line {line_no}: {e}") from e
+            return records
+
+        return json.load(f)
 
 
 def normalize_record(record, index: int):
@@ -147,6 +252,7 @@ def normalize_record(record, index: int):
             "record_id": record.get("record_id") or f"dialogue_{index:06d}",
             "is_first": record.get("is_first", ""),
             "record_text": record.get("record_text", ""),
+            "pre_collected_info": record.get("pre_collected_info", {}),
             "dialogue": dialogue,
         }
 
@@ -155,6 +261,7 @@ def normalize_record(record, index: int):
             "record_id": f"dialogue_{index:06d}",
             "is_first": "",
             "record_text": "",
+            "pre_collected_info": {},
             "dialogue": record,
         }
 
@@ -254,8 +361,7 @@ def convert(input_path: str, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"读取数据: {input_path}")
-    with open(input_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    data = load_records(input_path)
 
     sharegpt_data = []
     skipped_short = 0
@@ -368,7 +474,7 @@ def register_dataset(first_count: int, return_count: int):
             "user_tag": "human",
             "assistant_tag": "gpt"
         },
-        "description": f"中医玫瑰痤疮多轮问诊数据集，含初诊{first_count}条、复诊{return_count}条，医生只问诊不给诊断。"
+        "description": f"中医玫瑰痤疮多轮问诊数据集，含初诊{first_count}条、复诊{return_count}条，按初诊和复诊流程进行多轮问诊并给出谨慎医嘱。"
     }
 
     with open(info_path, "w", encoding="utf-8") as f:
@@ -382,7 +488,7 @@ def register_dataset(first_count: int, return_count: int):
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    INPUT = "medical/processed_data/postasr_speaker_content.json"
+    INPUT = "medical/processed_data/postasr_prompt_context.jsonl"
     OUTPUT_DIR = "medical/processed_data"
 
     sharegpt_data = convert(INPUT, OUTPUT_DIR)
