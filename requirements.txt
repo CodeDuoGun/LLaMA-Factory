@@ -8,3 +8,4 @@ sqlalchemy
 pydantic-settings
 dynaconf
 pymysql
+requests

@@ -12,6 +12,8 @@ import argparse
 import json
 import os
 import re
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from medical.config import config
@@ -19,7 +21,7 @@ from medical.utils.log import logger
 
 
 DEFAULT_INPUT = Path("medical/data/wuweiping_record_20260525.json")
-DEFAULT_OUTPUT = Path("medical/processed_data/wuweiping_es_prescription.jsonl")
+DEFAULT_OUTPUT = Path(f"medical/processed_data/wuweiping_es_prescription_{datetime.now().strftime('%Y%m%d')}.jsonl")
 DEFAULT_TEMPLATE_FILE = Path("medical/data/wuweiping_template_prescription.json")
 
 KEEP_FIELDS = [
@@ -72,6 +74,8 @@ CLINICAL_SOURCE_FIELDS = [
 
 INSPECTION_IMAGE_FIELDS = ["inspection_report_img", "admin_report_img"]
 TONGUE_FACE_IMAGE_FIELDS = ["tongue_face_img", "admin_face_img"]
+INTERNAL_USAGE_TYPE = "内服"
+EXTERNAL_USAGE_TYPES = {"外用", "外服"}
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
@@ -123,6 +127,104 @@ def format_prescription(prescription: dict[str, Any]) -> str:
 
 def format_prescriptions(prescriptions: Iterable[dict[str, Any]]) -> list[str]:
     return [text for text in (format_prescription(item) for item in prescriptions or []) if text]
+
+
+def _prescription_usage_type(prescription: Any) -> str:
+    if isinstance(prescription, dict):
+        return str(prescription.get("usage_type") or "").strip()
+    if isinstance(prescription, str):
+        match = re.match(r"^([^:：\s]+)\s*[:：]", prescription.strip())
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _has_internal_prescription(record: dict[str, Any]) -> bool:
+    for prescription in record.get("ps") or []:
+        if _prescription_usage_type(prescription) == INTERNAL_USAGE_TYPE:
+            return True
+    return False
+
+
+def _has_external_prescription(record: dict[str, Any]) -> bool:
+    for prescription in record.get("ps") or []:
+        usage_type = _prescription_usage_type(prescription)
+        if usage_type in EXTERNAL_USAGE_TYPES or (usage_type and usage_type != INTERNAL_USAGE_TYPE):
+            return True
+    return False
+
+
+def _is_external_only_prescription_record(record: dict[str, Any]) -> bool:
+    return _has_external_prescription(record) and not _has_internal_prescription(record)
+
+
+def _parse_record_datetime(value: Any) -> datetime:
+    if not value:
+        return datetime.min
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    for candidate, fmt in (
+        (text, "%Y-%m-%d %H:%M:%S"),
+        (text[:19], "%Y-%m-%d %H:%M:%S"),
+        (text[:19], "%Y-%m-%dT%H:%M:%S"),
+        (text[:10], "%Y-%m-%d"),
+    ):
+        try:
+            return datetime.strptime(candidate, fmt)
+        except ValueError:
+            continue
+    return datetime.min
+
+
+def _record_sort_key(record: dict[str, Any]) -> tuple[datetime, int]:
+    time_value = record.get("start_time") or record.get("created_at") or record.get("stop_time")
+    try:
+        record_id = int(record.get("id") or 0)
+    except (TypeError, ValueError):
+        record_id = 0
+    return (_parse_record_datetime(time_value), record_id)
+
+
+def _internal_prescription_texts(record: dict[str, Any]) -> list[str]:
+    return [
+        text
+        for prescription in record.get("ps") or []
+        if _prescription_usage_type(prescription) == INTERNAL_USAGE_TYPE
+        for text in [format_prescription(prescription) if isinstance(prescription, dict) else str(prescription).strip()]
+        if text
+    ]
+
+
+def build_linked_internal_prescription(previous_record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source_inquiry_id": previous_record.get("id"),
+        "source_order_sn": previous_record.get("order_sn") or "",
+        "source_start_time": previous_record.get("start_time") or "",
+        "source_created_at": previous_record.get("created_at") or "",
+        "diagnosis_disease": previous_record.get("diagnosis_disease") or "",
+        "diagnosis_sickness": previous_record.get("diagnosis_sickness") or "",
+        "ps": _internal_prescription_texts(previous_record),
+    }
+
+
+def build_previous_internal_prescription_map(records: Iterable[dict[str, Any]]) -> dict[Any, dict[str, Any]]:
+    records_by_patient: dict[Any, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        patient_id = record.get("patient_id")
+        if patient_id in (None, ""):
+            continue
+        records_by_patient[patient_id].append(record)
+
+    linked_by_record_id: dict[Any, dict[str, Any]] = {}
+    for patient_records in records_by_patient.values():
+        previous_internal_record = None
+        for record in sorted(patient_records, key=_record_sort_key):
+            if _is_external_only_prescription_record(record) and previous_internal_record is not None:
+                linked_by_record_id[record.get("id")] = build_linked_internal_prescription(previous_internal_record)
+            if _has_internal_prescription(record):
+                previous_internal_record = record
+    return linked_by_record_id
 
 
 def _normalize_drug_name(name: Any) -> str:
@@ -203,9 +305,18 @@ def find_most_similar_template(prescription: Any, templates: list[dict[str, Any]
     return candidates[0] if candidates else {}
 
 
+def _template_match_prescription_source(record: dict[str, Any]) -> Any:
+    if extract_drug_names_from_prescription(record.get("ps")):
+        return record
+    linked_internal_prescription = record.get("linked_internal_prescription") or {}
+    if linked_internal_prescription.get("ps"):
+        return linked_internal_prescription.get("ps")
+    return record
+
+
 def add_most_similar_template_detail(record: dict[str, Any], templates: list[dict[str, Any]]) -> dict[str, Any]:
     enriched = dict(record)
-    match_detail = find_most_similar_template(record, templates)
+    match_detail = find_most_similar_template(_template_match_prescription_source(record), templates)
     if not match_detail:
         enriched.update(
             {
@@ -264,9 +375,11 @@ def pack_record(
     inspection_abnormalities: str = "",
     tongue_face_findings: str = "",
     templates: list[dict[str, Any]] | None = None,
+    linked_internal_prescription: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     packed = {field: record.get(field, [] if field.endswith("_img") else "") for field in KEEP_FIELDS}
     packed["ps"] = format_prescriptions(record.get("ps") or [])
+    packed["linked_internal_prescription"] = linked_internal_prescription or {}
     packed["clinical_symptoms"] = clinical_symptoms
     packed["inspection_abnormalities"] = inspection_abnormalities
     packed["tongue_face_findings"] = tongue_face_findings
@@ -282,7 +395,16 @@ def pack_records(
     records: Iterable[dict[str, Any]],
     templates: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    return [pack_record(record, templates=templates) for record in records]
+    records = list(records)
+    linked_prescriptions = build_previous_internal_prescription_map(records)
+    return [
+        pack_record(
+            record,
+            templates=templates,
+            linked_internal_prescription=linked_prescriptions.get(record.get("id")),
+        )
+        for record in records
+    ]
 
 
 def write_jsonl(records: Iterable[dict[str, Any]], path: Path) -> None:
@@ -403,6 +525,7 @@ def fill_clinical_symptoms(
     templates: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     packed_records = []
+    linked_prescriptions = build_previous_internal_prescription_map(records)
     for start in range(0, len(records), batch_size):
         batch = records[start : start + batch_size]
         response = llm_call(build_symptom_extraction_prompt(batch))
@@ -411,7 +534,14 @@ def fill_clinical_symptoms(
             extracted = symptom_map.get(record.get("id"), {})
             if isinstance(extracted, str):
                 extracted = {"clinical_symptoms": extracted, "clinical_symptoms_text": extracted}
-            packed_records.append(pack_record(record, templates=templates, **extracted))
+            packed_records.append(
+                pack_record(
+                    record,
+                    templates=templates,
+                    linked_internal_prescription=linked_prescriptions.get(record.get("id")),
+                    **extracted,
+                )
+            )
     return packed_records
 
 
