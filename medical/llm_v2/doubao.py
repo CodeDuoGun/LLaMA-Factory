@@ -2,8 +2,8 @@ import requests
 from medical.config import config
 import json
 from typing import Generator, Optional
-from app.utils.log import logger
-from app.model.llm_v2.base import BaseLLMClient
+from medical.utils.log import logger
+from medical.llm_v2.base import BaseLLMClient
 import time
 from openai import OpenAI
 

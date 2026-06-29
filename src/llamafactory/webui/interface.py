@@ -68,7 +68,7 @@ def create_ui(demo_mode: bool = False) -> "gr.Blocks":
 
                     engine.manager.add_elems("prescription_rag", create_prescription_rag_tab())
                 except Exception as err:
-                    gr.Markdown(f"Prescription RAG 页面加载失败：`{err}`")
+                    gr.Markdown(f"处方 RAG 检索页面加载失败：`{err}`")
 
         engine.manager.add_elems("footer", create_footer())
         demo.load(engine.resume, outputs=engine.manager.get_elem_list(), concurrency_limit=None)

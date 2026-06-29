@@ -1,6 +1,6 @@
 import requests
 import time
-from app.utils.log import logger
+from medical.utils.log import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from medical.utils.tool import perf_counter_timer, normalize_vector
 from typing import List

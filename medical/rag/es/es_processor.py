@@ -58,9 +58,10 @@ except Exception:
         BGECODE = "bge_code"
 
 
-DEFAULT_INDEX_NAME = "medical_prescription_rag_v1"
+DEFAULT_INDEX_NAME = "alpha_medical_prescription_rag_v1"
 DEFAULT_ANALYSIS_FILE = Path("medical/data/wuweiping_prescription_strategy_analysis.json")
 DEFAULT_TEMPLATE_FILE = Path("medical/data/wuweiping_template_prescription.json")
+DEFAULT_WUWEIPING_JSONL_FILE = Path("medical/processed_data/wuweiping_es_prescription.jsonl")
 
 
 def _require_dependency(dependency: Any, name: str) -> Any:
@@ -143,13 +144,9 @@ def build_index_body(dims: int, text_analyzer: str = "standard") -> dict[str, An
                 "template_id": {"type": "keyword"},
                 "template_name": {"type": "keyword"},
                 "template_name_text": {"type": "text", "analyzer": text_analyzer},
-                "symptom_tags": {"type": "keyword"},
                 "clinical_symptoms_text": {"type": "text", "analyzer": text_analyzer},
-                "exam_tags": {"type": "keyword"},
-                "drug_names": {"type": "keyword"},
-                "added_drugs": {"type": "keyword"},
-                "removed_drugs": {"type": "keyword"},
-                "risk_tags": {"type": "keyword"},
+                "prescription_text": {"type": "text", "analyzer": text_analyzer},
+                "template_prescription_text": {"type": "text", "analyzer": text_analyzer},
                 "text": {"type": "text", "analyzer": text_analyzer},
                 "metadata": {"type": "object", "enabled": True},
                 "embedding": {"type": "dense_vector", "dims": dims, "index": True, "similarity": "cosine"},
@@ -183,6 +180,119 @@ def compact_drug_text(drugs: Iterable[dict[str, Any]], dose_key: str = "dose") -
         unit = drug.get("unit") or ""
         parts.append(f"{name}{dose or ''}{unit}")
     return "、".join(parts)
+
+
+def _clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _stable_doc_part(value: Any) -> str:
+    text = _clean_text(value)
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", text).strip("_") or "unknown"
+
+
+def _format_template_prescription(template_detail: dict[str, Any] | None, template_name: str = "") -> str:
+    template_detail = template_detail or {}
+    drugs = template_detail.get("drugs") or []
+    drug_text = compact_drug_text(drugs, dose_key="quantity")
+    if template_name and drug_text:
+        return f"模板方：{template_name}\n组成：{drug_text}"
+    if template_name:
+        return f"模板方：{template_name}"
+    if drug_text:
+        return f"模板方组成：{drug_text}"
+    return ""
+
+
+def _normalize_dose(value: Any) -> Any:
+    text = _clean_text(value)
+    if not text:
+        return ""
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    if number.is_integer():
+        return int(number)
+    return number
+
+
+def _parse_prescription_drug_detail(part: str, usage_type: str = "") -> dict[str, Any] | None:
+    text = re.sub(r"\s+", "", _clean_text(part))
+    text = text.strip(" 。,，、；;")
+    if not text:
+        return None
+    match = re.match(r"^(?P<name>.+?)(?P<dose>\d+(?:\.\d+)?)(?P<unit>g|克|mg|ml|片|粒|袋|支|瓶|盒|丸)?$", text, flags=re.IGNORECASE)
+    if match:
+        return {
+            "drug_name": match.group("name"),
+            "dose": _normalize_dose(match.group("dose")),
+            "unit": match.group("unit") or "",
+            "usage_type": usage_type,
+        }
+    return {"drug_name": text, "dose": "", "unit": "", "usage_type": usage_type}
+
+
+def build_wuweiping_embedding_text(row: dict[str, Any]) -> str:
+    """
+    向量检索中，只存储诊断结果和临床表现，不存储处方和模板方内容。
+    """
+    diagnosis_result = _clean_text(row.get("diagnosis_sickness"))
+    syndrome_result = _clean_text(row.get("diagnosis_disease"))
+    clinical_symptoms = _clean_text(row.get("clinical_symptoms_text") or row.get("clinical_symptoms"))
+    return "\n".join(
+        part
+        for part in [
+            f"{diagnosis_result}",
+            f"{syndrome_result}",
+            f"患者症状：{clinical_symptoms}",
+        ]
+        if part and not part.endswith("：")
+    )
+
+
+def build_wuweiping_prescription_doc(row: dict[str, Any], embedding: list[float] | None = None) -> dict[str, Any]:
+    diagnosis_result = _clean_text(row.get("diagnosis_sickness"))
+    syndrome_result = _clean_text(row.get("diagnosis_disease"))
+    clinical_symptoms = _clean_text(row.get("clinical_symptoms_text") or row.get("clinical_symptoms"))
+    prescriptions = [_clean_text(item) for item in row.get("ps") or [] if _clean_text(item)]
+    prescription_text = "\n".join(prescriptions)
+    template_detail = row.get("matched_template_detail") or {}
+    template_name = _clean_text(row.get("matched_template_name"))
+    template_prescription_text = _format_template_prescription(template_detail, template_name)
+
+    doc_id = f"case_prescription:{_stable_doc_part(row.get('id'))}:{_stable_doc_part(row.get('order_sn'))}"
+    text = build_wuweiping_embedding_text(row)
+    source = {
+        "chunk_type": "case_prescription",
+        "source": "wuweiping_es_prescription",
+        "diagnosis_result": diagnosis_result,
+        "diagnosis_result_text": diagnosis_result,
+        "syndrome_result": syndrome_result,
+        "syndrome_result_text": syndrome_result,
+        "sex": _clean_text(row.get("patient_sex")),
+        "age": int(row.get("patient_age")) if str(row.get("patient_age") or "").isdigit() else None,
+        "age_bucket": age_bucket(row.get("patient_age")),
+        "template_id": _clean_text(row.get("matched_template_id")),
+        "template_name": template_name,
+        "template_name_text": template_name,
+        "clinical_symptoms_text": clinical_symptoms,
+        "prescription_text": prescription_text,
+        "template_prescription_text": template_prescription_text,
+        "text": text,
+        "metadata": {
+            "record": row,
+            "inquiry_id": row.get("id"),
+            "order_sn": row.get("order_sn"),
+            "patient_id": row.get("patient_id"),
+            "matched_template_score": row.get("matched_template_score"),
+        },
+    }
+    if source["age"] is None:
+        source.pop("age")
+    if embedding is not None:
+        source["embedding"] = embedding
+    return _source_doc(doc_id, source)
 
 
 def _source_doc(doc_id: str, source: dict[str, Any]) -> dict[str, Any]:
@@ -253,7 +363,6 @@ def build_template_doc(template: dict[str, Any], embedding: list[float] | None =
         "template_id": str(template_id or ""),
         "template_name": template_name,
         "template_name_text": template_name,
-        "drug_names": [drug.get("drug_name") for drug in drugs if drug.get("drug_name")],
         "text": f"模板方：{template_name}\n组成：{compact_drug_text(drugs, dose_key='quantity')}",
         "metadata": {"template": template},
     }
@@ -291,11 +400,39 @@ def build_disease_strategy_doc(summary: dict[str, Any], embedding: list[float] |
     return _source_doc(f"disease_strategy:{diagnosis_result or 'unknown'}", source)
 
 
+def _es_error_type(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            return str(error.get("type") or "")
+        if isinstance(error, str):
+            return error
+    return ""
+
+
+def _es_status(exc: Exception) -> int | None:
+    meta = getattr(exc, "meta", None)
+    status = getattr(meta, "status", None)
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return None
+
+
 def create_index(client: Any, index_name: str, dims: int, text_analyzer: str = "standard", recreate: bool = False) -> None:
-    if recreate and client.indices.exists(index=index_name):
-        client.indices.delete(index=index_name)
-    if not client.indices.exists(index=index_name):
+    if recreate:
+        try:
+            client.indices.delete(index=index_name)
+        except Exception as exc:
+            if _es_status(exc) != 404 and _es_error_type(exc) != "index_not_found_exception":
+                raise
+    try:
         client.indices.create(index=index_name, body=build_index_body(dims, text_analyzer=text_analyzer))
+    except Exception as exc:
+        if not recreate and _es_error_type(exc) == "resource_already_exists_exception":
+            return
+        raise
 
 
 def upsert_doc(client: Any, index_name: str, doc: dict[str, Any]) -> Any:
@@ -380,6 +517,27 @@ def vector_query(
     return {"knn": knn, "size": k}
 
 
+def same_disease_syndrome_vector_query(
+    query_vector: list[float],
+    diagnosis_result: str,
+    syndrome_result: str,
+    k: int = 5,
+    num_candidates: int = 100,
+) -> dict[str, Any]:
+    filters = structured_filter(diagnosis_result, syndrome_result)
+    filters.append({"term": {"chunk_type": "case_prescription"}})
+    return {
+        "knn": {
+            "field": "embedding",
+            "query_vector": query_vector,
+            "k": k,
+            "num_candidates": max(num_candidates, k),
+            "filter": filters,
+        },
+        "size": k,
+    }
+
+
 def bm25_search(client: Any, index_name: str, query_text: str, **kwargs: Any) -> list[dict[str, Any]]:
     response = client.search(index=index_name, body=bm25_query(query_text, **kwargs))
     return response.get("hits", {}).get("hits", [])
@@ -422,6 +580,47 @@ def search_same_disease_syndrome_cases(
     response = client.search(
         index=index_name,
         body=same_disease_syndrome_case_query(diagnosis_result, syndrome_result, clinical_symptoms, size=top_k),
+    )
+    return response.get("hits", {}).get("hits", [])
+
+
+def count_same_disease_syndrome_cases(
+    client: Any,
+    index_name: str,
+    diagnosis_result: str,
+    syndrome_result: str,
+) -> int:
+    response = client.count(
+        index=index_name,
+        body={
+            "query": {
+                "bool": {
+                    "filter": structured_filter(diagnosis_result, syndrome_result, chunk_types=["case_prescription"])
+                }
+            }
+        },
+    )
+    return int(response.get("count", 0))
+
+
+def vector_search_same_disease_syndrome_cases(
+    client: Any,
+    index_name: str,
+    diagnosis_result: str,
+    syndrome_result: str,
+    query_vector: list[float],
+    top_k: int = 5,
+    num_candidates: int = 100,
+) -> list[dict[str, Any]]:
+    response = client.search(
+        index=index_name,
+        body=same_disease_syndrome_vector_query(
+            query_vector=query_vector,
+            diagnosis_result=diagnosis_result,
+            syndrome_result=syndrome_result,
+            k=top_k,
+            num_candidates=num_candidates,
+        ),
     )
     return response.get("hits", {}).get("hits", [])
 
@@ -477,6 +676,41 @@ def retrieve_prescription_by_disease_syndrome_symptoms(
     )
     template_candidates = aggregate_template_candidates(case_hits, limit=template_limit)
     return {"case_hits": case_hits, "template_candidates": template_candidates}
+
+
+def retrieve_wuweiping_prescription_by_vector(
+    client: Any,
+    index_name: str,
+    diagnosis_result: str,
+    syndrome_result: str,
+    query_vector: list[float],
+    top_k: int = 5,
+    num_candidates: int = 100,
+    template_limit: int = 5,
+) -> dict[str, Any]:
+    same_count = count_same_disease_syndrome_cases(client, index_name, diagnosis_result, syndrome_result)
+    case_hits = vector_search_same_disease_syndrome_cases(
+        client,
+        index_name,
+        diagnosis_result=diagnosis_result,
+        syndrome_result=syndrome_result,
+        query_vector=query_vector,
+        top_k=top_k,
+        num_candidates=max(num_candidates, same_count, top_k),
+    )
+    template_candidates = aggregate_template_candidates(case_hits, limit=template_limit)
+    return {"same_disease_syndrome_count": same_count, "case_hits": case_hits, "template_candidates": template_candidates}
+
+
+def embed_prescription_query(text: str, embedding_model_type: str = "doubao", embed_model: Any = None) -> list[float]:
+    _load_embedding_tools()
+    if embedding_model_type in {"bge", "bge_large_zh", "beg_large_zh"}:
+        return get_embedding(text, embed_model)
+    if embedding_model_type == "bge_code":
+        return get_bge_code_embedding(text, embed_model)
+    if embedding_model_type == "bgem3":
+        return get_bgem3_embedding(embed_model, text)
+    return get_doubao_embedding(text)
 
 
 def vector_search(client: Any, index_name: str, query_vector: list[float], **kwargs: Any) -> list[dict[str, Any]]:
@@ -753,6 +987,21 @@ def load_json(path: Path) -> Any:
         return json.load(f)
 
 
+def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as f:
+        for line_number, line in enumerate(f, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at {path}:{line_number}: {exc.msg}") from exc
+            if not isinstance(data, dict):
+                raise ValueError(f"Invalid JSONL at {path}:{line_number}: expected object")
+            yield data
+
+
 def load_templates(path: Path) -> list[dict[str, Any]]:
     data = load_json(path)
     if isinstance(data, dict):
@@ -771,6 +1020,11 @@ def iter_docs_from_analysis(
         yield build_disease_strategy_doc(summary)
     for row in analysis.get("template_match_details", []):
         yield build_case_prescription_doc(row)
+
+
+def iter_wuweiping_prescription_docs(path: Path = DEFAULT_WUWEIPING_JSONL_FILE) -> Iterable[dict[str, Any]]:
+    for row in iter_jsonl(path):
+        yield build_wuweiping_prescription_doc(row)
 
 
 def parse_args() -> argparse.Namespace:
@@ -875,6 +1129,27 @@ class ElasticsearchHandler:
             syndrome_result=syndrome_result,
             clinical_symptoms=clinical_symptoms,
             top_k=top_k,
+            template_limit=template_limit,
+        )
+
+    def retrieve_wuweiping_prescription_by_vector(
+        self,
+        index_name: str,
+        diagnosis_result: str,
+        syndrome_result: str,
+        query_vector: list[float],
+        top_k: int = 5,
+        num_candidates: int = 100,
+        template_limit: int = 5,
+    ) -> dict[str, Any]:
+        return retrieve_wuweiping_prescription_by_vector(
+            self.es,
+            index_name=index_name,
+            diagnosis_result=diagnosis_result,
+            syndrome_result=syndrome_result,
+            query_vector=query_vector,
+            top_k=top_k,
+            num_candidates=num_candidates,
             template_limit=template_limit,
         )
 

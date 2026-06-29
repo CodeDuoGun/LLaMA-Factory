@@ -8,9 +8,11 @@ from medical.rag.es.es_processor import (
     _load_elasticsearch,
     bm25_search,
     aggregate_template_candidates,
+    embed_prescription_query,
     evaluate_retrieval,
     hybrid_search,
     retrieve_prescription_by_disease_syndrome_symptoms,
+    retrieve_wuweiping_prescription_by_vector,
 )
 
 from medical.config import config
@@ -53,10 +55,11 @@ def hits_to_rows(hits: list[dict[str, Any]]) -> list[list[Any]]:
                 rank,
                 hit.get("_id", ""),
                 round(float(hit.get("rerank_score", hit.get("rrf_score", hit.get("_score", 0))) or 0), 6),
-                source.get("chunk_type", ""),
-                source.get("template_name", ""),
-                "、".join(source.get("drug_names") or []),
-                (source.get("text") or "")[:240],
+                source.get("diagnosis_result", ""),
+                source.get("syndrome_result", ""),
+                source.get("clinical_symptoms_text", ""),
+                source.get("prescription_text", "") or (source.get("text") or "")[:240],
+                source.get("template_prescription_text", "") or source.get("template_name", ""),
             ]
         )
     return rows
@@ -101,6 +104,10 @@ def _make_client() -> Any:
     return es_class(f"http://{host}:{port}", basic_auth=auth, request_timeout=80)
 
 
+def _embed_symptoms(clinical_symptoms: str) -> list[float]:
+    return [float(item) for item in embed_prescription_query(clinical_symptoms)]
+
+
 def run_recall_test(
     index_name: str,
     diagnosis_result: str,
@@ -116,12 +123,12 @@ def run_recall_test(
         case_diagnosis = case.get("diagnosis_result") or diagnosis_result or None
         case_syndrome = case.get("syndrome_result") or syndrome_result or None
         case_symptoms = case.get("clinical_symptoms") or case.get("query_text") or clinical_symptoms
-        result = retrieve_prescription_by_disease_syndrome_symptoms(
+        result = retrieve_wuweiping_prescription_by_vector(
             client,
             index_name=index_name,
             diagnosis_result=case_diagnosis,
             syndrome_result=case_syndrome,
-            clinical_symptoms=case_symptoms,
+            query_vector=_embed_symptoms(case_symptoms),
             top_k=size,
         )
         return result["case_hits"]
@@ -138,12 +145,12 @@ def run_recall_test(
             {"metrics": metrics, "details": metrics.get("details", []), "template_candidates": templates},
         )
 
-    result = retrieve_prescription_by_disease_syndrome_symptoms(
+    result = retrieve_wuweiping_prescription_by_vector(
         client,
         index_name=index_name,
         diagnosis_result=diagnosis_result,
         syndrome_result=syndrome_result,
-        clinical_symptoms=clinical_symptoms,
+        query_vector=_embed_symptoms(clinical_symptoms),
         top_k=top_k,
     )
     return (
@@ -163,17 +170,17 @@ def create_prescription_rag_tab() -> dict[str, Any]:
     elem_dict = {}
     with gr.Row():
         index_name = gr.Textbox(value=DEFAULT_INDEX_NAME, label="索引", scale=2)
-        top_k = gr.Number(value=10, label="Top K", precision=0, scale=1)
+        top_k = gr.Number(value=5, label="Top K", precision=0, scale=1)
     with gr.Row():
-        diagnosis_result = gr.Textbox(label="诊断结果", scale=1)
-        syndrome_result = gr.Textbox(label="证候结果", scale=1)
-    clinical_symptoms = gr.Textbox(label="临床症状", lines=4)
+        diagnosis_result = gr.Textbox(label="病名", scale=1)
+        syndrome_result = gr.Textbox(label="证型名", scale=1)
+    clinical_symptoms = gr.Textbox(label="患者症状", lines=4)
     gold_cases = gr.Textbox(label="评测样本 JSON 数组（可选）", lines=8)
-    run_btn = gr.Button(value="运行召回测试", variant="primary")
+    run_btn = gr.Button(value="检索处方", variant="primary")
     metrics = gr.Dataframe(headers=["指标", "值"], label="召回指标", interactive=False)
     hits = gr.Dataframe(
-        headers=["Rank", "ID", "Score", "类型", "模板", "药物", "文本"],
-        label="召回结果",
+        headers=["Rank", "ID", "Score", "病名", "证型", "患者症状", "处方结果", "模板方结果"],
+        label="Top5 处方召回结果",
         interactive=False,
         wrap=True,
     )
