@@ -13,7 +13,7 @@ from medical.rag.es.es_processor import (
     DEFAULT_INDEX_NAME,
     _load_elasticsearch,
     embed_prescription_query,
-    retrieve_wuweiping_prescription_by_vector,
+    retrieve_prescription_by_vector,
 )
 
 
@@ -43,15 +43,15 @@ def hit_to_result(hit: dict[str, Any]) -> dict[str, Any]:
 
 def search(
     index_name: str,
-    diagnosis_result: str,
-    syndrome_result: str,
+    diagnosis_result: str | None,
+    syndrome_result: str | None,
     clinical_symptoms: str,
     top_k: int,
     embedding_model_type: str,
 ) -> dict[str, Any]:
     client = make_client()
     query_vector = embed_prescription_query(clinical_symptoms, embedding_model_type=embedding_model_type)
-    result = retrieve_wuweiping_prescription_by_vector(
+    result = retrieve_prescription_by_vector(
         client,
         index_name=index_name,
         diagnosis_result=diagnosis_result,
@@ -61,6 +61,7 @@ def search(
     )
     return {
         "same_disease_syndrome_count": result["same_disease_syndrome_count"],
+        "retrieval_mode": "keyword_filtered_vector" if (diagnosis_result or syndrome_result) else "vector_only",
         "results": [hit_to_result(hit) for hit in result["case_hits"]],
         "template_candidates": result["template_candidates"],
     }
@@ -69,8 +70,8 @@ def search(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Search Wu Weiping prescriptions.")
     parser.add_argument("--index", default=DEFAULT_INDEX_NAME)
-    parser.add_argument("--disease", required=True, help="病名，对应 diagnosis_sickness")
-    parser.add_argument("--syndrome", required=True, help="证型名，对应 diagnosis_disease")
+    parser.add_argument("--disease", default="", help="病名，对应 diagnosis_sickness；为空时不按病名过滤")
+    parser.add_argument("--syndrome", default="", help="证型名，对应 diagnosis_disease；为空时不按证候过滤")
     parser.add_argument("--symptoms", required=True, help="患者症状文本")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--embedding-model", default="doubao", choices=["doubao", "bge", "bge_large_zh", "bge_code", "bgem3"])

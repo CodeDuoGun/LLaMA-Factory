@@ -61,7 +61,7 @@ except Exception:
 DEFAULT_INDEX_NAME = "alpha_medical_prescription_rag_v1"
 DEFAULT_ANALYSIS_FILE = Path("medical/data/wuweiping_prescription_strategy_analysis.json")
 DEFAULT_TEMPLATE_FILE = Path("medical/data/wuweiping_template_prescription.json")
-DEFAULT_WUWEIPING_JSONL_FILE = Path("medical/processed_data/wuweiping_es_prescription.jsonl")
+DEFAULT_WUWEIPING_JSONL_FILE = Path("medical/processed_data/wuweiping_es_prescription_20260701.jsonl")
 
 
 def _require_dependency(dependency: Any, name: str) -> Any:
@@ -147,7 +147,7 @@ def build_index_body(dims: int, text_analyzer: str = "standard") -> dict[str, An
                 "clinical_symptoms_text": {"type": "text", "analyzer": text_analyzer},
                 "prescription_text": {"type": "text", "analyzer": text_analyzer},
                 "template_prescription_text": {"type": "text", "analyzer": text_analyzer},
-                "symptom_expert_drug_associations": {"type": "object", "enabled": True},
+                "medication_adjustment_analysis": {"type": "text", "analyzer": text_analyzer},
                 "text": {"type": "text", "analyzer": text_analyzer},
                 "metadata": {"type": "object", "enabled": True},
                 "embedding": {"type": "dense_vector", "dims": dims, "index": True, "similarity": "cosine"},
@@ -205,6 +205,33 @@ def _format_template_prescription(template_detail: dict[str, Any] | None, templa
     return ""
 
 
+def _format_medication_adjustment_analysis(row: dict[str, Any]) -> str:
+    lines = []
+    for item in row.get("symptom_adjustment_associations") or []:
+        # logger.debug(f"medication_adjustment_analysis item: {item}")
+        if not isinstance(item, dict):
+            continue
+        symptom_change = _clean_text(item.get("symptom_change") or item.get("symptom"))
+        if "不明确" in symptom_change or "人工" in symptom_change or "模型返回为空" in symptom_change:
+            logger.debug(f"skip symptom_change: {symptom_change}")
+            continue
+        drug_name = _clean_text(item.get("drug_name"))
+        adjustment = _clean_text(item.get("adjustment"))
+        reason = _clean_text(item.get("reason") or item.get("relation"))
+        if not any([symptom_change, drug_name, adjustment, reason]):
+            continue
+        parts = []
+        if symptom_change:
+            parts.append(f"因{symptom_change}")
+        if adjustment or drug_name:
+            parts.append(f"{adjustment}{drug_name}".strip())
+        if reason:
+            parts.append(f"原因分析：{reason}")
+        lines.append("，".join(parts))
+    logger.debug(f"medication_adjustment_analysis lines: {lines}")
+    return "\n".join(lines)
+
+
 def _normalize_dose(value: Any) -> Any:
     text = _clean_text(value)
     if not text:
@@ -216,50 +243,6 @@ def _normalize_dose(value: Any) -> Any:
     if number.is_integer():
         return int(number)
     return number
-
-
-def _parse_prescription_drug_detail(part: str, usage_type: str = "") -> dict[str, Any] | None:
-    text = re.sub(r"\s+", "", _clean_text(part))
-    text = text.strip(" 。,，、；;")
-    if not text:
-        return None
-    match = re.match(r"^(?P<name>.+?)(?P<dose>\d+(?:\.\d+)?)(?P<unit>g|克|mg|ml|片|粒|袋|支|瓶|盒|丸)?$", text, flags=re.IGNORECASE)
-    if match:
-        return {
-            "drug_name": match.group("name"),
-            "dose": _normalize_dose(match.group("dose")),
-            "unit": match.group("unit") or "",
-            "usage_type": usage_type,
-        }
-    return {"drug_name": text, "dose": "", "unit": "", "usage_type": usage_type}
-
-
-def _probability(value: Any) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    return round(max(0.0, min(1.0, number)), 4)
-
-
-def build_symptom_expert_drug_associations(row: dict[str, Any]) -> list[dict[str, Any]]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for item in row.get("symptom_prescription_associations") or []:
-        if not isinstance(item, dict):
-            continue
-        symptom = _clean_text(item.get("symptom"))
-        drug_name = _clean_text(item.get("drug_name"))
-        if not symptom or not drug_name:
-            continue
-        grouped.setdefault(symptom, []).append(
-            {
-                "drug_name": drug_name,
-                "probability": _probability(item.get("confidence", item.get("probability"))),
-                "relation": _clean_text(item.get("relation") or item.get("reason")),
-            }
-        )
-
-    return [{"symptom": symptom, "drugs": drugs} for symptom, drugs in grouped.items()]
 
 
 def build_wuweiping_embedding_text(row: dict[str, Any]) -> str:
@@ -293,6 +276,7 @@ def build_wuweiping_prescription_doc(row: dict[str, Any], embedding: list[float]
     template_detail = row.get("matched_template_detail") or {}
     template_name = _clean_text(row.get("matched_template_name"))
     template_prescription_text = _format_template_prescription(template_detail, template_name)
+    medication_adjustment_analysis = _format_medication_adjustment_analysis(row)
 
     doc_id = f"case_prescription:{_stable_doc_part(row.get('id'))}:{_stable_doc_part(row.get('order_sn'))}"
     text = build_wuweiping_embedding_text(row)
@@ -312,7 +296,7 @@ def build_wuweiping_prescription_doc(row: dict[str, Any], embedding: list[float]
         "clinical_symptoms_text": clinical_symptoms,
         "prescription_text": prescription_text,
         "template_prescription_text": template_prescription_text,
-        "symptom_expert_drug_associations": build_symptom_expert_drug_associations(row),
+        "medication_adjustment_analysis": medication_adjustment_analysis,
         "text": text,
         "metadata": {
             "record": row,
@@ -499,13 +483,17 @@ def structured_filter(
     chunk_types: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     filters = []
-    if diagnosis_result is not None:
+    diagnosis_result = _clean_text(diagnosis_result)
+    syndrome_result = _clean_text(syndrome_result)
+    sex = _clean_text(sex)
+    age_bucket_value = _clean_text(age_bucket_value)
+    if diagnosis_result:
         filters.append({"term": {"diagnosis_result": diagnosis_result}})
-    if syndrome_result is not None:
+    if syndrome_result:
         filters.append({"term": {"syndrome_result": syndrome_result}})
-    if sex is not None:
+    if sex:
         filters.append({"term": {"sex": sex}})
-    if age_bucket_value is not None:
+    if age_bucket_value:
         filters.append({"term": {"age_bucket": age_bucket_value}})
     if chunk_types:
         filters.append({"terms": {"chunk_type": chunk_types}})
@@ -553,8 +541,8 @@ def vector_query(
 
 def same_disease_syndrome_vector_query(
     query_vector: list[float],
-    diagnosis_result: str,
-    syndrome_result: str,
+    diagnosis_result: str | None = None,
+    syndrome_result: str | None = None,
     k: int = 5,
     num_candidates: int = 100,
 ) -> dict[str, Any]:
@@ -621,8 +609,8 @@ def search_same_disease_syndrome_cases(
 def count_same_disease_syndrome_cases(
     client: Any,
     index_name: str,
-    diagnosis_result: str,
-    syndrome_result: str,
+    diagnosis_result: str | None = None,
+    syndrome_result: str | None = None,
 ) -> int:
     response = client.count(
         index=index_name,
@@ -640,9 +628,9 @@ def count_same_disease_syndrome_cases(
 def vector_search_same_disease_syndrome_cases(
     client: Any,
     index_name: str,
-    diagnosis_result: str,
-    syndrome_result: str,
     query_vector: list[float],
+    diagnosis_result: str | None = None,
+    syndrome_result: str | None = None,
     top_k: int = 5,
     num_candidates: int = 100,
 ) -> list[dict[str, Any]]:
@@ -712,11 +700,11 @@ def retrieve_prescription_by_disease_syndrome_symptoms(
     return {"case_hits": case_hits, "template_candidates": template_candidates}
 
 
-def retrieve_wuweiping_prescription_by_vector(
+def retrieve_prescription_by_vector(
     client: Any,
     index_name: str,
-    diagnosis_result: str,
-    syndrome_result: str,
+    diagnosis_result: str | None,
+    syndrome_result: str | None,
     query_vector: list[float],
     top_k: int = 5,
     num_candidates: int = 100,
@@ -1166,7 +1154,7 @@ class ElasticsearchHandler:
             template_limit=template_limit,
         )
 
-    def retrieve_wuweiping_prescription_by_vector(
+    def retrieve_prescription_by_vector(
         self,
         index_name: str,
         diagnosis_result: str,
@@ -1176,7 +1164,7 @@ class ElasticsearchHandler:
         num_candidates: int = 100,
         template_limit: int = 5,
     ) -> dict[str, Any]:
-        return retrieve_wuweiping_prescription_by_vector(
+        return retrieve_prescription_by_vector(
             self.es,
             index_name=index_name,
             diagnosis_result=diagnosis_result,

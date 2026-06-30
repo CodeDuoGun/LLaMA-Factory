@@ -9,3 +9,6 @@ pydantic-settings
 dynaconf
 pymysql
 requests
+elasticsearch==8.17.1
+pandas
+elasticsearch-dsl==8.17.1

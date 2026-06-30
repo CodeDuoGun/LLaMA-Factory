@@ -12,7 +12,7 @@ from medical.rag.es.es_processor import (
     evaluate_retrieval,
     hybrid_search,
     retrieve_prescription_by_disease_syndrome_symptoms,
-    retrieve_wuweiping_prescription_by_vector,
+    retrieve_prescription_by_vector,
 )
 
 from medical.config import config
@@ -123,7 +123,7 @@ def run_recall_test(
         case_diagnosis = case.get("diagnosis_result") or diagnosis_result or None
         case_syndrome = case.get("syndrome_result") or syndrome_result or None
         case_symptoms = case.get("clinical_symptoms") or case.get("query_text") or clinical_symptoms
-        result = retrieve_wuweiping_prescription_by_vector(
+        result = retrieve_prescription_by_vector(
             client,
             index_name=index_name,
             diagnosis_result=case_diagnosis,
@@ -145,7 +145,7 @@ def run_recall_test(
             {"metrics": metrics, "details": metrics.get("details", []), "template_candidates": templates},
         )
 
-    result = retrieve_wuweiping_prescription_by_vector(
+    result = retrieve_prescription_by_vector(
         client,
         index_name=index_name,
         diagnosis_result=diagnosis_result,

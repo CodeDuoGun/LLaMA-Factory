@@ -314,6 +314,23 @@ def _template_match_prescription_source(record: dict[str, Any]) -> Any:
     return record
 
 
+def _template_match_detail_for_record(
+    record: dict[str, Any],
+    templates: list[dict[str, Any]] | None = None,
+    linked_internal_prescription: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    existing_match_detail = record.get("matched_template_detail")
+    if isinstance(existing_match_detail, dict) and existing_match_detail:
+        return existing_match_detail
+    if templates is None:
+        return {}
+    if extract_drug_names_from_prescription(record.get("ps")):
+        source = record
+    else:
+        source = {"ps": linked_internal_prescription.get("ps", []) if linked_internal_prescription else []}
+    return find_most_similar_template(source, templates)
+
+
 def add_most_similar_template_detail(record: dict[str, Any], templates: list[dict[str, Any]]) -> dict[str, Any]:
     enriched = dict(record)
     match_detail = find_most_similar_template(_template_match_prescription_source(record), templates)
@@ -367,28 +384,6 @@ def _clean_association_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _normalize_prescription_associations(items: Any, source_text: str = "") -> list[dict[str, Any]]:
-    if not isinstance(items, list):
-        return []
-    associations = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        symptom = _clean_association_text(item.get("symptom"))
-        if source_text and not _normalized_contains(source_text, symptom):
-            continue
-        associations.append(
-            {
-                "symptom": symptom,
-                "drug_name": _clean_association_text(item.get("drug_name")),
-                "relation": _clean_association_text(item.get("relation") or item.get("reason")),
-                "evidence": _clean_association_text(item.get("evidence")),
-                "confidence": _confidence(item.get("confidence")),
-            }
-        )
-    return [item for item in associations if item["symptom"] and item["drug_name"]]
-
-
 def _normalize_adjustment_associations(items: Any, source_text: str = "") -> list[dict[str, Any]]:
     if not isinstance(items, list):
         return []
@@ -410,6 +405,42 @@ def _normalize_adjustment_associations(items: Any, source_text: str = "") -> lis
             }
         )
     return [item for item in associations if item["symptom_change"] and item["drug_name"]]
+
+
+def _requires_adjustment_associations(match_detail: dict[str, Any] | None) -> bool:
+    if not isinstance(match_detail, dict):
+        return False
+    return bool(match_detail.get("missing_template_drugs") or match_detail.get("extra_prescription_drugs"))
+
+
+def _list_text(values: Any) -> str:
+    if not isinstance(values, list):
+        return ""
+    return "、".join(_clean_association_text(value) for value in values if _clean_association_text(value))
+
+
+def _empty_adjustment_association_reason(match_detail: dict[str, Any], source_text: str = "") -> list[dict[str, Any]]:
+    missing_drugs = _list_text(match_detail.get("missing_template_drugs"))
+    extra_drugs = _list_text(match_detail.get("extra_prescription_drugs"))
+    changed_drugs = "、".join(item for item in [missing_drugs, extra_drugs] if item) or "模板差异药物"
+    adjustment = "加药/减药" if missing_drugs and extra_drugs else "减药" if missing_drugs else "加药"
+    reason_parts = [
+        "模型返回为空",
+        "matched_template_detail 中存在缺失或新增药物",
+        "但模型未能基于原文症状、检查异常、舌面情况与药物药性功效形成明确关联说明",
+    ]
+    if source_text:
+        reason_parts.append("需人工结合原文进一步确认")
+    return [
+        {
+            "symptom_change": "症状与用药调整关联不明确",
+            "drug_name": changed_drugs,
+            "adjustment": adjustment,
+            "reason": "；".join(reason_parts),
+            "evidence": source_text[:200],
+            "confidence": 0.0,
+        }
+    ]
 
 
 def _format_image_context(record: dict[str, Any], fields: list[str]) -> str:
@@ -437,7 +468,6 @@ def pack_record(
     clinical_symptoms_text: str = "",
     inspection_abnormalities: str = "",
     tongue_face_findings: str = "",
-    symptom_prescription_associations: list[dict[str, Any]] | None = None,
     symptom_adjustment_associations: list[dict[str, Any]] | None = None,
     templates: list[dict[str, Any]] | None = None,
     linked_internal_prescription: dict[str, Any] | None = None,
@@ -451,7 +481,6 @@ def pack_record(
     packed["clinical_symptoms_text"] = clinical_symptoms_text or "，".join(
         item for item in [clinical_symptoms, inspection_abnormalities, tongue_face_findings] if item
     )
-    packed["symptom_prescription_associations"] = symptom_prescription_associations or []
     packed["symptom_adjustment_associations"] = symptom_adjustment_associations or []
     if templates is not None:
         packed = add_most_similar_template_detail(packed, templates)
@@ -496,33 +525,21 @@ def _prompt_record_item(
     }
     if linked_internal_prescription:
         item["linked_internal_prescription"] = linked_internal_prescription
-    existing_match_detail = record.get("matched_template_detail")
-    if isinstance(existing_match_detail, dict) and existing_match_detail:
-        item["matched_template_detail"] = existing_match_detail
+    match_detail = _template_match_detail_for_record(
+        record,
+        templates=templates,
+        linked_internal_prescription=linked_internal_prescription,
+    )
+    if match_detail:
+        item["matched_template_detail"] = match_detail
         item["matched_template"] = {
-            "template_id": existing_match_detail.get("template_id") or record.get("matched_template_id"),
-            "template_name": existing_match_detail.get("template_name") or record.get("matched_template_name"),
-            "overlap_drugs": existing_match_detail.get("overlap_drugs", []),
-            "missing_template_drugs": existing_match_detail.get("missing_template_drugs", []),
-            "extra_prescription_drugs": existing_match_detail.get("extra_prescription_drugs", []),
+            "template_id": match_detail.get("template_id") or record.get("matched_template_id"),
+            "template_name": match_detail.get("template_name") or record.get("matched_template_name"),
+            "overlap_drugs": match_detail.get("overlap_drugs", []),
+            "missing_template_drugs": match_detail.get("missing_template_drugs", []),
+            "extra_prescription_drugs": match_detail.get("extra_prescription_drugs", []),
+            "drugs": match_detail.get("drugs", []),
         }
-        return item
-    if templates is not None:
-        if extract_drug_names_from_prescription(record.get("ps")):
-            source = record
-        else:
-            source = {"ps": linked_internal_prescription.get("ps", []) if linked_internal_prescription else []}
-        match_detail = find_most_similar_template(source, templates)
-        if match_detail:
-            item["matched_template_detail"] = match_detail
-            item["matched_template"] = {
-                "template_id": match_detail.get("template_id"),
-                "template_name": match_detail.get("template_name"),
-                "overlap_drugs": match_detail.get("overlap_drugs", []),
-                "missing_template_drugs": match_detail.get("missing_template_drugs", []),
-                "extra_prescription_drugs": match_detail.get("extra_prescription_drugs", []),
-                "drugs": match_detail.get("drugs", []),
-            }
     return item
 
 
@@ -540,6 +557,7 @@ def build_symptom_extraction_prompt(
         )
         for record in records
     ]
+    # print(f"records {items[0]}")
     prompt = f"""请从以下中医问诊病历中抽取“本次就诊可用于相似病例检索的临床症状”。
 
 抽取规则：
@@ -551,10 +569,12 @@ def build_symptom_extraction_prompt(
 6. 检查所见异常必须记录到 inspection_abnormalities；包括化验、影像、皮肤镜、病理、报告描述里的异常结果。正常结果可以不写，除非文本强调“检查未见异常”。
 7. 舌面情况必须记录到 tongue_face_findings；包括舌质、舌苔、舌下络脉、面部颜色、皮损外观、照片文字描述等。
 8. 如果上下文只有检查报告图片或舌面图片 URL、没有文字描述，不能编造图片内容；可在对应字段写“有检查报告图片，待 OCR/视觉识别”或“有舌面图片，待视觉识别”。
-9. clinical_symptoms_text 用于 ES 检索，应合并“当前症状 + 新增症状 + 病情变化 + 疗效反馈 + 检查所见异常 + 舌面情况”，不要写成列表，不要包含药名和诊断名。
-10. 分析 symptom_prescription_associations：只分析“输入文本明确提及的症状”和最终内服处方药物之间的可能关联，症状必须来自输入文本，不允许编造未提及症状；每条给出 confidence，范围 0-1。
-11. 分析 symptom_adjustment_associations：结合 matched_template_detail 中缺失/新增/重叠药物，分析“输入文本明确提及的症状变化”和用药加、减、保留、剂量变化之间的可能关联；症状变化必须来自输入文本，每条给出 confidence，范围 0-1。
-
+9. clinical_symptoms_text 用于 ES 检索，应合并“当前症状 + 新增症状 + 病情变化 + 疗效反馈 + 检查所见异常 + 舌面情况 + 二便情况 + 饮食情况 + 睡眠情况， 女性患者重点记录月经情况”，不要写成列表，不要包含药名和诊断名。
+10. 分析 symptom_adjustment_associations：结合 matched_template_detail 中 missing_template_drugs 和 extra_prescription_drugs，缺失/新增药物，分析“输入文本明确提及的症状变化”和用药加、减、剂量变化之间的可能关联；症状变化必须来自输入文本，每条给出 confidence，范围 0-1。
+11. 如果 matched_template_detail.missing_template_drugs 和 extra_prescription_drugs 任意一个不为空，symptom_adjustment_associations 必须为非空数组，至少返回 1 条，不能返回空数组。
+12. 生成 symptom_adjustment_associations 时，必须从当前症状、症状变化、检查异常、舌面情况中选择原文出现的短语作为 symptom_change；reason 必须结合该症状/体征和药物的药性、功效或治疗方向，说明为什么可能加用、减去、保留或调整该药。即使无法确定严格因果，也要给出“可能的辨证/治疗方向解释”，不要因为不确定而留空。
+13. 如果确实无法从输入文本建立症状/体征与加减药的关联，也不能返回空数组；请返回 1 条原因说明：symptom_change 写“症状与用药调整关联不明确”，drug_name 填 missing_template_drugs 和 extra_prescription_drugs 中涉及的药物，adjustment 写“加药/减药/加药、减药”，reason 写明“字段为空的原因”，例如“原文仅有处方差异，缺少可对应到该药药性、功效或治疗方向的症状变化证据”，confidence 设为 0。
+14. drug_name 必须优先覆盖 matched_template_detail.missing_template_drugs 和 extra_prescription_drugs 中的药物；多个药物治疗方向相近时可以合并到一条。
 只返回 JSON 数组，不要输出解释。每项格式：
 [
   {{
@@ -563,21 +583,12 @@ def build_symptom_extraction_prompt(
     "inspection_abnormalities": "检查所见异常",
     "tongue_face_findings": "舌面情况",
     "clinical_symptoms_text": "用于 ES 检索的合并症状文本",
-    "symptom_prescription_associations": [
-      {{
-        "symptom": "输入文本中出现的症状",
-        "drug_name": "最终内服处方药名",
-        "relation": "症状与该药物的可能治疗/辨证关联",
-        "evidence": "输入文本中的依据短句",
-        "confidence": 0.0
-      }}
-    ],
     "symptom_adjustment_associations": [
       {{
-        "symptom_change": "输入文本中出现的症状变化",
-        "drug_name": "与相似模版方相比，发生加减或保留的药名",
-        "adjustment": "加药/减药/保留/剂量增加/剂量减少",
-        "reason": "症状变化与用药调整的可能关系",
+        "symptom_change": "症状变化描述",
+        "drug_name": "与相似模版方相比，发生加减的药名，如果治疗方向或者药性相同的药物，放在一起，用逗号分隔",
+        "adjustment": "加药/减药/剂量增加/剂量减少",
+        "reason": "基于当前症状、症状变化、检查异常或舌面情况，并结合药物药性、功效或治疗方向，解释该加减药的可能原因",
         "evidence": "输入文本中的依据短句",
         "confidence": 0.0
       }}
@@ -597,9 +608,6 @@ def build_symptom_extraction_prompt(
     "inspection_abnormalities": "白细胞偏高",
     "tongue_face_findings": "舌红苔黄腻，面部潮红",
     "clinical_symptoms_text": "面部红斑较前减轻，丘疹减少，仍有口干，鼻翼潮红加重，熬夜诱发，白细胞偏高，舌红苔黄腻，面部潮红",
-    "symptom_prescription_associations": [
-      {{"symptom": "口干", "drug_name": "生地黄", "relation": "养阴清热以改善口干", "evidence": "仍有口干", "confidence": 0.72}}
-    ],
     "symptom_adjustment_associations": [
       {{"symptom_change": "鼻翼潮红近3日加重", "drug_name": "黄芩片", "adjustment": "保留", "reason": "清热解毒以应对潮红加重", "evidence": "鼻翼潮红近3日加重", "confidence": 0.68}}
     ]
@@ -612,13 +620,14 @@ def build_symptom_extraction_prompt(
     return prompt
 
 
-def parse_symptom_response(response_text: str, source_text_by_id: dict[Any, str] | None = None) -> dict[Any, dict[str, Any]]:
+def parse_symptom_response(
+    response_text: str,
+    source_text_by_id: dict[Any, str] | None = None,
+    match_detail_by_id: dict[Any, dict[str, Any]] | None = None,
+) -> dict[Any, dict[str, Any]]:
     source_text_by_id = source_text_by_id or {}
-    text = response_text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.startswith("json"):
-            text = text[4:].strip()
+    match_detail_by_id = match_detail_by_id or {}
+    text = _extract_json_payload(response_text)
     data = json.loads(text)
     if isinstance(data, dict):
         data = data.get("items") or data.get("data") or []
@@ -627,6 +636,13 @@ def parse_symptom_response(response_text: str, source_text_by_id: dict[Any, str]
         if isinstance(item, dict) and item.get("id") is not None:
             item_id = item["id"]
             source_text = source_text_by_id.get(item_id, "")
+            adjustment_associations = _normalize_adjustment_associations(
+                item.get("symptom_adjustment_associations"),
+                source_text=source_text,
+            )
+            match_detail = match_detail_by_id.get(item_id)
+            if _requires_adjustment_associations(match_detail) and not adjustment_associations:
+                adjustment_associations = _empty_adjustment_association_reason(match_detail or {}, source_text)
             result[item_id] = {
                 "clinical_symptoms": str(item.get("clinical_symptoms") or "").strip(),
                 "clinical_symptoms_text": str(
@@ -634,41 +650,79 @@ def parse_symptom_response(response_text: str, source_text_by_id: dict[Any, str]
                 ).strip(),
                 "inspection_abnormalities": str(item.get("inspection_abnormalities") or "").strip(),
                 "tongue_face_findings": str(item.get("tongue_face_findings") or "").strip(),
-                "symptom_prescription_associations": _normalize_prescription_associations(
-                    item.get("symptom_prescription_associations"),
-                    source_text=source_text,
-                ),
-                "symptom_adjustment_associations": _normalize_adjustment_associations(
-                    item.get("symptom_adjustment_associations"),
-                    source_text=source_text,
-                ),
+                "symptom_adjustment_associations": adjustment_associations,
             }
     return result
 
 
-def create_llm_call(model: str) -> Callable[[str], str]:
-    """Create an LLM caller lazily so normal packing has no network dependency."""
-    from openai import OpenAI
+def _extract_json_payload(response_text: str) -> str:
+    text = response_text.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
 
-    api_key = config.DASHSCOPE_API_KEY
-    base_url = config.DASHSCOPE_BASE_URL
-    if not api_key:
-        raise RuntimeError("Set ARK_API_KEY or OPENAI_API_KEY before using --extract-clinical-symptoms.")
+    starts = [index for index in (text.find("["), text.find("{")) if index != -1]
+    if not starts:
+        return text
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    decoder = json.JSONDecoder()
+    start = min(starts)
+    _, end = decoder.raw_decode(text[start:])
+    return text[start : start + end]
 
-    def call(prompt: str) -> str:
-        logger.debug(f"Calling LLM with model: {model}")
-        completion = client.chat.completions.create(
+
+from openai import OpenAI
+
+def create_llm_call(model: str):
+
+    provider = config.LLM_PROVIDER.lower()
+    if provider == "dashscope":
+        client = OpenAI(
+            api_key=config.DASHSCOPE_API_KEY,
+            base_url=config.DASHSCOPE_BASE_URL,
+        )
+
+    elif provider == "deepseek":
+        client = OpenAI(
+            api_key=config.DEEPSEEK_API_KEY,
+            base_url=config.DEEPSEEK_BASE_URL,
+        )
+        model = config.DEEPSEEK_MODEL
+
+    elif provider == "baichuan":
+        client = OpenAI(
+            api_key=config.BAICHUAN_API_KEY,
+            base_url=config.BAICHUAN_BASE_URL,
+        )
+        model = config.BAICHUAN_TEXT_MODEL
+
+    elif provider == "ark":
+        client = OpenAI(
+            api_key=config.ARK_API_KEY,
+            base_url=config.ARK_BASE_URL,
+        )
+
+    else:
+        raise ValueError(f"Unsupported provider: {provider}")
+
+    def call(prompt: str):
+        response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "你是中医病历结构化抽取助手。"},
-                {"role": "user", "content": prompt},
+                # {
+                #     "role": "system",
+                #     "content": "你是中医病历结构化抽取助手。"
+                # },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
             ],
             temperature=0,
         )
-        return completion.choices[0].message.content or "[]"
-
+        logger.debug(f"response: {response.choices[0].message.content[:100]}")
+        return response.choices[0].message.content or "[]"
+    logger.debug(f"call llm with model {model}")
     return call
 
 
@@ -677,24 +731,71 @@ def fill_clinical_symptoms(
     llm_call: Callable[[str], str],
     batch_size: int = 10,
     templates: list[dict[str, Any]] | None = None,
+    append_output: Path | None = None,
 ) -> list[dict[str, Any]]:
     packed_records = []
     linked_prescriptions = build_previous_internal_prescription_map(records)
-    for start in range(0, len(records), batch_size):
-        batch = records[start : start + batch_size]
+    if append_output is not None:
+        append_output.parent.mkdir(parents=True, exist_ok=True)
+        append_output.write_text("", encoding="utf-8")
+
+    def _pack_with_default(record: dict[str, Any]) -> dict[str, Any]:
+        return pack_record(
+            record,
+            templates=templates,
+            linked_internal_prescription=linked_prescriptions.get(record.get("id")),
+        )
+
+    def _extract_batch(batch_records: list[dict[str, Any]]) -> dict[Any, dict[str, Any]]:
+        source_text_by_id = {record.get("id"): build_clinical_context(record) for record in batch_records}
+        match_detail_by_id = {
+            record.get("id"): _template_match_detail_for_record(
+                record,
+                templates=templates,
+                linked_internal_prescription=linked_prescriptions.get(record.get("id")),
+            )
+            for record in batch_records
+        }
         response = llm_call(
             build_symptom_extraction_prompt(
-                batch,
+                batch_records,
                 templates=templates,
                 linked_prescriptions=linked_prescriptions,
             )
         )
-        source_text_by_id = {record.get("id"): build_clinical_context(record) for record in batch}
-        symptom_map = parse_symptom_response(response, source_text_by_id=source_text_by_id)
+        return parse_symptom_response(
+            response,
+            source_text_by_id=source_text_by_id,
+            match_detail_by_id=match_detail_by_id,
+        )
+
+    for start in range(0, len(records), batch_size):
+        batch = records[start : start + batch_size]
+        try:
+            symptom_map = _extract_batch(batch)
+        except Exception as exc:
+            logger.warning(
+                "failed to extract clinical symptoms for batch ids %s, fallback to single-record mode: %s",
+                [record.get("id") for record in batch],
+                exc,
+            )
+            symptom_map = {}
+            for record in batch:
+                try:
+                    symptom_map.update(_extract_batch([record]))
+                except Exception as single_exc:
+                    logger.warning(
+                        "failed to extract clinical symptoms for record %s, use default empty extraction: %s",
+                        record.get("id"),
+                        single_exc,
+                    )
         for record in batch:
             extracted = symptom_map.get(record.get("id"), {})
             if isinstance(extracted, str):
                 extracted = {"clinical_symptoms": extracted, "clinical_symptoms_text": extracted}
+            if not extracted:
+                packed_records.append(_pack_with_default(record))
+                continue
             packed_records.append(
                 pack_record(
                     record,
@@ -703,6 +804,10 @@ def fill_clinical_symptoms(
                     **extracted,
                 )
             )
+        if append_output is not None:
+            with append_output.open("a", encoding="utf-8") as f:
+                for packed_record in packed_records[-len(batch) :]:
+                    f.write(json.dumps(packed_record, ensure_ascii=False, separators=(",", ":")) + "\n")
     return packed_records
 
 
@@ -716,6 +821,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=os.getenv("ARK_MODEL", "qwen3.6-flash"))
     parser.add_argument("--template-file", type=Path, default=DEFAULT_TEMPLATE_FILE)
     parser.add_argument("--no-template-match", action="store_true", help="Skip matched template enrichment.")
+    parser.add_argument(
+        "--append-output",
+        action="store_true",
+        help="Write each processed batch to output immediately; useful for long background runs.",
+    )
     return parser.parse_args()
 
 
@@ -726,7 +836,7 @@ def main() -> None:
     if args.limit:
         records = records[: args.limit]
     templates = None if args.no_template_match else load_templates(args.template_file)
-    print(f"templates: length {len(templates)}")
+    print(f"templates: {templates[0]}")
 
     if args.extract_clinical_symptoms:
         packed_records = fill_clinical_symptoms(
@@ -734,11 +844,13 @@ def main() -> None:
             create_llm_call(args.model),
             batch_size=args.batch_size,
             templates=templates,
+            append_output=args.output if args.append_output else None,
         )
     else:
         packed_records = pack_records(records, templates=templates)
 
-    write_jsonl(packed_records, args.output)
+    if not (args.extract_clinical_symptoms and args.append_output):
+        write_jsonl(packed_records, args.output)
     print(f"wrote {len(packed_records)} records to {args.output}")
 
 

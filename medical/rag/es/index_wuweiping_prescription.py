@@ -81,7 +81,7 @@ def index_wuweiping_prescriptions(
             embedding = embed_prescription_query(embedding_text, embedding_model_type=embedding_model_type)
             docs.append(build_wuweiping_prescription_doc(row, embedding=[float(item) for item in embedding]))
         bulk_upsert(client, index_name, docs)
-        break
+        # break
         count += len(docs)
         print(f"indexed {count}/{len(rows)} docs")
     return count
