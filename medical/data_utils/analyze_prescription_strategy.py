@@ -7,6 +7,7 @@
 import argparse
 import itertools
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,40 @@ SYNDROME_ALIASES = {
     "湿毒蕴肤症": "湿毒蕴肤证",
     "脾虚湿蕴证": "脾虚湿蕴肌肤证",
 }
+
+SYMPTOM_KEYWORDS = [
+    "鼻翼潮红",
+    "面部潮红",
+    "毛细血管扩张",
+    "皮肤屏障受损",
+    "脓疱",
+    "丘疹",
+    "粉刺",
+    "红斑",
+    "发红",
+    "潮红",
+    "发烫",
+    "灼热",
+    "瘙痒",
+    "疼痛",
+    "刺痛",
+    "肿胀",
+    "脱屑",
+    "干燥",
+    "干紧",
+    "油腻",
+    "口干",
+    "口苦",
+    "便秘",
+    "腹泻",
+    "睡眠差",
+    "失眠",
+    "月经不调",
+    "舌红",
+    "苔黄",
+    "苔白",
+    "苔腻",
+]
 
 
 def normalize_name(value: Any, aliases: dict[str, str]) -> str:
@@ -60,6 +95,27 @@ def load_templates(path: Path) -> list[dict[str, Any]]:
 
 def clean_drug_name(value: Any) -> str:
     return "" if value is None else str(value).strip()
+
+
+def clinical_text(record: dict[str, Any]) -> str:
+    clinical_info = record.get("clinical_info") or {}
+    parts = [
+        clinical_info.get("doctor_symptom_summary"),
+        clinical_info.get("patient_symptoms"),
+        clinical_info.get("present_history"),
+        clinical_info.get("exam_findings"),
+        clinical_info.get("inspection_abnormalities"),
+        clinical_info.get("tongue_face_findings"),
+        record.get("chief_complaint"),
+        record.get("present_history"),
+    ]
+    return "。".join(str(part).strip() for part in parts if str(part or "").strip())
+
+
+def extract_symptom_tags(text: Any) -> list[str]:
+    normalized = re.sub(r"\s+", "", str(text or ""))
+    tags = [keyword for keyword in SYMPTOM_KEYWORDS if keyword in normalized]
+    return sorted(set(tags), key=tags.index)
 
 
 def dose_key(value: Any) -> str:
@@ -158,6 +214,7 @@ def flatten_prescriptions(records: list[dict[str, Any]], templates: list[dict[st
             "report_images": report_images,
             "face_tongue_images": face_tongue_images,
         }
+        symptom_tags = extract_symptom_tags(clinical_text(record))
         for prescription in record.get("internal_prescriptions", []):
             drugs = prescription.get("drugs", [])
             match = match_template(prescription, templates)
@@ -168,6 +225,7 @@ def flatten_prescriptions(records: list[dict[str, Any]], templates: list[dict[st
                     "diagnosis_result": diagnosis_result,
                     "diagnosis_syndrome": diagnosis_syndrome,
                     "clinical_info": normalized_clinical_info,
+                    "symptom_tags": symptom_tags,
                     "prescription_order_id": prescription.get("prescription_order_id"),
                     "drug_count": len(drug_set(drugs)),
                     "drugs": drugs,
@@ -254,6 +312,53 @@ def summarize_inquiry_template_matches(rows: list[dict[str, Any]]) -> list[dict[
     return matches
 
 
+def symptom_drug_associations(rows: list[dict[str, Any]], target: str = "drugs", limit: int = 50) -> list[dict[str, Any]]:
+    total = len(rows)
+    min_co_count = 3 if total >= 100 else 2 if total >= 20 else 1
+    symptom_counter = Counter()
+    drug_counter = Counter()
+    pair_counter = Counter()
+
+    for row in rows:
+        symptoms = set(row.get("symptom_tags") or [])
+        if target == "drugs":
+            drugs = drug_set(row.get("drugs", []))
+        else:
+            drugs = {clean_drug_name(item) for item in row.get(target, []) if clean_drug_name(item)}
+        if not symptoms or not drugs:
+            continue
+        symptom_counter.update(symptoms)
+        drug_counter.update(drugs)
+        for symptom in symptoms:
+            for drug in drugs:
+                pair_counter[(symptom, drug)] += 1
+
+    associations = []
+    for (symptom, drug), co_count in pair_counter.items():
+        if co_count < min_co_count:
+            continue
+        symptom_count = symptom_counter[symptom]
+        drug_count = drug_counter[drug]
+        confidence = co_count / symptom_count if symptom_count else 0
+        drug_rate = drug_count / total if total else 0
+        lift = confidence / drug_rate if drug_rate else 0
+        associations.append(
+            {
+                "symptom": symptom,
+                "drug_name": drug,
+                "co_count": co_count,
+                "symptom_count": symptom_count,
+                "drug_count": drug_count,
+                "support": round(co_count / total, 4) if total else 0,
+                "confidence": round(confidence, 4),
+                "lift": round(lift, 4),
+            }
+        )
+
+    associations.sort(key=lambda item: (item["lift"], item["co_count"], item["confidence"]), reverse=True)
+    return associations[:limit]
+
+
 def summarize_rows(
     rows: list[dict[str, Any]],
     template_catalog: dict[str, dict[str, Any]],
@@ -298,6 +403,9 @@ def summarize_rows(
         "top_added_drugs": top_counter(added_counter, prescription_count, "drug_name", 20),
         "top_removed_drugs": top_counter(removed_counter, prescription_count, "drug_name", 20),
         "top_drug_pairs": top_counter(pair_counter, prescription_count, "drug_pair", 20),
+        "top_symptom_drug_associations": symptom_drug_associations(rows, "drugs", 50),
+        "top_symptom_added_drug_associations": symptom_drug_associations(rows, "added_drugs", 50),
+        "top_symptom_removed_drug_associations": symptom_drug_associations(rows, "removed_drugs", 50),
         "dose_distribution": {
             name: top_counter(counter, sum(counter.values()), "dose", 8)
             for name, counter in sorted(dose_distribution.items())

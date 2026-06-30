@@ -147,6 +147,7 @@ def build_index_body(dims: int, text_analyzer: str = "standard") -> dict[str, An
                 "clinical_symptoms_text": {"type": "text", "analyzer": text_analyzer},
                 "prescription_text": {"type": "text", "analyzer": text_analyzer},
                 "template_prescription_text": {"type": "text", "analyzer": text_analyzer},
+                "symptom_expert_drug_associations": {"type": "object", "enabled": True},
                 "text": {"type": "text", "analyzer": text_analyzer},
                 "metadata": {"type": "object", "enabled": True},
                 "embedding": {"type": "dense_vector", "dims": dims, "index": True, "similarity": "cosine"},
@@ -233,18 +234,50 @@ def _parse_prescription_drug_detail(part: str, usage_type: str = "") -> dict[str
     return {"drug_name": text, "dose": "", "unit": "", "usage_type": usage_type}
 
 
+def _probability(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(max(0.0, min(1.0, number)), 4)
+
+
+def build_symptom_expert_drug_associations(row: dict[str, Any]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in row.get("symptom_prescription_associations") or []:
+        if not isinstance(item, dict):
+            continue
+        symptom = _clean_text(item.get("symptom"))
+        drug_name = _clean_text(item.get("drug_name"))
+        if not symptom or not drug_name:
+            continue
+        grouped.setdefault(symptom, []).append(
+            {
+                "drug_name": drug_name,
+                "probability": _probability(item.get("confidence", item.get("probability"))),
+                "relation": _clean_text(item.get("relation") or item.get("reason")),
+            }
+        )
+
+    return [{"symptom": symptom, "drugs": drugs} for symptom, drugs in grouped.items()]
+
+
 def build_wuweiping_embedding_text(row: dict[str, Any]) -> str:
     """
     向量检索中，只存储诊断结果和临床表现，不存储处方和模板方内容。
     """
     diagnosis_result = _clean_text(row.get("diagnosis_sickness"))
     syndrome_result = _clean_text(row.get("diagnosis_disease"))
+    patient_sex = _clean_text(row.get("patient_sex"))
+    patient_age = "" if row.get("patient_age") is None else str(row.get("patient_age")).strip()
     clinical_symptoms = _clean_text(row.get("clinical_symptoms_text") or row.get("clinical_symptoms"))
     return "\n".join(
         part
         for part in [
             f"{diagnosis_result}",
             f"{syndrome_result}",
+            f"患者性别：{patient_sex}",
+            f"患者年龄：{patient_age}",
             f"患者症状：{clinical_symptoms}",
         ]
         if part and not part.endswith("：")
@@ -279,6 +312,7 @@ def build_wuweiping_prescription_doc(row: dict[str, Any], embedding: list[float]
         "clinical_symptoms_text": clinical_symptoms,
         "prescription_text": prescription_text,
         "template_prescription_text": template_prescription_text,
+        "symptom_expert_drug_associations": build_symptom_expert_drug_associations(row),
         "text": text,
         "metadata": {
             "record": row,

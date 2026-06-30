@@ -369,66 +369,45 @@
         color: #1847a7;
       }
 
-      .case-list {
+      .association-list {
         display: grid;
-        gap: 10px;
-        max-height: 560px;
+        gap: 9px;
+        max-height: 380px;
         overflow: auto;
       }
 
-      .case-card {
+      .association-card {
         border: 1px solid var(--line);
-        border-radius: 8px;
+        border-radius: 7px;
         background: #fff;
-        overflow: hidden;
+        padding: 10px;
+        display: grid;
+        gap: 8px;
       }
 
-      .case-card-head {
-        min-height: 38px;
-        padding: 10px 12px;
-        border-bottom: 1px solid var(--line);
+      .association-head {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 12px;
-        background: #fbfcfd;
       }
 
-      .case-id {
+      .association-title {
         font-weight: 700;
       }
 
-      .case-grid {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 10px;
-        padding: 12px;
+      .association-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 7px;
       }
 
-      .case-field {
-        min-width: 0;
-        display: grid;
-        gap: 5px;
-      }
-
-      .case-field.wide {
-        grid-column: span 2;
-      }
-
-      .case-field.full {
-        grid-column: 1 / -1;
-      }
-
-      .case-label {
-        color: var(--muted);
+      .association-chip {
+        border-radius: 999px;
+        background: #eef2f7;
+        color: #334155;
+        padding: 3px 7px;
         font-size: 12px;
-        font-weight: 700;
-      }
-
-      .case-text {
-        line-height: 1.55;
-        color: var(--text);
-        overflow-wrap: anywhere;
       }
 
       table {
@@ -506,14 +485,6 @@
           grid-template-columns: minmax(72px, 110px) minmax(0, 1fr) 52px;
         }
 
-        .case-grid {
-          grid-template-columns: 1fr;
-        }
-
-        .case-field.wide,
-        .case-field.full {
-          grid-column: auto;
-        }
       }
     </style>
   </head>
@@ -684,47 +655,57 @@
           .join("")}</div>`;
       }
 
-      function sameScopeClinicalCards(items) {
-        if (!items.length) return '<div class="empty">暂无同病同证处方单</div>';
+      function drugNames(item) {
+        return new Set((item.drugs || []).map((drug) => drug.drug_name).filter(Boolean));
+      }
+
+      function associationList(items) {
         return `
-          <div class="case-list">
-            ${items
-              .map((item) => {
-                const info = item.clinical_info || {};
-                return `
-                  <article class="case-card">
-                    <div class="case-card-head">
-                      <div class="case-id">问诊单 ${esc(item.inquiry_id)} · 处方 ${esc(item.prescription_order_id || "")}</div>
-                      <div class="subtle">${esc(item.diagnosis_result || item.diagnosis_name || "")} · ${esc(item.diagnosis_syndrome || "")} · ${esc(item.matched_template_name || "未匹配模板")}</div>
-                    </div>
-                    <div class="case-grid">
-                      <div class="case-field wide">
-                        <div class="case-label">临床症状</div>
-                        <div class="case-text" title="${esc(clinicalText(info))}">${esc(clip(clinicalText(info), 220) || "未记录")}</div>
-                      </div>
-                      <div class="case-field">
-                        <div class="case-label">症状变化</div>
-                        <div class="case-text" title="${esc(symptomChangeText(info))}">${esc(clip(symptomChangeText(info), 140))}</div>
-                      </div>
-                      <div class="case-field">
-                        <div class="case-label">舌面信息</div>
-                        <div class="case-text" title="${esc(tongueFaceText(info))}">${esc(clip(tongueFaceText(info), 140))}</div>
-                      </div>
-                      <div class="case-field wide">
-                        <div class="case-label">检查所见</div>
-                        <div class="case-text" title="${esc(examText(info))}">${esc(clip(examText(info), 220) || "未记录")}</div>
-                      </div>
-                      <div class="case-field full">
-                        <div class="case-label">内服处方</div>
-                        <div class="case-text" title="${esc(prescriptionText(item))}">${esc(clip(prescriptionText(item), 360) || "未记录")}</div>
-                      </div>
-                    </div>
-                  </article>
-                `;
-              })
-              .join("")}
+          <div class="association-list">
+            ${
+              items.length
+                ? items
+                    .map(
+                      (item) => `
+                        <div class="association-card">
+                          <div class="association-head">
+                            <div class="association-title">${esc(item.symptom)} → ${esc(item.drug_name)}</div>
+                            <div class="rate">Lift ${esc(item.lift)}</div>
+                          </div>
+                          <div class="association-meta">
+                            <span class="association-chip">共现 ${esc(item.co_count)} 方</span>
+                            <span class="association-chip">置信度 ${fmtPct(item.confidence)}</span>
+                            <span class="association-chip">支持度 ${fmtPct(item.support)}</span>
+                          </div>
+                        </div>
+                      `,
+                    )
+                    .join("")
+                : '<div class="empty">暂无可统计的症状-用药关联</div>'
+            }
           </div>
         `;
+      }
+
+      function prescriptionAssociationText(item, scope) {
+        const symptoms = new Set(item.symptom_tags || []);
+        const drugs = drugNames(item);
+        const matched = (scope.top_symptom_drug_associations || [])
+          .filter((association) => symptoms.has(association.symptom) && drugs.has(association.drug_name))
+          .slice(0, 6);
+        return matched
+          .map((association) => `${association.symptom}→${association.drug_name}: Lift ${association.lift}, 置信度${fmtPct(association.confidence)}`)
+          .join("；");
+      }
+
+      function adjustmentAssociationList(scope) {
+        const added = (scope.top_symptom_added_drug_associations || [])
+          .slice(0, 12)
+          .map((item) => ({ ...item, drug_name: `加 ${item.drug_name}` }));
+        const removed = (scope.top_symptom_removed_drug_associations || [])
+          .slice(0, 12)
+          .map((item) => ({ ...item, drug_name: `减 ${item.drug_name}` }));
+        return associationList([...added, ...removed].slice(0, 18));
       }
 
       function renderSidebar() {
@@ -832,12 +813,19 @@
               <div class="panel-header"><h3 class="panel-title">高频药对</h3><span class="subtle">同方共现</span></div>
               <div class="panel-body">${barList(scope.top_drug_pairs.slice(0, 12), "drug_pair", { color: "warn" })}</div>
             </div>
-            <div class="panel full">
+            <div class="panel">
               <div class="panel-header">
-                <h3 class="panel-title">同病同证处方临床项</h3>
-                <span class="subtle">临床症状、舌面信息、检查所见与症状变化 · ${esc(details.length)} 张处方</span>
+                <h3 class="panel-title">症状-最终用药关联</h3>
+                <span class="subtle">Lift 越高，越偏向该症状下出现</span>
               </div>
-              <div class="panel-body">${sameScopeClinicalCards(details)}</div>
+              <div class="panel-body">${associationList((scope.top_symptom_drug_associations || []).slice(0, 18))}</div>
+            </div>
+            <div class="panel">
+              <div class="panel-header">
+                <h3 class="panel-title">症状-加减药关联</h3>
+                <span class="subtle">相对最相似模板方</span>
+              </div>
+              <div class="panel-body">${adjustmentAssociationList(scope)}</div>
             </div>
             <div class="panel full">
               <div class="panel-header"><h3 class="panel-title">处方匹配明细</h3><span class="subtle">按问诊单展示 ${esc(details.length)} 张处方与最相似模板方</span></div>
@@ -856,12 +844,14 @@
                       <th>加药</th>
                       <th>减药</th>
                       <th>剂量变化</th>
+                      <th>用药症状关联度</th>
                     </tr>
                   </thead>
                   <tbody>
                     ${details
-                      .map(
-                        (item) => `
+                      .map((item) => {
+                        const associationText = prescriptionAssociationText(item, scope);
+                        return `
                           <tr>
                             <td>${esc(item.inquiry_id)}</td>
                             <td>${esc(item.diagnosis_result || item.diagnosis_name || "")}</td>
@@ -874,9 +864,10 @@
                             <td>${esc((item.added_drugs || []).slice(0, 8).join("、"))}</td>
                             <td>${esc((item.removed_drugs || []).slice(0, 8).join("、"))}</td>
                             <td>${esc((item.dose_changes || []).slice(0, 5).map((d) => `${d.drug_name}:${d.template_dose}->${d.record_dose}${d.unit || ""}`).join("；"))}</td>
+                            <td title="${esc(associationText)}">${esc(clip(associationText, 140) || "暂无")}</td>
                           </tr>
-                        `,
-                      )
+                        `;
+                      })
                       .join("")}
                   </tbody>
                 </table>
