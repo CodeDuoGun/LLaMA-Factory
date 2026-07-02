@@ -97,7 +97,7 @@ def extract_internal_prescriptions(record: dict[str, Any]) -> list[dict[str, Any
 
 
 def extract_record(record: dict[str, Any]) -> dict[str, Any]:
-    diagnosis_result = _clean_text(record.get("diagnosis_sickness"))
+    diagnosis_result = _clean_text(record.get("diagnosis_illness"))
     present_history = _clean_text(record.get("new_medical_history"))
     exam_findings = _join_history_parts(record.get("admin_face_describe"), _extract_check_findings(present_history))
     return {

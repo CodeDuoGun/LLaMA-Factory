@@ -75,6 +75,17 @@ def normalize_diagnosis(value: Any) -> str:
     return normalize_name(value, DIAGNOSIS_ALIASES)
 
 
+def normalize_diagnosis_result(value: Any) -> str:
+    if value is None:
+        return ""
+    parts = [
+        normalize_diagnosis(part)
+        for part in re.split(r"[,，、;；/]+", str(value))
+        if str(part).strip()
+    ]
+    return ",".join(sorted(set(parts)))
+
+
 def normalize_syndrome(value: Any) -> str:
     return normalize_name(value, SYNDROME_ALIASES)
 
@@ -199,7 +210,7 @@ def flatten_prescriptions(records: list[dict[str, Any]], templates: list[dict[st
     rows = []
     for record in records:
         diagnosis_name = normalize_diagnosis(record.get("diagnosis_name"))
-        diagnosis_result = normalize_diagnosis(record.get("diagnosis_result", record.get("diagnosis_name")))
+        diagnosis_result = normalize_diagnosis_result(record.get("diagnosis_result", record.get("diagnosis_name")))
         diagnosis_syndrome = normalize_syndrome(record.get("diagnosis_syndrome"))
         clinical_info = record.get("clinical_info") or {}
         report_images = clinical_info.get("report_images") or []

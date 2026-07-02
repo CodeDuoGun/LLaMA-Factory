@@ -268,7 +268,7 @@ def build_wuweiping_embedding_text(row: dict[str, Any]) -> str:
 
 
 def build_wuweiping_prescription_doc(row: dict[str, Any], embedding: list[float] | None = None) -> dict[str, Any]:
-    diagnosis_result = _clean_text(row.get("diagnosis_sickness"))
+    diagnosis_result = _clean_text(row.get("diagnosis_illness"))
     syndrome_result = _clean_text(row.get("diagnosis_disease"))
     clinical_symptoms = _clean_text(row.get("clinical_symptoms_text") or row.get("clinical_symptoms"))
     prescriptions = [_clean_text(item) for item in row.get("ps") or [] if _clean_text(item)]
