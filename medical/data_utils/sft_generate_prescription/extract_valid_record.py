@@ -98,6 +98,7 @@ def extract_prescription(prescription: dict[str, Any]) -> dict[str, Any] | None:
         "drug_process_name": clean_text(prescription.get("drug_process_name")),
         "doctor_advice": clean_text(prescription.get("doctor_advice")),
         "drugs": drugs,
+        "usage_desc": clean_text(prescription.get("usage_desc")),
     }
 
 

@@ -1,0 +1,102 @@
+# alpha 环境 Neo4j Docker Compose 文件。
+# 用途：在 alpha 服务器上运行知识图谱数据库。
+# 主服务通过 Bolt 端口访问它。
+# 生产级建议：Neo4j 密码不要写在 compose 中，需使用环境变量或密钥管理系统。
+
+# Compose 文件版本。
+version: '3.9'
+
+# 服务定义区域。
+services:
+  # alpha Neo4j 服务。
+  neo4j-alpha:
+    # Neo4j 镜像版本。
+    # 常用可选值：neo4j:5.x-community、neo4j:enterprise。
+    # 升级大版本前必须备份数据。
+    image: neo4j:2026.03-community
+
+    # 容器名。
+    container_name: neo4j-alpha
+
+    # 重启策略。
+    # always：容器退出后总是重启。
+    restart: always
+
+    # 端口映射。
+    ports:
+      # Neo4j Browser 管理页面端口，当前未开放。
+      # 如需临时访问，建议通过 SSH 隧道，不建议公网开放。
+#      - 7474:7474
+      # Bolt 协议端口：宿主机 7787 -> 容器 7687。
+      - 7787:7687
+
+    # 资源限制。
+    # 注意：普通 docker compose 对 deploy.resources 支持有限，具体取决于 Docker 版本。
+    deploy:
+      resources:
+        limits:
+          # CPU 上限。
+          cpus: '4'
+          # 内存上限。
+          memory: 8G
+
+    # Neo4j 环境变量。
+    environment:
+      # Neo4j 用户名/密码。
+      # 当前为明文，生产级必须迁移。
+      - NEO4J_AUTH=neo4j/Sdsf34432@dsdEssf
+      # JVM heap 初始大小。
+      - NEO4J_server_memory_heap_initial__size=4G
+      # JVM heap 最大大小。
+      - NEO4J_server_memory_heap_max__size=4G
+      # pagecache 大小，用于图数据缓存。
+      - NEO4J_server_memory_pagecache_size=4G
+      # worker 线程数。
+      - NEO4J_dbms_threads_worker__count=3
+      # 可选：关闭 HTTP Browser。
+#      - NEO4J_server_http_enabled=false      #关闭 7474 网页管理控制台,默认：true 开启
+      # 可选：关闭 HTTPS Browser。
+#      - NEO4J_server_https_enabled=false     #关闭 7473 网页管理控制台,默认：false关闭
+      # 可选：是否允许自动升级数据库格式。
+#      - NEO4J_dbms_allow__upgrade=false      #允许启动时自动做数据库格式升级，默认：false
+
+    # 数据和日志挂载。
+    volumes:
+      # alpha Neo4j 数据目录，删除会丢失图谱数据。
+      - /data/neo4j/alpha/data:/data
+      # alpha Neo4j 日志目录。
+      - /data/neo4j/alpha/logs:/logs
+      # 可选：挂载 Neo4j 配置目录。
+#      - /data/neo4j/alpha/conf:/var/lib/neo4j/conf/
+
+    # 网络配置。
+    networks:
+      network:
+        # 固定 IP，供同网络内服务访问。
+        ipv4_address: 10.251.1.249
+
+    # 健康检查。
+    # 执行 RETURN 1 验证数据库可查询。
+    # 当前密码写在命令中，生产级应迁移。
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "Sdsf34432@dsdEssf", "RETURN 1"]
+      # 检查间隔。
+      interval: 10s
+      # 单次检查超时。
+      timeout: 5s
+      # 连续失败次数阈值。
+      retries: 5
+      # 启动等待时间。
+      start_period: 30s
+
+# 网络定义区域。
+networks:
+  network:
+    # bridge：单机 Docker 网络。
+    driver: bridge
+    # 自定义网段。
+    ipam:
+      config:
+        - subnet: 10.251.1.0/24
+    # 网络名，需和 alpha agent compose 保持一致。
+    name: agent_alpha_net

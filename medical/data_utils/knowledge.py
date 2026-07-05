@@ -1,945 +1,1091 @@
-# -*- coding: utf-8 -*-
-"""中医知识图谱增删改查管理脚本（吴卫平 Neo4j）。
-
-设计目标：
-- 与 `app/tcm_agent/custom_knowledge.py` 中 `_GraphDB.VALID_LABELS / VALID_RELS` 保持一致，
-  写入/查询都走白名单校验，避免误建节点、误连关系。
-- 双形态：可作为 `python -m app.tcm_agent.rag.knowledge_graph_manager ...` CLI 使用，
-  也可以 `from app.tcm_agent.rag.knowledge_graph_manager import KnowledgeGraphManager`
-  在 Python 里直接调用。
-- 通过【证候名 / 诊断结果】等自然输入，自动匹配对应节点类型并返回结构化结果。
-
-核心使用示例：
-    from app.tcm_agent.rag.knowledge_graph_manager import KnowledgeGraphManager
-
-    kg = KnowledgeGraphManager()
-    # 查询
-    kg.get_syndrome("湿热蕴肤证")
-    kg.get_treatments_for_disease("痤疮")
-    kg.check_incompatibilities(["甘草", "海藻"])
-    kg.search_similar_cases(disease="痤疮", syndrome="湿热蕴肤证", limit=5)
-    # 写入
-    kg.upsert_herb("生地黄", nature="寒", flavors=["甘"], category="清热药")
-    kg.link_syndrome_herb("湿热蕴肤证", "黄芩", count=12)
-    kg.link_incompatibility("甘草", "海藻", rule="十八反", description="甘草反海藻")
-    kg.close()
-
-CLI 示例：
-    python -m app.tcm_agent.rag.knowledge_graph_manager syndrome "湿热蕴肤证"
-    python -m app.tcm_agent.rag.knowledge_graph_manager disease "痤疮"
-    python -m app.tcm_agent.rag.knowledge_graph_manager incompat "甘草" "海藻"
-    python -m app.tcm_agent.rag.knowledge_graph_manager herb-upsert 生地黄 --nature 寒 \\
-        --flavor 甘 --category 清热药
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
-import os
-import sys
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-
-# 允许直接以 `python app/tcm_agent/rag/knowledge_graph_manager.py` 跑 CLI
-_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-if _PKG_ROOT not in sys.path:
-    sys.path.insert(0, _PKG_ROOT)
-
-from neo4j import GraphDatabase  # noqa: E402
-
-from app.tcm_agent.config import config  # noqa: E402
-from app.tcm_agent.utils.log import logger  # noqa: E402
+from typing import Any, Optional
 
 
-# ── 与 custom_knowledge._GraphDB 对齐的标签 / 关系白名单 ────────────────────────
+class TCMKnowledgeRetriever:
+    def __init__(self, uri: str, user: str, password: str, database: str = "neo4j"):
+        from neo4j import GraphDatabase
 
-VALID_LABELS = {
-    "Doctor", "Disease", "Syndrome", "Herb", "Symptom", "Case", "LifestyleAdvice",
-    "Function", "Meridian", "Indication", "Contraindication",
-    "Preparation", "AdverseEffect", "Complication",
-    "HerbNature", "HerbCategory", "HerbIndication",
-}
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+        self.database = database
 
-VALID_RELS = {
-    "DIAGNOSED", "TREATS", "FREQUENTLY_USES", "HAS_SYNDROME", "HAS_DISEASE",
-    "PRESENTS_SYMPTOM", "PRESCRIBED", "COMMONLY_USES", "MANIFESTS_AS",
-    "INCOMPATIBLE_WITH",   # 十八反
-    "ANTAGONIZES",        # 十九畏
-    "HAS_ADVICE", "COMPLICATES_WITH",
-    "HAS_FUNCTION", "ENTERS_MERIDIAN", "INDICATED_FOR", "CONTRAINDICATED_FOR",
-    "HAS_PREPARATION", "HAS_ADVERSE_EFFECT", "PAIRS_WITH",
-    "PROPERTY_OF", "PART_OF", "SUITABLE_FOR",
-}
+    def close(self):
+        self.driver.close()
 
-WRITE_FORBIDDEN = ["DETACH DELETE"]  # 危险操作需要单独走 drop_node/drop_rel
+    def query(self, cypher: str, params: Optional[dict[str, Any]] = None):
+        with self.driver.session(database=self.database) as session:
+            rows = [r.data() for r in session.run(cypher, params or {})]
+        return json_safe(rows)
 
-# 哪些节点标签在自定义知识图谱里有 identity 字段 `name`（与 custom_knowledge 一致）
-NAME_INDEXED_LABELS = {
-    "Doctor", "Disease", "Syndrome", "Herb", "Symptom", "Case",
-    "Function", "Meridian", "Indication", "Contraindication",
-    "Preparation", "AdverseEffect", "Complication",
-    "HerbNature", "HerbCategory", "HerbIndication",
-    "LifestyleAdvice",
-}
+    def get_syndrome_diagnosis_context(
+        self,
+        disease: str,
+        syndrome: str,
+        symptoms: Optional[list[str]] = None,
+        herbs: Optional[list[str]] = None,
+        limit: int = 2,
+    ) -> dict[str, Any]:
+        symptoms = symptoms or []
+        herbs = herbs or []
 
-
-# ── 返回结构 ─────────────────────────────────────────────────────────────────
-
-@dataclass
-class KGResult:
-    """统一的查询结果外壳，便于 CLI 渲染与 Python 消费。"""
-
-    ok: bool = True
-    data: Any = None
-    message: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {"ok": self.ok, "data": self.data, "message": self.message}
-
-    def to_json(self, indent: Optional[int] = 2) -> str:
-        return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent, default=str)
-
-
-# ── 通用 Neo4j 连接 ───────────────────────────────────────────────────────────
-
-class KnowledgeGraphManager:
-    """知识图谱 CRUD 管理器。
-
-    连接从 `config.NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD` 读取（与现有
-    custom_knowledge.py 保持一致），不存在则抛 RuntimeError。
-    """
-
-    def __init__(self, uri: Optional[str] = None, user: Optional[str] = None,
-                 password: Optional[str] = None, database: Optional[str] = None):
-        self.uri = uri or config.NEO4J_URI
-        self.user = user or config.NEO4J_USER
-        self.password = password or config.NEO4J_PASSWORD
-        if not self.password:
-            raise RuntimeError("NEO4J_PASSWORD 未配置，无法连接图谱")
-        self.database = database or getattr(config, "NEO4J_DATABASE", None) or "neo4j"
-        self._driver = GraphDatabase.driver(self.uri, auth=(self.user, self.password))
-
-    # ── 底层执行（带白名单校验） ──────────────────────────────────────────────
-
-    def _exec(self, cypher: str, **params) -> List[Dict[str, Any]]:
-        """任意写读都走这里：标签/关系必须命中白名单，写关键字不被拦截（CRUD
-        必须允许 CREATE/MERGE/SET/DELETE，但禁用 DETACH DELETE 默认）。"""
-        used_labels = [l for l in _extract_labels(cypher) if l not in VALID_LABELS]
-        if used_labels:
-            raise ValueError(f"节点标签非法：{used_labels}")
-        used_rels = [r for r in _extract_rels(cypher) if r not in VALID_RELS]
-        if used_rels:
-            raise ValueError(f"关系类型非法：{used_rels}")
-
-        with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, **params)
-            return [dict(r) for r in result]
-
-    def _exec_write(self, cypher: str, **params) -> Dict[str, Any]:
-        """写操作的轻量包装：返回统计信息；无 stats 返回兜底 dict。"""
-        with self._driver.session(database=self.database) as session:
-            res = session.run(cypher, **params)
-            summary = res.consume()
-            counters = summary.counters
-            return {
-                "nodes_created": counters.nodes_created,
-                "nodes_deleted": counters.nodes_deleted,
-                "relationships_created": counters.relationships_created,
-                "relationships_deleted": counters.relationships_deleted,
-                "properties_set": counters.properties_set,
-            }
-
-    # ── 查询：按节点类型 ───────────────────────────────────────────────────────
-
-    def get_node(self, label: str, name: str, doctor_id: Optional[str] = None) -> KGResult:
-        """按 label+name（或 doctor_id）取一个节点的所有属性。"""
-        if label not in VALID_LABELS:
-            return KGResult(ok=False, message=f"非法 label: {label}")
-
-        clauses = ["n.name = $name"]
-        params: Dict[str, Any] = {"name": name}
-        if doctor_id and label in {"Disease", "Syndrome", "Case"}:
-            clauses.append("n.doctor_id = $doc")
-            params["doc"] = doctor_id
-        cypher = f"MATCH (n:{label}) WHERE {' AND '.join(clauses)} RETURN n LIMIT 1"
-        rows = self._exec(cypher, **params)
-        if not rows:
-            return KGResult(ok=False, message=f"未找到 {label}: {name}")
-        return KGResult(ok=True, data=_unwrap_node(rows[0]["n"]))
-
-    # ── 查询：证候 (Syndrome) ──────────────────────────────────────────────────
-
-    def get_syndrome(self, syndrome: str, doctor_id: Optional[str] = None) -> KGResult:
-        """按证候名取一手信息：常用药表、症见分布、对应疾病、生活调理、相似病例。
-
-        复用 `custom_knowledge._triplets_for_syndrome` 的语义，但返回结构化 dict
-        方便脚本化消费。
-        """
-        if doctor_id:
-            syndrome_rows = self._exec(
-                "MATCH (s:Syndrome {name:$s, doctor_id:$doc}) RETURN s LIMIT 1",
-                s=syndrome, doc=doctor_id,
-            )
-        else:
-            syndrome_rows = self._exec(
-                "MATCH (s:Syndrome {name:$s}) RETURN s LIMIT 1",
-                s=syndrome,
-            )
-        if not syndrome_rows:
-            return KGResult(ok=False, message=f"证候不存在: {syndrome}")
-
-        # 常用药 top12
-        herb_rows = self._exec(
-            "MATCH (s:Syndrome {name:$s})-[r:COMMONLY_USES]->(h:Herb) "
-            "RETURN h.name AS herb, r.count AS count, r.avg_dose AS dose "
-            "ORDER BY r.count DESC LIMIT 12",
-            s=syndrome,
-        )
-
-        # 症见分布
-        symptom_rows = self._exec(
-            "MATCH (c:Case)-[:HAS_SYNDROME]->(s:Syndrome {name:$s}) "
-            "MATCH (c)-[:PRESENTS_SYMPTOM]->(sym:Symptom) "
-            "RETURN sym.name AS symptom, count(c) AS cases "
-            "ORDER BY cases DESC LIMIT 20",
-            s=syndrome,
-        )
-
-        # 哪些疾病表现为该证型
-        disease_rows = self._exec(
-            "MATCH (d:Disease)-[r:MANIFESTS_AS]->(s:Syndrome {name:$s}) "
-            "RETURN d.name AS disease, r.count AS cases "
-            "ORDER BY r.count DESC LIMIT 10",
-            s=syndrome,
-        )
-
-        # 相似病历（用该证型的病例，按时间倒序取若干）
-        case_rows = self._exec(
-            "MATCH (c:Case)-[:HAS_SYNDROME]->(s:Syndrome {name:$s}) "
-            "RETURN c.id AS id, c.disease AS disease, c.gender AS gender, "
-            "       c.age AS age, c.created_at AS created_at "
-            "ORDER BY c.created_at DESC LIMIT 10",
-            s=syndrome,
-        )
-
-        data = {
-            "syndrome": syndrome,
-            "common_herbs": [
-                {"herb": r["herb"], "count": r.get("count"), "avg_dose": r.get("dose")}
-                for r in herb_rows
-            ],
-            "symptoms": [
-                {"symptom": r["symptom"], "cases": r["cases"]} for r in symptom_rows
-            ],
-            "diseases": [
-                {"disease": r["disease"], "cases": r["cases"]} for r in disease_rows
-            ],
-            "similar_cases": [
-                {k: r.get(k) for k in ("id", "disease", "gender", "age", "created_at")}
-                for r in case_rows
-            ],
+        return {
+            "诊断": disease,
+            "证候": syndrome,
+            "病机信息": self.get_pathogenesis(disease, syndrome),
+            "诊断证候相关关系": self.get_disease_syndrome_relations(disease, syndrome),
+            "证候相关关系": self.get_syndrome_relations(syndrome),
+            "诊断相关关系": self.get_disease_relations(disease),
+            "临床症状": self.get_clinical_symptoms(disease, syndrome, symptoms),
+            "相关药物知识": self.get_herb_knowledge(herbs),
+            "相似病例": self.get_similar_cases(disease, syndrome, symptoms, limit),
+            "证候相似病例": self.get_syndrome_similar_cases(syndrome, symptoms, limit),
         }
-        return KGResult(ok=True, data=data)
 
-    # ── 查询：诊断 / 疾病 (Disease) ───────────────────────────────────────────
+    def get_disease_syndrome_relations(self, disease: str, syndrome: str, limit: int = 50):
+        if not disease or not syndrome:
+            return []
 
-    def get_treatments_for_disease(self, disease: str, doctor_id: Optional[str] = None) -> KGResult:
-        """按疾病取『治则治法』路径：常见证型 + 各证型常用药 + 并发症 + 调理建议。"""
-        if doctor_id:
-            d_rows = self._exec(
-                "MATCH (d:Disease {name:$d, doctor_id:$doc}) RETURN d LIMIT 1",
-                d=disease, doc=doctor_id,
-            )
-        else:
-            d_rows = self._exec(
-                "MATCH (d:Disease {name:$d}) RETURN d LIMIT 1", d=disease,
-            )
-        if not d_rows:
-            return KGResult(ok=False, message=f"疾病不存在: {disease}")
-
-        syn_rows = self._exec(
-            "MATCH (d:Disease {name:$d})-[r:MANIFESTS_AS]->(s:Syndrome) "
-            "RETURN s.name AS syndrome, r.count AS cases "
-            "ORDER BY r.count DESC LIMIT 5",
-            d=disease,
+        cypher = """
+        MATCH (d:Disease {name:$disease})
+        MATCH (s:Syndrome {name:$syndrome})
+        CALL (d, s) {
+            MATCH (d)-[r]->(s)
+            RETURN
+                labels(d) AS source_labels,
+                d.name AS source_name,
+                properties(d) AS source_properties,
+                type(r) AS relation_type,
+                properties(r) AS relation_properties,
+                labels(s) AS target_labels,
+                s.name AS target_name,
+                properties(s) AS target_properties,
+                "disease_to_syndrome" AS direction
+            UNION ALL
+            MATCH (s)-[r]->(d)
+            RETURN
+                labels(s) AS source_labels,
+                s.name AS source_name,
+                properties(s) AS source_properties,
+                type(r) AS relation_type,
+                properties(r) AS relation_properties,
+                labels(d) AS target_labels,
+                d.name AS target_name,
+                properties(d) AS target_properties,
+                "syndrome_to_disease" AS direction
+        }
+        RETURN
+            source_labels,
+            source_name,
+            source_properties,
+            relation_type,
+            relation_properties,
+            target_labels,
+            target_name,
+            target_properties,
+            direction
+        ORDER BY relation_type ASC, source_name ASC, target_name ASC
+        LIMIT $limit
+        """
+        return self._format_relations(
+            self.query(cypher, {"disease": disease, "syndrome": syndrome, "limit": limit})
         )
 
-        # 每个证型展开常用药 top10
-        syndromes = []
-        for s in syn_rows:
-            herbs = self._exec(
-                "MATCH (s:Syndrome {name:$s})-[r:COMMONLY_USES]->(h:Herb) "
-                "RETURN h.name AS herb, r.count AS count, r.avg_dose AS dose "
-                "ORDER BY r.count DESC LIMIT 10",
-                s=s["syndrome"],
-            )
-            syndromes.append({
-                "syndrome": s["syndrome"],
-                "cases": s["cases"],
-                "common_herbs": [
-                    {"herb": h["herb"], "count": h.get("count"), "avg_dose": h.get("dose")}
-                    for h in herbs
-                ],
+    def get_disease_properties(self, disease: str):
+        if not disease:
+            return {}
+
+        cypher = """
+        MATCH (d:Disease {name:$disease})
+        RETURN properties(d) AS properties
+        LIMIT 1
+        """
+        rows = self.query(cypher, {"disease": disease})
+        if not rows:
+            return {}
+        return rows[0].get("properties") or {}
+
+    def get_syndrome_properties(self, syndrome: str):
+        if not syndrome:
+            return {}
+
+        cypher = """
+        MATCH (s:Syndrome {name:$syndrome})
+        RETURN properties(s) AS properties
+        LIMIT 1
+        """
+        rows = self.query(cypher, {"syndrome": syndrome})
+        if not rows:
+            return {}
+        return rows[0].get("properties") or {}
+
+    def get_disease_syndrome_properties(self, disease: str, syndrome: str):
+        if not disease and not syndrome:
+            return {"诊断属性": {}, "证候属性": {}}
+
+        cypher = """
+        OPTIONAL MATCH (d:Disease {name:$disease})
+        OPTIONAL MATCH (s:Syndrome {name:$syndrome})
+        RETURN
+            properties(d) AS disease_properties,
+            properties(s) AS syndrome_properties
+        LIMIT 1
+        """
+        rows = self.query(cypher, {"disease": disease, "syndrome": syndrome})
+        if not rows:
+            return {"诊断属性": {}, "证候属性": {}}
+        return {
+            "诊断属性": rows[0].get("disease_properties") or {},
+            "证候属性": rows[0].get("syndrome_properties") or {},
+        }
+
+
+    def get_syndrome_relations(self, syndrome: str, limit: Optional[int] = None):
+        """查询与某个证候节点直接相连的全部关系。
+
+        默认返回该证候所有一跳入边和出边关系；如果担心结果过多，可传入 limit 截断返回数量。
+        COMMONLY_USES 关系通常较多，会在查询后最多保留前 5 条。
+        HAS_SYNDROME 关系通常对应相似病历，会在查询后最多保留前 2 条。
+        MANIFESTS_AS 关系通常对应相关疾病，会在查询后最多保留前 5 条。
+        返回结果会保留关系方向、关系类型、关系属性、相邻节点标签与属性。
+        """
+        if not syndrome:
+            return []
+
+        limit_clause = "\n        LIMIT $limit" if limit is not None else ""
+        cypher = f"""
+        MATCH (s:Syndrome {{name:$syndrome}})
+        CALL (s) {{
+            MATCH (source)-[r]->(s)
+            RETURN
+                labels(source) AS source_labels,
+                source.name AS source_name,
+                properties(source) AS source_properties,
+                type(r) AS relation_type,
+                properties(r) AS relation_properties,
+                labels(s) AS target_labels,
+                s.name AS target_name,
+                properties(s) AS target_properties,
+                "incoming" AS direction
+            UNION ALL
+            MATCH (s)-[r]->(target)
+            RETURN
+                labels(s) AS source_labels,
+                s.name AS source_name,
+                properties(s) AS source_properties,
+                type(r) AS relation_type,
+                properties(r) AS relation_properties,
+                labels(target) AS target_labels,
+                target.name AS target_name,
+                properties(target) AS target_properties,
+                "outgoing" AS direction
+        }}
+        RETURN
+            source_labels,
+            source_name,
+            source_properties,
+            relation_type,
+            relation_properties,
+            target_labels,
+            target_name,
+            target_properties,
+            direction
+        ORDER BY relation_type ASC, source_name ASC, target_name ASC
+        {limit_clause}
+        """
+        params = {"syndrome": syndrome}
+        if limit is not None:
+            params["limit"] = limit
+        rows = self._limit_syndrome_relation_types(
+            self.query(cypher, params),
+            max_counts={
+                "COMMONLY_USES": 5,
+                "HAS_SYNDROME": 2,
+                "MANIFESTS_AS": 5,
+            },
+        )
+        return self._format_relations(rows)
+
+    def get_disease_relations(self, disease: str, limit: Optional[int] = None):
+        """查询与某个疾病节点直接相连的全部关系。
+
+        默认返回该疾病所有一跳入边和出边关系；如果担心结果过多，可传入 limit 截断返回数量。
+        查询后会按关系类型限制数量：默认每种关系最多 5 条，HAS_DISEASE 和 MANIFESTS_AS 最多 2 条。
+        返回结果会保留关系方向、关系类型、关系属性、相邻节点标签与属性。
+        """
+        if not disease:
+            return []
+
+        limit_clause = "\n        LIMIT $limit" if limit is not None else ""
+        cypher = f"""
+        MATCH (d:Disease {{name:$disease}})
+        CALL (d) {{
+            MATCH (source)-[r]->(d)
+            RETURN
+                labels(source) AS source_labels,
+                source.name AS source_name,
+                properties(source) AS source_properties,
+                type(r) AS relation_type,
+                properties(r) AS relation_properties,
+                labels(d) AS target_labels,
+                d.name AS target_name,
+                properties(d) AS target_properties,
+                "incoming" AS direction
+            UNION ALL
+            MATCH (d)-[r]->(target)
+            RETURN
+                labels(d) AS source_labels,
+                d.name AS source_name,
+                properties(d) AS source_properties,
+                type(r) AS relation_type,
+                properties(r) AS relation_properties,
+                labels(target) AS target_labels,
+                target.name AS target_name,
+                properties(target) AS target_properties,
+                "outgoing" AS direction
+        }}
+        RETURN
+            source_labels,
+            source_name,
+            source_properties,
+            relation_type,
+            relation_properties,
+            target_labels,
+            target_name,
+            target_properties,
+            direction
+        ORDER BY relation_type ASC, source_name ASC, target_name ASC
+        {limit_clause}
+        """
+        params = {"disease": disease}
+        if limit is not None:
+            params["limit"] = limit
+        rows = self._limit_syndrome_relation_types(
+            self.query(cypher, params),
+            default_max_count=5,
+            max_counts={"HAS_DISEASE": 2, "MANIFESTS_AS": 2},
+        )
+        return self._format_relations(rows)
+
+    def _format_relations(self, rows: list[dict[str, Any]]):
+        relations = []
+        for row in rows:
+            relations.append({
+                "source": {
+                    "name": row.get("source_name"),
+                    "labels": row.get("source_labels") or [],
+                    "properties": row.get("source_properties") or {},
+                },
+                "relation": row.get("relation_type"),
+                "target": {
+                    "name": row.get("target_name"),
+                    "labels": row.get("target_labels") or [],
+                    "properties": row.get("target_properties") or {},
+                },
+                "direction": row.get("direction"),
+                "properties": row.get("relation_properties") or {},
             })
+        return relations
 
-        advice_rows = self._exec(
-            "MATCH (d:Disease {name:$d})-[:HAS_ADVICE]->(a:LifestyleAdvice) "
-            "RETURN a.category AS category, a.content AS content",
-            d=disease,
-        )
-        complication_rows = self._exec(
-            "MATCH (d:Disease {name:$d})-[:COMPLICATES_WITH]->(c:Complication) "
-            "RETURN c.name AS complication",
-            d=disease,
-        )
-        return KGResult(ok=True, data={
-            "disease": disease,
-            "syndromes": syndromes,
-            "lifestyle_advice": [
-                {"category": r["category"], "content": r["content"]} for r in advice_rows
-            ],
-            "complications": [r["complication"] for r in complication_rows],
-        })
+    def _limit_syndrome_relation_types(
+        self,
+        rows: list[dict[str, Any]],
+        max_counts: dict[str, int],
+        default_max_count: Optional[int] = None,
+    ):
+        relation_counts = {relation_type: 0 for relation_type in max_counts}
+        result = []
+        for row in rows:
+            relation_type = row.get("relation_type")
+            max_count = max_counts.get(relation_type, default_max_count)
+            if max_count is None:
+                result.append(row)
+                continue
 
-    # ── 查询：相似病历 ────────────────────────────────────────────────────────
+            relation_count = relation_counts.get(relation_type, 0)
+            if relation_count >= max_count:
+                continue
 
-    def search_similar_cases(self, disease: str = "", syndrome: str = "",
-                             limit: int = 5) -> KGResult:
-        """按 disease / syndrome 组合定位相似病历。基本子图：
-        (Case)-[:HAS_DISEASE]->(Disease), (Case)-[:HAS_SYNDROME]->(Syndrome),
-        (Case)-[:PRESENTS_SYMPTOM]->(Symptom), (Case)-[:DIAGNOSED]->(Doctor)。
+            result.append(row)
+            relation_counts[relation_type] = relation_count + 1
+        return result
+
+    def get_treatment_principles(self, disease: str, syndrome: str):
+        """查询指定诊断-证候组合在 MANIFESTS_AS 关系上的治则治法。"""
+        cypher = """
+        MATCH (d:Disease {name:$disease})-[r:MANIFESTS_AS]->(s:Syndrome {name:$syndrome})
+        RETURN
+            s.name AS syndrome,
+            s.description AS syndrome_description,
+            properties(r) AS relation_properties
         """
-        conditions, params = [], {"limit": int(limit)}
-        if disease:
-            conditions.append("EXISTS { (c)-[:HAS_DISEASE]->(:Disease {name:$d}) }")
-            params["d"] = disease
-        if syndrome:
-            conditions.append("EXISTS { (c)-[:HAS_SYNDROME]->(:Syndrome {name:$s}) }")
-            params["s"] = syndrome
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        cypher = (
-            "MATCH (c:Case) "
-            f"{where} "
-            "OPTIONAL MATCH (c)-[:HAS_DISEASE]->(d:Disease) "
-            "OPTIONAL MATCH (c)-[:HAS_SYNDROME]->(s:Syndrome) "
-            "OPTIONAL MATCH (c)-[:PRESENTS_SYMPTOM]->(sym:Symptom) "
-            "RETURN c.id AS id, c.gender AS gender, c.age AS age, "
-            "       c.created_at AS created_at, "
-            "       collect(DISTINCT d.name) AS diseases, "
-            "       collect(DISTINCT s.name) AS syndromes, "
-            "       collect(DISTINCT sym.name) AS symptoms "
-            "ORDER BY c.created_at DESC LIMIT $limit"
-        )
-        rows = self._exec(cypher, **params)
-        return KGResult(ok=True, data={"cases": rows})
+        rows = self.query(cypher, {"disease": disease, "syndrome": syndrome})
 
-    # ── 查询：证候知识（百科式聚合） ───────────────────────────────────────────
+        result = []
+        for row in rows:
+            props = row.get("relation_properties") or {}
+            treatment = props.get("treatment") or props.get("治则治法") or props.get("治法")
+            if treatment:
+                result.append({
+                    "name": treatment,
+                    "source": "Disease-MANIFESTS_AS-Syndrome",
+                    "properties": props,
+                })
+        return result
 
-    def get_syndrome_knowledge(self, syndrome: str, doctor_id: Optional[str] = None) -> KGResult:
-        """科普向的证候聚合：定义 + 病因病机（若有 LifestyleAdvice/doctor notes）
-        + 症见分布 + 涵盖疾病 + 医师诊断统计。
+    def get_pathogenesis(self, disease: str, syndrome: str):
+        """查询指定诊断-证候组合对应的病机，优先使用关系属性，其次使用证候属性。"""
+        cypher = """
+        MATCH (d:Disease {name:$disease})-[r:MANIFESTS_AS]->(s:Syndrome {name:$syndrome})
+        RETURN
+            s.name AS syndrome,
+            s.description AS syndrome_description,
+            properties(r) AS relation_properties,
+            properties(s) AS syndrome_properties
         """
-        node = self.get_syndrome(syndrome, doctor_id=doctor_id)
-        if not node.ok:
-            return node
+        rows = self.query(cypher, {"disease": disease, "syndrome": syndrome})
 
-        # 把『核心摘要』+『症见分布』+『涵盖疾病』合并
-        base = node.data
-        doctor_rows = self._exec(
-            "MATCH (d:Doctor)-[:DIAGNOSED]->(c:Case)-[:HAS_SYNDROME]->(s:Syndrome {name:$s}) "
-            "RETURN d.name AS doctor, count(c) AS cases "
-            "ORDER BY cases DESC LIMIT 5",
-            s=syndrome,
-        )
-        base["doctors"] = [
-            {"doctor": r["doctor"], "cases": r["cases"]} for r in doctor_rows
+        result = []
+        for row in rows:
+            rel_props = row.get("relation_properties") or {}
+            syn_props = row.get("syndrome_properties") or {}
+
+            pathogenesis = (
+                rel_props.get("pathogenesis")
+                or rel_props.get("病机")
+                or syn_props.get("pathogenesis")
+                or syn_props.get("病机")
+                or row.get("syndrome_description")
+            )
+
+            if pathogenesis:
+                result.append({
+                    "name": pathogenesis,
+                    "source": "Syndrome.description / MANIFESTS_AS.properties",
+                    "properties": {
+                        "relation": rel_props,
+                        "syndrome": syn_props,
+                    },
+                })
+        return result
+
+    def get_syndrome_pathogenesis(self, syndrome: str):
+        """查询某个证候相关的病机信息。
+
+        检索范围包括：
+        1. 证候节点自身属性，如 pathogenesis、病机、description；
+        2. 所有关联疾病通过 MANIFESTS_AS 指向该证候时，关系上的 pathogenesis、病机属性。
+        """
+        if not syndrome:
+            return []
+
+        cypher = """
+        MATCH (s:Syndrome {name:$syndrome})
+        OPTIONAL MATCH (d:Disease)-[r:MANIFESTS_AS]->(s)
+        RETURN
+            d.name AS disease,
+            s.name AS syndrome,
+            s.description AS syndrome_description,
+            properties(s) AS syndrome_properties,
+            CASE WHEN r IS NULL THEN {} ELSE properties(r) END AS relation_properties
+        ORDER BY disease ASC
+        """
+        rows = self.query(cypher, {"syndrome": syndrome})
+
+        result = []
+        seen = set()
+        for row in rows:
+            rel_props = row.get("relation_properties") or {}
+            syn_props = row.get("syndrome_properties") or {}
+            pathogenesis = (
+                rel_props.get("pathogenesis")
+                or rel_props.get("病机")
+                or syn_props.get("pathogenesis")
+                or syn_props.get("病机")
+                or row.get("syndrome_description")
+            )
+            if not pathogenesis or pathogenesis in seen:
+                continue
+
+            result.append({
+                "name": pathogenesis,
+                "source": "Syndrome.properties / Disease-MANIFESTS_AS-Syndrome",
+                "disease": row.get("disease"),
+                "syndrome": row.get("syndrome"),
+                "properties": {
+                    "relation": rel_props,
+                    "syndrome": syn_props,
+                },
+            })
+            seen.add(pathogenesis)
+        return result
+
+    def get_syndrome_treatments(self, syndrome: str):
+        """查询某个证候相关的治则治法。
+
+        检索范围包括：
+        1. 证候节点自身属性，如 treatment、治则治法、治法；
+        2. 所有关联疾病通过 MANIFESTS_AS 指向该证候时，关系上的 treatment、治则治法、治法属性。
+        """
+        if not syndrome:
+            return []
+
+        cypher = """
+        MATCH (s:Syndrome {name:$syndrome})
+        OPTIONAL MATCH (d:Disease)-[r:MANIFESTS_AS]->(s)
+        RETURN
+            d.name AS disease,
+            s.name AS syndrome,
+            properties(s) AS syndrome_properties,
+            CASE WHEN r IS NULL THEN {} ELSE properties(r) END AS relation_properties
+        ORDER BY disease ASC
+        """
+        rows = self.query(cypher, {"syndrome": syndrome})
+
+        result = []
+        seen = set()
+        for row in rows:
+            rel_props = row.get("relation_properties") or {}
+            syn_props = row.get("syndrome_properties") or {}
+            treatment = (
+                rel_props.get("treatment")
+                or rel_props.get("治则治法")
+                or rel_props.get("治法")
+                or syn_props.get("treatment")
+                or syn_props.get("治则治法")
+                or syn_props.get("治法")
+            )
+            if not treatment or treatment in seen:
+                continue
+
+            result.append({
+                "name": treatment,
+                "source": "Syndrome.properties / Disease-MANIFESTS_AS-Syndrome",
+                "disease": row.get("disease"),
+                "syndrome": row.get("syndrome"),
+                "properties": {
+                    "relation": rel_props,
+                    "syndrome": syn_props,
+                },
+            })
+            seen.add(treatment)
+        return result
+
+    def get_clinical_symptoms(
+        self,
+        disease: str,
+        syndrome: str,
+        input_symptoms: Optional[list[str]] = None,
+    ):
+        input_symptoms = input_symptoms or []
+
+        cypher = """
+        MATCH (c:Case)-[:HAS_DISEASE]->(:Disease {name:$disease})
+        MATCH (c)-[:HAS_SYNDROME]->(:Syndrome {name:$syndrome})
+        MATCH (c)-[:PRESENTS_SYMPTOM]->(sym:Symptom)
+        RETURN
+            sym.name AS symptom,
+            count(DISTINCT c) AS cases
+        ORDER BY cases DESC, symptom ASC
+        LIMIT 50
+        """
+
+        rows = self.query(cypher, {"disease": disease, "syndrome": syndrome})
+
+        kg_symptoms = [
+            {
+                "name": r["symptom"],
+                "labels": ["Symptom"],
+                "properties": {"cases": r["cases"]},
+            }
+            for r in rows
+            if r.get("symptom")
         ]
-        return KGResult(ok=True, data=base)
 
-    # ── 查询：十八反 / 十九畏配伍禁忌 ─────────────────────────────────────────
+        kg_names = {x["name"] for x in kg_symptoms}
+        return {
+            "知识图谱症状": kg_symptoms,
+            "输入症状": input_symptoms,
+            "已匹配症状": [s for s in input_symptoms if s in kg_names],
+            "未匹配症状": [s for s in input_symptoms if s not in kg_names],
+        }
 
-    def check_incompatibilities(self, herbs: Iterable[str]) -> KGResult:
-        """对一组药两两校验十八反/十九畏。命中即返回三元组描述。"""
-        names = sorted({h.strip() for h in herbs if h and h.strip()})
-        if len(names) < 2:
-            return KGResult(ok=True, data={"warnings": [], "herbs": names})
+    def get_herb_knowledge(self, herbs: list[str]):
+        if not herbs:
+            return []
 
-        rows = self._exec(
-            "MATCH (a:Herb)-[r:INCOMPATIBLE_WITH|ANTAGONIZES]-(b:Herb) "
-            "WHERE a.name IN $names AND b.name IN $names AND a.name < b.name "
-            "RETURN a.name AS a, b.name AS b, type(r) AS rel, "
-            "r.rule AS rule, r.description AS description",
-            names=names,
-        )
-        warnings = []
-        for r in rows:
-            kind = "十八反" if r["rel"] == "INCOMPATIBLE_WITH" else "十九畏"
-            warnings.append({
-                "herb_a": r["a"],
-                "herb_b": r["b"],
-                "kind": kind,
-                "rule": r.get("rule"),
-                "description": r.get("description"),
-            })
-        return KGResult(ok=True, data={"herbs": names, "warnings": warnings})
+        cypher = """
+        MATCH (h:Herb)
+        WHERE h.name IN $herbs
 
-    def list_incompatibilities(self, kind: str = "all", limit: int = 100) -> KGResult:
-        """枚举全图配伍禁忌。kind: 'all' | 'INCOMPATIBLE_WITH' | 'ANTAGONIZES'。"""
-        rel_types = {
-            "all": ["INCOMPATIBLE_WITH", "ANTAGONIZES"],
-            "INCOMPATIBLE_WITH": ["INCOMPATIBLE_WITH"],
-            "ANTAGONIZES": ["ANTAGONIZES"],
-        }.get(kind.upper(), ["INCOMPATIBLE_WITH", "ANTAGONIZES"])
+        OPTIONAL MATCH (h)-[:HAS_FUNCTION]->(f:Function)
+        OPTIONAL MATCH (h)-[:INDICATED_FOR]->(i:Indication)
+        OPTIONAL MATCH (h)-[:ENTERS_MERIDIAN]->(m:Meridian)
+        OPTIONAL MATCH (h)-[:CONTRAINDICATED_FOR]->(c:Contraindication)
+        OPTIONAL MATCH (h)-[:HAS_ADVERSE_EFFECT]->(ae:AdverseEffect)
+        OPTIONAL MATCH (h)-[:HAS_PREPARATION]->(p:Preparation)
 
-        rows = self._exec(
-            "MATCH (a:Herb)-[r]->(b:Herb) WHERE type(r) IN $rels "
-            "RETURN a.name AS a, b.name AS b, type(r) AS rel, "
-            "r.rule AS rule, r.description AS description LIMIT $limit",
-            rels=rel_types, limit=int(limit),
-        )
-        items = []
-        for r in rows:
-            label = "十八反" if r["rel"] == "INCOMPATIBLE_WITH" else "十九畏"
-            items.append({
-                "herb_a": r["a"],
-                "herb_b": r["b"],
-                "kind": label,
-                "rule": r.get("rule"),
-                "description": r.get("description"),
-            })
-        return KGResult(ok=True, data={"items": items, "count": len(items)})
-
-    # ── 写入：节点 ────────────────────────────────────────────────────────────
-
-    def upsert_node(self, label: str, name: str,
-                    doctor_id: Optional[str] = None,
-                    extra: Optional[Dict[str, Any]] = None) -> KGResult:
-        """通用 upsert 节点：name 唯一键（doctor_id 可选）。"""
-        if label not in VALID_LABELS or label not in NAME_INDEXED_LABELS:
-            return KGResult(ok=False, message=f"该 label 不支持通过 name upsert: {label}")
-
-        props = dict(extra or {})
-        props["name"] = name
-        if doctor_id and label in {"Disease", "Syndrome", "Case"}:
-            props["doctor_id"] = doctor_id
-        props.setdefault("updated_at", _now_date())
-
-        set_clauses = ", ".join(f"n.{k} = ${k}" for k in props if k != "name")
-        on_create = ", ".join(f"n.{k} = ${k}" for k in props)
-        cypher = (
-            f"MERGE (n:{label} {{name:$name}}) "
-            f"ON CREATE SET {on_create} "
-            + (f"ON MATCH SET {set_clauses}" if set_clauses else "")
-        )
-        stats = self._exec_write(cypher, **props)
-        return KGResult(ok=True, data={"label": label, "name": name, "stats": stats})
-
-    def upsert_herb(self, name: str, *, pinyin: Optional[str] = None,
-                    nature: Optional[str] = None,
-                    flavors: Optional[List[str]] = None,
-                    category: Optional[str] = None,
-                    toxicity: Optional[str] = None,
-                    latin_name: Optional[str] = None,
-                    source: Optional[str] = None,
-                    reference: Optional[str] = None,
-                    textbook_dose: Optional[str] = None,
-                    extra: Optional[Dict[str, Any]] = None) -> KGResult:
-        """草药节点的便捷 upsert：性味 / 归经 / 药类 / 毒性等。"""
-        props: Dict[str, Any] = dict(extra or {})
-        if pinyin is not None:
-            props["pinyin"] = pinyin
-        if nature is not None:
-            props["nature"] = nature
-        if flavors is not None:
-            props["flavors"] = flavors
-        if category is not None:
-            props["category"] = category
-        if toxicity is not None:
-            props["toxicity"] = toxicity
-        if latin_name is not None:
-            props["latin_name"] = latin_name
-        if source is not None:
-            props["source"] = source
-        if reference is not None:
-            props["reference"] = reference
-        if textbook_dose is not None:
-            props["textbook_dose"] = textbook_dose
-        return self.upsert_node("Herb", name, extra=props)
-
-    def upsert_syndrome(self, name: str, *, doctor_id: Optional[str] = None,
-                        description: Optional[str] = None,
-                        extra: Optional[Dict[str, Any]] = None) -> KGResult:
-        props: Dict[str, Any] = dict(extra or {})
-        if description is not None:
-            props["description"] = description
-        return self.upsert_node("Syndrome", name, doctor_id=doctor_id, extra=props)
-
-    def upsert_disease(self, name: str, *, doctor_id: Optional[str] = None,
-                       description: Optional[str] = None,
-                       extra: Optional[Dict[str, Any]] = None) -> KGResult:
-        props: Dict[str, Any] = dict(extra or {})
-        if description is not None:
-            props["description"] = description
-        return self.upsert_node("Disease", name, doctor_id=doctor_id, extra=props)
-
-    # ── 写入：关系 ────────────────────────────────────────────────────────────
-
-    def link(self, rel_type: str, from_label: str, from_name: str,
-             to_label: str, to_name: str,
-             rel_props: Optional[Dict[str, Any]] = None,
-             doctor_id: Optional[str] = None) -> KGResult:
-        """通用关系 upsert。from_name/to_name 为节点 name（或 (name, doctor_id) 复合）。"""
-        if rel_type not in VALID_RELS:
-            return KGResult(ok=False, message=f"非法关系类型: {rel_type}")
-        if from_label not in VALID_LABELS or to_label not in VALID_LABELS:
-            return KGResult(ok=False, message="非法节点标签")
-
-        # 部分节点需要 doctor_id 才能唯一定位
-        from_match = "MATCH (a:{L} {{name:$a{cond}}})".format(
-            L=from_label, cond=", doctor_id:$doc" if doctor_id and from_label in {"Disease", "Syndrome", "Case"} else "",
-        )
-        to_match = "MATCH (b:{L} {{name:$b{cond}}})".format(
-            L=to_label, cond=", doctor_id:$doc" if doctor_id and to_label in {"Disease", "Syndrome", "Case"} else "",
-        )
-
-        rel_props = dict(rel_props or {})
-        set_clause = ""
-        if rel_props:
-            set_clause = "SET " + ", ".join(f"r.{k} = ${k}" for k in rel_props)
-            params = {"a": from_name, "b": to_name, **rel_props}
-        else:
-            params = {"a": from_name, "b": to_name}
-        if doctor_id and (from_label in {"Disease", "Syndrome", "Case"} or to_label in {"Disease", "Syndrome", "Case"}):
-            params["doc"] = doctor_id
-
-        cypher = (
-            f"{from_match} {to_match} "
-            f"MERGE (a)-[r:{rel_type}]->(b) "
-            + (set_clause if set_clause else "")
-        )
-        stats = self._exec_write(cypher, **params)
-        return KGResult(ok=True, data={
-            "from": f"{from_label}:{from_name}",
-            "to": f"{to_label}:{to_name}",
-            "rel": rel_type,
-            "props": rel_props,
-            "stats": stats,
-        })
-
-    def link_syndrome_herb(self, syndrome: str, herb: str, *,
-                           count: Optional[int] = None,
-                           avg_dose: Optional[float] = None,
-                           doctor_id: Optional[str] = None) -> KGResult:
-        """证型 ↔ 草药的常用药关系。"""
-        props: Dict[str, Any] = {}
-        if count is not None:
-            props["count"] = int(count)
-        if avg_dose is not None:
-            props["avg_dose"] = float(avg_dose)
-        return self.link(
-            "COMMONLY_USES", "Syndrome", syndrome, "Herb", herb,
-            rel_props=props, doctor_id=doctor_id,
-        )
-
-    def link_disease_syndrome(self, disease: str, syndrome: str, *,
-                              count: Optional[int] = None,
-                              doctor_id: Optional[str] = None) -> KGResult:
-        props: Dict[str, Any] = {}
-        if count is not None:
-            props["count"] = int(count)
-        return self.link(
-            "MANIFESTS_AS", "Disease", disease, "Syndrome", syndrome,
-            rel_props=props, doctor_id=doctor_id,
-        )
-
-    def link_incompatibility(self, herb_a: str, herb_b: str, *,
-                             kind: str = "INCOMPATIBLE_WITH",
-                             rule: Optional[str] = None,
-                             description: Optional[str] = None) -> KGResult:
-        """写入十八反 / 十九畏。kind ∈ {INCOMPATIBLE_WITH, ANTAGONIZES}。"""
-        if kind not in {"INCOMPATIBLE_WITH", "ANTAGONIZES"}:
-            return KGResult(ok=False, message="kind 必须为 INCOMPATIBLE_WITH 或 ANTAGONIZES")
-        props: Dict[str, Any] = {}
-        if rule:
-            props["rule"] = rule
-        if description:
-            props["description"] = description
-        # 双向链接保证 (a,b) 和 (b,a) 查询都能命中，与现有 fix_herb_incompatibility.cypher 一致
-        for direction in [(herb_a, herb_b), (herb_b, herb_a)]:
-            self._exec_write(
-                f"MATCH (a:Herb {{name:$a}}), (b:Herb {{name:$b}}) "
-                f"MERGE (a)-[r:{kind}]->(b) "
-                + ("SET " + ", ".join(f"r.{k}=${k}" for k in props) if props else ""),
-                a=direction[0], b=direction[1], **props,
-            )
-        return KGResult(ok=True, data={
-            "herb_a": herb_a, "herb_b": herb_b, "kind": kind,
-            "rule": rule, "description": description,
-        })
-
-    def link_symptom(self, syndrome: str, symptom: str,
-                     doctor_id: Optional[str] = None) -> KGResult:
-        """为证型登记症见节点，并把 (Case)-[:PRESENTS_SYMPTOM]->(Symptom) 接住。
-
-        这里创建 Symptom 节点（如不存在），然后连 Syndrome-HAS_SYNDROME-Case-
-        PRESENTS_SYMPTOM-Symptom 比较重；本函数仅做『自动建 Symptom + 计数关联』，
-        若需要病历级统计，请用 bulk_register_symptom_from_cases。
+        RETURN
+            h.name AS herb,
+            properties(h) AS herb_properties,
+            collect(DISTINCT f.name) AS functions,
+            collect(DISTINCT i.name) AS indications,
+            collect(DISTINCT m.name) AS meridians,
+            collect(DISTINCT c.name) AS contraindications,
+            collect(DISTINCT ae.name) AS adverse_effects,
+            collect(DISTINCT p.name) AS preparations
+        ORDER BY herb ASC
         """
-        self.upsert_node("Symptom", symptom)
-        cypher = (
-            "MATCH (s:Syndrome {name:$s}), (sym:Symptom {name:$sym}) "
-            "MERGE (s)-[r:ASSOCIATED_WITH]->(sym) "
-            "ON CREATE SET r.created_at = date()"
+
+        return self.query(cypher, {"herbs": herbs})
+
+    def get_similar_cases(
+        self,
+        disease: str,
+        syndrome: str,
+        symptoms: Optional[list[str]] = None,
+        limit: int = 2,
+    ):
+        """查询相似病例，默认返回 2 条。"""
+        symptoms = symptoms or []
+
+        cypher = """
+        MATCH (c:Case)
+
+        OPTIONAL MATCH (c)-[:HAS_DISEASE]->(d:Disease)
+        OPTIONAL MATCH (c)-[:HAS_SYNDROME]->(syn:Syndrome)
+        OPTIONAL MATCH (c)-[:PRESENTS_SYMPTOM]->(sym:Symptom)
+
+        WITH
+            c,
+            collect(DISTINCT d.name) AS diseases,
+            collect(DISTINCT syn.name) AS syndromes,
+            collect(DISTINCT sym.name) AS case_symptoms
+
+        WITH
+            c, diseases, syndromes, case_symptoms,
+            CASE WHEN $disease IN diseases THEN 3 ELSE 0 END AS disease_score,
+            CASE WHEN $syndrome IN syndromes THEN 4 ELSE 0 END AS syndrome_score,
+            size([x IN case_symptoms WHERE x IN $symptoms]) AS symptom_score
+
+        WHERE disease_score + syndrome_score + symptom_score > 0
+
+        OPTIONAL MATCH (c)-[pr:PRESCRIBED]->(h:Herb)
+
+        RETURN
+            c.id AS id,
+            properties(c) AS case_properties,
+            diseases,
+            syndromes,
+            case_symptoms AS symptoms,
+            disease_score + syndrome_score + symptom_score AS score,
+            collect(DISTINCT {
+                name: h.name,
+                prescription_relation: properties(pr)
+            }) AS herbs
+        ORDER BY score DESC, id DESC
+        LIMIT $limit
+        """
+
+        return self.query(
+            cypher,
+            {
+                "disease": disease,
+                "syndrome": syndrome,
+                "symptoms": symptoms,
+                "limit": limit,
+            },
         )
-        stats = self._exec_write(cypher, s=syndrome, sym=symptom)
-        return KGResult(ok=True, data={"stats": stats})
 
-    def link_lifestyle_advice(self, disease: str, category: str, content: str) -> KGResult:
-        """疾病下的生活方式建议：MATCH LifestyleAdvice(category+content) 再 MERGE。"""
-        cypher = (
-            "MATCH (d:Disease {name:$d}) "
-            "MERGE (a:LifestyleAdvice {category:$cat, content:$content}) "
-            "MERGE (d)-[:HAS_ADVICE]->(a)"
+    def get_syndrome_similar_cases(
+        self,
+        syndrome: str,
+        symptoms: Optional[list[str]] = None,
+        limit: int = 2,
+    ):
+        """查询同证候下的相似病例，并按输入症状重合度排序。
+
+        评分规则：
+        - 命中同一证候记 4 分；
+        - 每个输入症状与病例症状重合记 1 分；
+        - 未传入症状时，返回同证候病例并按病例 id 倒序排列。
+        """
+        if not syndrome:
+            return []
+
+        symptoms = symptoms or []
+
+        cypher = """
+        MATCH (c:Case)-[:HAS_SYNDROME]->(syn:Syndrome {name:$syndrome})
+
+        OPTIONAL MATCH (c)-[:HAS_DISEASE]->(d:Disease)
+        OPTIONAL MATCH (c)-[:PRESENTS_SYMPTOM]->(sym:Symptom)
+
+        WITH
+            c,
+            collect(DISTINCT d.name) AS diseases,
+            collect(DISTINCT syn.name) AS syndromes,
+            collect(DISTINCT sym.name) AS case_symptoms
+
+        WITH
+            c, diseases, syndromes, case_symptoms,
+            4 AS syndrome_score,
+            size([x IN case_symptoms WHERE x IN $symptoms]) AS symptom_score
+
+        OPTIONAL MATCH (c)-[pr:PRESCRIBED]->(h:Herb)
+
+        RETURN
+            c.id AS id,
+            properties(c) AS case_properties,
+            diseases,
+            syndromes,
+            case_symptoms AS symptoms,
+            syndrome_score + symptom_score AS score,
+            collect(DISTINCT {
+                name: h.name,
+                prescription_relation: properties(pr)
+            }) AS herbs
+        ORDER BY score DESC, id DESC
+        LIMIT $limit
+        """
+
+        return self.query(
+            cypher,
+            {
+                "syndrome": syndrome,
+                "symptoms": symptoms,
+                "limit": limit,
+            },
         )
-        stats = self._exec_write(cypher, d=disease, cat=category, content=content)
-        return KGResult(ok=True, data={
-            "disease": disease, "category": category, "content": content, "stats": stats,
-        })
 
-    # ── 删除：节点 ────────────────────────────────────────────────────────────
+def json_safe(obj):
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_safe(v) for v in obj]
+    if hasattr(obj, "iso_format"):   # Neo4j Date / DateTime
+        return obj.iso_format()
+    if hasattr(obj, "isoformat"):    # Python datetime/date
+        return obj.isoformat()
+    return obj
 
-    def drop_node(self, label: str, name: str, *,
-                  detach: bool = False,
-                  doctor_id: Optional[str] = None) -> KGResult:
-        """按 label+name 删节点。默认只删无关系的孤立节点；detach=True 时
-        连同它发起的关系一起删。"""
-        if label not in VALID_LABELS:
-            return KGResult(ok=False, message=f"非法 label: {label}")
-
-        cond, params = ["n.name = $name"], {"name": name}
-        if doctor_id and label in {"Disease", "Syndrome", "Case"}:
-            cond.append("n.doctor_id = $doc")
-            params["doc"] = doctor_id
-        prefix = "DETACH DELETE n" if detach else "DELETE n"
-        cypher = f"MATCH (n:{label}) WHERE {' AND '.join(cond)} {prefix}"
-        try:
-            stats = self._exec_write(cypher, **params)
-        except Exception as e:
-            return KGResult(ok=False, message=f"删除失败（节点仍有关系？可加 detach=True）: {e}")
-        return KGResult(ok=True, data={"label": label, "name": name, "stats": stats})
-
-    # ── 删除：关系 ────────────────────────────────────────────────────────────
-
-    def drop_relation(self, rel_type: str, from_label: str, from_name: str,
-                      to_label: str, to_name: str,
-                      doctor_id: Optional[str] = None) -> KGResult:
-        """删除两节点间的指定关系（不影响节点本身）。"""
-        if rel_type not in VALID_RELS:
-            return KGResult(ok=False, message=f"非法关系类型: {rel_type}")
-        from_cond = "{name:$a"
-        to_cond = "{name:$b"
-        if doctor_id and from_label in {"Disease", "Syndrome", "Case"}:
-            from_cond += ", doctor_id:$doc"
-        if doctor_id and to_label in {"Disease", "Syndrome", "Case"}:
-            to_cond += ", doctor_id:$doc"
-        from_cond += "}"
-        to_cond += "}"
-
-        params: Dict[str, Any] = {"a": from_name, "b": to_name}
-        if doctor_id and (from_label in {"Disease", "Syndrome", "Case"} or to_label in {"Disease", "Syndrome", "Case"}):
-            params["doc"] = doctor_id
-
-        cypher = (
-            f"MATCH (a:{from_label} {from_cond})-[r:{rel_type}]->(b:{to_label} {to_cond}) "
-            "DELETE r"
-        )
-        try:
-            stats = self._exec_write(cypher, **params)
-        except Exception as e:
-            return KGResult(ok=False, message=f"删除失败: {e}")
-        return KGResult(ok=True, data={
-            "from": f"{from_label}:{from_name}",
-            "to": f"{to_label}:{to_name}",
-            "rel": rel_type, "stats": stats,
-        })
-
-    # ── 工具方法 ──────────────────────────────────────────────────────────────
-
-    def stats(self) -> KGResult:
-        """全局节点 / 关系数量统计。"""
-        cypher = (
-            "MATCH (n) UNWIND labels(n) AS lbl WITH lbl, count(*) AS c "
-            "ORDER BY c DESC RETURN lbl AS label, c AS count"
-        )
-        labels = self._exec(cypher)
-        cypher2 = (
-            "MATCH ()-[r]->() UNWIND type(r) AS rt WITH rt, count(*) AS c "
-            "ORDER BY c DESC RETURN rt AS rel, c AS count"
-        )
-        rels = self._exec(cypher2)
-        return KGResult(ok=True, data={"labels": labels, "relationships": rels})
-
-    def close(self) -> None:
-        try:
-            self._driver.close()
-        except Exception:
-            pass
+def _join(items: Optional[list[Any]], sep: str = "、", default: str = "无") -> str:
+    items = [str(x) for x in (items or []) if x]
+    return sep.join(items) if items else default
 
 
-# ── 工具函数 ─────────────────────────────────────────────────────────────────
+def _get_case_herbs(case: dict[str, Any], max_herbs: int = 20) -> str:
+    herbs = []
+    for item in case.get("herbs", []) or []:
+        name = item.get("name")
+        dose = (item.get("prescription_relation") or {}).get("dose")
+        if name and dose:
+            herbs.append(f"{name}{dose:g}g")
+        elif name:
+            herbs.append(name)
 
-def _extract_labels(cypher: str) -> List[str]:
-    """提取 Cypher 里出现的所有节点标签（最简实现，足够白名单校验）。"""
-    import re
-    return re.findall(r"\((?:\w+\s*:\s*|\s*:)(\w+)", cypher)
+    return _join(herbs[:max_herbs])
 
 
-def _extract_rels(cypher: str) -> List[str]:
-    import re
-    return re.findall(r"\[(?:\w+\s*:\s*|\s*:)(\w+)\s*\]", cypher)
+def _format_relation_properties(properties: Optional[dict[str, Any]], max_items: int = 5) -> str:
+    items = []
+    for key, value in (properties or {}).items():
+        if value is None or value == "":
+            continue
+        if isinstance(value, list):
+            value = _join(value)
+        items.append(f"{key}：{value}")
+        if len(items) >= max_items:
+            break
+    return "；".join(items)
 
 
-def _unwrap_node(node) -> Dict[str, Any]:
-    """neo4j Node → dict。处理 list/dict 类型字段。"""
-    if node is None:
-        return {}
-    if isinstance(node, dict):
-        return node
-    props = dict(node)
-    out: Dict[str, Any] = {}
-    for k, v in props.items():
-        if hasattr(v, "isoformat"):
-            out[k] = v.isoformat()
-        elif hasattr(v, "__iter__") and not isinstance(v, (str, bytes, dict)):
-            try:
-                out[k] = [_coerce(x) for x in v]
-            except TypeError:
-                out[k] = v
+_PROPERTY_LABELS = {
+    "name": "名称",
+    "tcm_name": "中医病名",
+    "affected_population": "好发人群",
+    "pathogenesis_tcm": "中医病机",
+    "pathogenesis_western": "西医病因病机",
+    "prognosis": "预后",
+    "description": "描述",
+    "pathogenesis": "病机",
+    "treatment": "治法",
+    "治则治法": "治则治法",
+    "治法": "治法",
+    "病机": "病机",
+}
+
+
+def _format_node_properties(properties: Optional[dict[str, Any]], max_items: int = 20) -> list[str]:
+    items = []
+    for key, value in (properties or {}).items():
+        if value is None or value == "":
+            continue
+        if isinstance(value, list):
+            value = _join(value)
+        label = _PROPERTY_LABELS.get(key, key)
+        items.append(f"{label}：{value}")
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _append_property_section(lines: list[str], title: str, properties: dict[str, Any]) -> None:
+    lines.append(title)
+    property_items = _format_node_properties(properties)
+    if property_items:
+        for item in property_items:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- 知识图谱中暂无属性信息。")
+    lines.append("")
+
+
+def _get_relation_property(properties: Optional[dict[str, Any]], keys: list[str]) -> Any:
+    for key in keys:
+        value = (properties or {}).get(key)
+        if value:
+            return value
+    return None
+
+
+def _format_relation_sentence(item: dict[str, Any]) -> str | None:
+    source = (item.get("source") or {}).get("name") or ""
+    target = (item.get("target") or {}).get("name") or ""
+    relation = item.get("relation") or "UNKNOWN_RELATION"
+    properties = item.get("properties") or {}
+    source_known = bool(source and source != "未知节点")
+    target_known = bool(target and target != "未知节点")
+    property_text = _format_relation_properties(properties)
+
+    if relation == "COMPLICATES_WITH" and source_known and target_known:
+        return f"{source}可能并发或累及{target}。"
+
+    if relation == "DIFFERENTIATE_FROM" and source_known and target_known:
+        key_points = _get_relation_property(properties, ["key_points", "鉴别要点", "points"])
+        if key_points:
+            return f"鉴别诊断：{source}与{target}需鉴别，要点为：{key_points}"
+        return f"鉴别诊断：{source}需与{target}鉴别。"
+
+    if relation == "HAS_ADVICE":
+        advice = _get_relation_property(properties, ["advice", "建议", "content", "text", "name"])
+        if advice:
+            return f"诊疗建议：{advice}"
+        if target_known:
+            return f"诊疗建议：{target}。"
+        return None
+
+    if relation == "MANIFESTS_AS" and source_known and target_known:
+        if property_text:
+            return f"疾病证候关系：{source}可表现为{target}；{property_text}"
+        return f"疾病证候关系：{source}可表现为{target}。"
+
+    if not source_known or not target_known:
+        return None
+
+    if property_text:
+        return f"{source}与{target}存在{relation}关系；{property_text}"
+    return f"{source}与{target}存在{relation}关系。"
+
+
+def _get_node_id_or_name(node: dict[str, Any]) -> str:
+    name = node.get("name")
+    properties = node.get("properties") or {}
+    return name or properties.get("id") or "未知节点"
+
+
+def _format_disease_relation_item(item: dict[str, Any]) -> str | None:
+    source = item.get("source") or {}
+    target = item.get("target") or {}
+    relation = item.get("relation")
+    properties = item.get("properties") or {}
+    source_name = _get_node_id_or_name(source)
+    target_name = _get_node_id_or_name(target)
+
+    if relation == "COMPLICATES_WITH":
+        return f"{source_name}可能并发或累及{target_name}。"
+
+    if relation == "DIFFERENTIATE_FROM":
+        key_points = _get_relation_property(properties, ["key_points", "鉴别要点", "points"])
+        if key_points:
+            return f"鉴别诊断：{source_name}与{target_name}需鉴别；鉴别要点：{key_points}"
+        return f"鉴别诊断：{source_name}与{target_name}需鉴别。"
+
+    if relation == "HAS_ADVICE":
+        advice = _get_relation_property(properties, ["advice", "建议", "content", "text", "name"])
+        advice = advice or _get_relation_property(target.get("properties") or {}, ["advice", "建议", "content", "text", "name"])
+        if advice:
+            return f"{advice}"
+        return f"关联生活建议：{target_name}。"
+
+    if relation == "HAS_DISEASE":
+        case_props = source.get("properties") or {}
+        case_id = case_props.get("id") or source_name
+        chief_complaint = case_props.get("chief_complaint")
+        gender = case_props.get("gender")
+        age = case_props.get("age")
+        patient = "，".join(str(x) for x in [gender, f"{age}岁" if age else None] if x)
+        parts = [f"病例 {case_id}"]
+        if patient:
+            parts.append(patient)
+        if chief_complaint:
+            parts.append(f"主诉：{chief_complaint}")
+        return "；".join(parts)
+
+    if relation == "HAS_STAGE":
+        return f"疾病分期：{target_name}。"
+
+    if relation == "MANIFESTS_AS":
+        count = properties.get("count")
+        if count is not None:
+            return f"可表现为证候：{target_name}（{count}例）。"
+        return f"可表现为证候：{target_name}。"
+
+    return None
+
+
+def _append_disease_relation_section(lines: list[str], relations: list[dict[str, Any]]) -> None:
+    lines.append("【诊断关系参考】")
+
+    relation_groups = [
+        ("疾病可能的并发症", "COMPLICATES_WITH"),
+        ("疾病鉴别诊断关系", "DIFFERENTIATE_FROM"),
+        ("疾病关联生活建议", "HAS_ADVICE"),
+        ("疾病关联的病例", "HAS_DISEASE"),
+        ("疾病分期", "HAS_STAGE"),
+        ("疾病表现的证候", "MANIFESTS_AS"),
+    ]
+
+    for title, relation_type in relation_groups:
+        lines.append(f"{title}：")
+        relation_texts = []
+        seen = set()
+        for item in relations:
+            if item.get("relation") != relation_type:
+                continue
+            relation_text = _format_disease_relation_item(item)
+            if not relation_text or relation_text in seen:
+                continue
+            relation_texts.append(relation_text)
+            seen.add(relation_text)
+
+        if relation_texts:
+            for relation_text in relation_texts:
+                lines.append(f"- {relation_text}")
         else:
-            out[k] = v
-    return out
+            lines.append("- 知识图谱中暂无相关信息。")
+    lines.append("")
 
 
-def _coerce(v: Any) -> Any:
-    if hasattr(v, "isoformat"):
-        return v.isoformat()
-    return v
+def _append_relation_section(
+    lines: list[str], title: str, relations: list[dict[str, Any]], max_relations: int
+) -> None:
+    lines.append(title)
+    relation_texts = []
+    seen = set()
+    for item in relations:
+        relation_text = _format_relation_sentence(item)
+        if not relation_text or relation_text in seen:
+            continue
+        relation_texts.append(relation_text)
+        seen.add(relation_text)
+        if len(relation_texts) >= max_relations:
+            break
+
+    if relation_texts:
+        for relation_text in relation_texts:
+            lines.append(f"- {relation_text}")
+    else:
+        lines.append("- 知识图谱中暂无相关关系。")
+    lines.append("")
 
 
-def _now_date() -> str:
-    from datetime import date
-    return date.today().isoformat()
+def format_kg_context_for_llm(
+    kg: dict[str, Any],
+    max_symptoms: int = 20,
+    max_cases: int = 2,
+    max_herbs_per_case: int = 20,
+    max_relations: int = 20,
+) -> str:
+    disease = kg.get("诊断") or ""
+    syndrome = kg.get("证候") or ""
 
+    lines = []
+    lines.append("【知识图谱参考】")
+    lines.append(f"疾病：{disease}")
+    lines.append(f"证候：{syndrome}")
+    lines.append("")
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
+    # 病机
+    pathogenesis = kg.get("病机信息") or []
+    lines.append("【病机参考】")
+    if pathogenesis:
+        for item in pathogenesis:
+            lines.append(f"- {item.get('name')}")
+    else:
+        lines.append("- 知识图谱中暂无明确病机描述。")
+    lines.append("")
 
-def _print_result(res: KGResult) -> None:
-    if not res.ok:
-        print(f"[FAIL] {res.message}", file=sys.stderr)
-        sys.exit(1)
-    print(res.to_json())
+    _append_relation_section(lines, "【诊断-证候关系参考】", kg.get("诊断证候相关关系") or [], max_relations)
+    _append_relation_section(lines, "【证候关系参考】", kg.get("证候相关关系") or [], max_relations)
+    _append_disease_relation_section(lines, kg.get("诊断相关关系") or [])
 
+    # 临床症状
+    clinical = kg.get("临床症状") or {}
+    kg_symptoms = clinical.get("知识图谱症状") or []
+    input_symptoms = clinical.get("输入症状") or []
+    matched = clinical.get("已匹配症状") or []
+    unmatched = clinical.get("未匹配症状") or []
 
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="knowledge_graph_manager",
-        description="中医知识图谱 Neo4j 增删改查 CLI",
-    )
-    sub = p.add_subparsers(dest="cmd", required=True)
+    lines.append("【临床症状参考】")
+    if kg_symptoms:
+        lines.append("该疾病-证候下常见症状：")
+        for item in kg_symptoms[:max_symptoms]:
+            name = item.get("name")
+            cases = (item.get("properties") or {}).get("cases")
+            if cases is not None:
+                lines.append(f"- {name}（{cases}例）")
+            else:
+                lines.append(f"- {name}")
+    else:
+        lines.append("- 知识图谱中暂无该证候的症状统计。")
+    if input_symptoms:
+        lines.append(f"本次输入症状：{_join(input_symptoms)}")
+    if matched:
+        lines.append(f"已匹配症状：{_join(matched)}")
+    if unmatched:
+        lines.append(f"未匹配症状：{_join(unmatched)}")
+    lines.append("")
 
-    # 查询
-    sub.add_parser("stats", help="节点 / 关系统计")
+    # 药物知识
+    herb_knowledge = kg.get("相关药物知识") or []
+    lines.append("【药物知识参考】")
+    if herb_knowledge:
+        for herb in herb_knowledge:
+            name = herb.get("herb")
+            props = herb.get("herb_properties") or {}
+            functions = herb.get("functions") or []
+            indications = herb.get("indications") or []
+            meridians = herb.get("meridians") or []
+            contraindications = herb.get("contraindications") or []
 
-    sp = sub.add_parser("syndrome", help="按证候聚合查询")
-    sp.add_argument("name")
-    sp.add_argument("--doctor-id", default=None)
+            lines.append(f"{name}：")
+            if props.get("category"):
+                lines.append(f"- 类别：{props.get('category')}")
+            if props.get("nature") or props.get("flavors"):
+                lines.append(f"- 性味：{props.get('nature', '')}，{_join(props.get('flavors'))}")
+            if meridians:
+                lines.append(f"- 归经：{_join(meridians)}")
+            if functions:
+                lines.append(f"- 功效：{_join(functions)}")
+            if indications:
+                lines.append(f"- 主治：{_join(indications[:10])}")
+            if props.get("textbook_dose"):
+                lines.append(f"- 常用剂量：{props.get('textbook_dose')}")
+            if contraindications:
+                lines.append(f"- 禁忌：{_join(contraindications)}")
+    else:
+        lines.append("- 知识图谱中暂无相关药物知识。")
+    lines.append("")
 
-    sp = sub.add_parser("disease", help="按疾病聚合查询（治则治法入口）")
-    sp.add_argument("name")
-    sp.add_argument("--doctor-id", default=None)
+    # 相似病例
+    cases = kg.get("相似病例") or []
+    lines.append("【相似病例参考】")
+    if cases:
+        for idx, case in enumerate(cases[:max_cases], start=1):
+            props = case.get("case_properties") or {}
+            gender = props.get("gender") or "未知性别"
+            age = props.get("age") or "未知年龄"
+            chief = props.get("chief_complaint") or "未记录主诉"
 
-    sp = sub.add_parser("herb", help="按草药名取节点")
-    sp.add_argument("name")
+            lines.append(f"相似病例{idx}：")
+            lines.append(f"- 患者：{gender}，{age}岁")
+            lines.append(f"- 主诉：{chief}")
+            lines.append(f"- 诊断：{_join(case.get('diseases'))}")
+            lines.append(f"- 证候：{_join(case.get('syndromes'))}")
+            lines.append(f"- 症状：{_join(case.get('symptoms'))}")
+            lines.append(f"- 相似度评分：{case.get('score')}")
+            lines.append(f"- 用药：{_get_case_herbs(case, max_herbs=max_herbs_per_case)}")
+    else:
+        lines.append("- 未检索到相似病例。")
 
-    sp = sub.add_parser("node", help="按 label+name 取一个节点")
-    sp.add_argument("label")
-    sp.add_argument("name")
-    sp.add_argument("--doctor-id", default=None)
+    lines.append("")
+    lines.append("【使用要求】")
+    lines.append("- 以上知识图谱内容仅作为参考。")
+    lines.append("- 若患者当前症状与知识图谱不一致，应优先依据患者当前症状进行辨证。")
+    lines.append("- 可结合相似病例中的核心用药，但不得机械照搬。")
 
-    sp = sub.add_parser("cases", help="按 disease/syndrome 取相似病历")
-    sp.add_argument("--disease", default="")
-    sp.add_argument("--syndrome", default="")
-    sp.add_argument("--limit", type=int, default=5)
+    return "\n".join(lines)
 
-    sp = sub.add_parser("incompat", help="查一组药的十八反/十九畏")
-    sp.add_argument("herbs", nargs="+")
+def format_disease_properties(props: dict) -> str:
+    field_labels = {
+        "name": "诊断名称",
+        "tcm_name": "中医病名",
+        "affected_population": "好发人群",
+        "western_summary": "西医概述",
+        "pathogenesis_western": "西医病因病机",
+        "pathogenesis_tcm": "中医病机",
+        "prognosis": "预后",
+        "updated_at": "更新时间",
+    }
 
-    sp = sub.add_parser("incompat-list", help="枚举全图配伍禁忌")
-    sp.add_argument("--kind", default="all", choices=["all", "INCOMPATIBLE_WITH", "ANTAGONIZES"])
-    sp.add_argument("--limit", type=int, default=50)
+    order = [
+        "name",
+        "tcm_name",
+        "affected_population",
+        "western_summary",
+        "pathogenesis_western",
+        "pathogenesis_tcm",
+        "prognosis",
+        "updated_at",
+    ]
 
-    # 写入 / 更新
-    sp = sub.add_parser("herb-upsert", help="upsert 草药节点")
-    sp.add_argument("name")
-    sp.add_argument("--pinyin", default=None)
-    sp.add_argument("--nature", default=None)
-    sp.add_argument("--flavor", action="append", help="可重复，加口味 list")
-    sp.add_argument("--category", default=None)
-    sp.add_argument("--toxicity", default=None)
-    sp.add_argument("--latin-name", default=None)
-    sp.add_argument("--source", default=None)
-    sp.add_argument("--reference", default=None)
-    sp.add_argument("--textbook-dose", default=None)
+    lines = []
+    for key in order:
+        value = props.get(key)
+        if value:
+            lines.append(f"{field_labels[key]}：{value}")
 
-    sp = sub.add_parser("syndrome-upsert", help="upsert 证候节点")
-    sp.add_argument("name")
-    sp.add_argument("--doctor-id", default=None)
-    sp.add_argument("--description", default=None)
-
-    sp = sub.add_parser("disease-upsert", help="upsert 疾病节点")
-    sp.add_argument("name")
-    sp.add_argument("--doctor-id", default=None)
-    sp.add_argument("--description", default=None)
-
-    sp = sub.add_parser("link", help="通用关系 upsert")
-    sp.add_argument("--rel", required=True)
-    sp.add_argument("--from-label", required=True)
-    sp.add_argument("--from-name", required=True)
-    sp.add_argument("--to-label", required=True)
-    sp.add_argument("--to-name", required=True)
-    sp.add_argument("--doctor-id", default=None)
-    sp.add_argument("--count", type=int, default=None)
-    sp.add_argument("--dose", type=float, default=None)
-    sp.add_argument("--rule", default=None)
-    sp.add_argument("--description", default=None)
-
-    sp = sub.add_parser("link-symptom", help="把症见挂在证候下")
-    sp.add_argument("--syndrome", required=True)
-    sp.add_argument("--symptom", required=True)
-
-    sp = sub.add_parser("link-advice", help="把生活方式建议挂在疾病下")
-    sp.add_argument("--disease", required=True)
-    sp.add_argument("--category", required=True)
-    sp.add_argument("--content", required=True)
-
-    sp = sub.add_parser("link-incompat", help="写入一对十八反/十九畏")
-    sp.add_argument("herb_a")
-    sp.add_argument("herb_b")
-    sp.add_argument("--kind", default="INCOMPATIBLE_WITH",
-                    choices=["INCOMPATIBLE_WITH", "ANTAGONIZES"])
-    sp.add_argument("--rule", default=None)
-    sp.add_argument("--description", default=None)
-
-    # 删除
-    sp = sub.add_parser("drop-node", help="删一个节点")
-    sp.add_argument("label")
-    sp.add_argument("name")
-    sp.add_argument("--doctor-id", default=None)
-    sp.add_argument("--detach", action="store_true", help="连同关系一起删除")
-
-    sp = sub.add_parser("drop-rel", help="删一对关系")
-    sp.add_argument("--rel", required=True)
-    sp.add_argument("--from-label", required=True)
-    sp.add_argument("--from-name", required=True)
-    sp.add_argument("--to-label", required=True)
-    sp.add_argument("--to-name", required=True)
-    sp.add_argument("--doctor-id", default=None)
-
-    return p
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = _build_parser()
-    args = parser.parse_args(argv)
-    kg = KnowledgeGraphManager()
-    try:
-        if args.cmd == "stats":
-            return _print_result(kg.stats())
-
-        if args.cmd == "syndrome":
-            return _print_result(kg.get_syndrome(args.name, doctor_id=args.doctor_id))
-
-        if args.cmd == "disease":
-            return _print_result(kg.get_treatments_for_disease(args.name, doctor_id=args.doctor_id))
-
-        if args.cmd == "herb":
-            return _print_result(kg.get_node("Herb", args.name))
-
-        if args.cmd == "node":
-            return _print_result(kg.get_node(args.label, args.name, doctor_id=args.doctor_id))
-
-        if args.cmd == "cases":
-            return _print_result(kg.search_similar_cases(args.disease, args.syndrome, args.limit))
-
-        if args.cmd == "incompat":
-            return _print_result(kg.check_incompatibilities(args.herbs))
-
-        if args.cmd == "incompat-list":
-            return _print_result(kg.list_incompatibilities(args.kind, args.limit))
-
-        if args.cmd == "herb-upsert":
-            return _print_result(kg.upsert_herb(
-                args.name, pinyin=args.pinyin, nature=args.nature,
-                flavors=args.flavor, category=args.category,
-                toxicity=args.toxicity, latin_name=args.latin_name,
-                source=args.source, reference=args.reference,
-                textbook_dose=args.textbook_dose,
-            ))
-
-        if args.cmd == "syndrome-upsert":
-            return _print_result(kg.upsert_syndrome(
-                args.name, doctor_id=args.doctor_id, description=args.description,
-            ))
-
-        if args.cmd == "disease-upsert":
-            return _print_result(kg.upsert_disease(
-                args.name, doctor_id=args.doctor_id, description=args.description,
-            ))
-
-        if args.cmd == "link":
-            rel_props: Dict[str, Any] = {}
-            if args.count is not None:
-                rel_props["count"] = args.count
-            if args.dose is not None:
-                rel_props["avg_dose"] = args.dose
-            if args.rule:
-                rel_props["rule"] = args.rule
-            if args.description:
-                rel_props["description"] = args.description
-            return _print_result(kg.link(
-                args.rel, args.from_label, args.from_name,
-                args.to_label, args.to_name,
-                rel_props=rel_props or None, doctor_id=args.doctor_id,
-            ))
-
-        if args.cmd == "link-symptom":
-            return _print_result(kg.link_symptom(args.syndrome, args.symptom))
-
-        if args.cmd == "link-advice":
-            return _print_result(kg.link_lifestyle_advice(args.disease, args.category, args.content))
-
-        if args.cmd == "link-incompat":
-            return _print_result(kg.link_incompatibility(
-                args.herb_a, args.herb_b,
-                kind=args.kind, rule=args.rule, description=args.description,
-            ))
-
-        if args.cmd == "drop-node":
-            return _print_result(kg.drop_node(args.label, args.name, detach=args.detach, doctor_id=args.doctor_id))
-
-        if args.cmd == "drop-rel":
-            return _print_result(kg.drop_relation(
-                args.rel, args.from_label, args.from_name,
-                args.to_label, args.to_name, doctor_id=args.doctor_id,
-            ))
-
-        parser.print_help()
-        return 1
-    finally:
-        kg.close()
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from medical.config import config
+    retriever = TCMKnowledgeRetriever(
+        uri="bolt://127.0.0.1:7687",
+        user="neo4j",
+        password=config.NEO4J_PASSWORD,
+        database="neo4j",
+    )
+
+    # context = retriever.get_syndrome_diagnosis_context(
+    #     disease="",
+    #     syndrome="",
+    #     symptoms=["舌有裂痕"],
+    #     herbs=[],
+    # )
+    # kg_text = format_kg_context_for_llm(context)
+    # print(kg_text)
+
+    # 查证候治则治法
+    syndrome_treatments = retriever.get_syndrome_treatments(
+        syndrome="湿毒蕴肤证",
+    )
+    print(f"治则治法：{syndrome_treatments}")
+
+    syndrome_relations = retriever.get_syndrome_relations(
+        syndrome="湿毒蕴肤证",
+    )
+    print(f"证候相关知识,常用药材、相似病历、相关疾病：{syndrome_relations}")
+
+    context_relations = retriever.get_disease_syndrome_relations(
+        disease="玫瑰痤疮",
+        syndrome="湿毒蕴肤证", # 名字写错，也找不到。。。
+    )
+    print(f"诊断-证候关系：{format_disease_properties(context_relations[0].get("source", {}).get("properties"))}")
+
+    # 诊断关系，包含疾病可能的并发症、疾病鉴别诊断关系、疾病关联生活建议、疾病关联的病例、疾病分期、疾病表现的证候
+    disease_relations = retriever.get_disease_relations(
+        disease="玫瑰痤疮",
+    )
+    print(f"诊断关系：{disease_relations}")
+
+    retriever.close()
