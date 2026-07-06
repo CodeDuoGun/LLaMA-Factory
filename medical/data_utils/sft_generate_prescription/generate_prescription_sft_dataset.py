@@ -80,20 +80,24 @@ SFT_PRESCRIPTION_SYSTEM_PROMPT = """
 7. 所有字符串不能为空，未知信息统一填写"未明确"。
 """
 LLM_SYSTEM_PROMPT = """
-你是一名资深中医皮肤科医生助手，负责结合病史信息、知识图谱知识、最高相似模板方信息，生成结构化辨证分析结果。
+你是一名资深中医皮肤科医生助手，负责结合病史信息、知识图谱信息、最高相似模板方信息，生成结构化辨证分析结果。
+你的核心任务是根据病史信息和知识图谱信息中的【已知的诊断结果、辨证结果、处方内容】，反推辨证逻辑、反推治则治法、反推配伍逻辑，并保持输出字段不变。
 
 你必须严格遵守以下要求：
 
 【辨证逻辑】
-1. 必须结合患者主诉、症状变化、既往病史、检查报告结果【如有】、舌面结果【如有】、患处分析结果【如有】进行辨证。
-2. 每个辨证判断都必须绑定具体依据，不能凭空推断。
-3. 未提供的信息必须说明“未提供”，不得作为依据。
-4. 需要区分主症、兼症、舌面/患处/检查报告依据，并说明这些依据如何支持证型、病机、治则治法。
-5. 辨证内容不超过300字。
+1. 必须以知识图谱信息和病史信息中已知的诊断结果、辨证结果为最终约束，辨证结论必须与已知诊断结果、辨证结果严格一致。
+2. 必须结合患者主诉、症状变化、既往病史、检查报告结果【如有】、舌面结果【如有】、患处分析结果【如有】反推辨证逻辑。
+3. 每个辨证判断都必须绑定具体依据，不能凭空推断。
+4. 未提供的信息必须说明“未提供”，不得作为依据。
+5. 需要区分主症、兼症、舌面/患处/检查报告依据，并说明这些依据如何支持已知证型、病机、治则治法。
+6. 如果病史依据不足以完全支持已知诊断或辨证结果，应说明“病史信息支持不足，但需与已知诊断结果、辨证结果保持一致”，不得改写诊断或证型。
+7. 辨证内容不超过300字。
 
 【治则治法】
-1. 根据辨证逻辑和知识图谱知识生成。
-2. 若知识图谱中治则治法为空，应基于辨证逻辑合理生成，并说明“知识图谱未提供明确治法”。
+1. 必须根据已知辨证结果、辨证逻辑和知识图谱知识反推治则治法。
+2. 治则治法必须服务于已知诊断结果、辨证结果，不得生成与其冲突的治法。
+3. 若知识图谱中治则治法为空，应基于已知辨证结果和辨证逻辑合理生成，并说明“知识图谱未提供明确治法”。
 
 【模板匹配】
 1. 如果最高模板匹配度低于0.55，不得参考模板方。
@@ -102,9 +106,11 @@ LLM_SYSTEM_PROMPT = """
 4. 模板匹配内容不超过300字。
 
 【配伍逻辑】
-1. 必须从君、臣、佐、使角度说明。
-2. 必须结合处方药物、证候、治法进行分析。
-3. 不得虚构病历中不存在的症状或检查结果。
+1. 必须根据知识图谱信息和病史信息中的处方内容反推配伍逻辑。
+2. 必须从君、臣、佐、使角度说明。
+3. 必须结合处方药物、已知辨证结果、治则治法进行分析。
+4. 配伍解释必须与已知诊断结果、辨证结果、处方内容严格一致。
+5. 不得虚构病历中不存在的症状或检查结果。
 
 【调理建议】
 1. 必须结合病史信息和知识图谱知识。
@@ -227,6 +233,7 @@ def build_user_prompt(
 【最高相似模板方信息】
 {most_similar_template_info}
 
+
 请严格输出 JSON，字段固定为：
 辨证逻辑、治则治法、模板匹配、配伍逻辑、调理建议。
 
@@ -239,10 +246,48 @@ def build_user_prompt(
 """.strip()
 
 
+def format_known_prescription_details(prescriptions: list[Dict[str, Any]]) -> str:
+    prescription_parts = []
+    for idx, prescription in enumerate(prescriptions, start=1):
+        part_items = [f"处方{idx}：{prescription.get('usage_type') or '未明确'}"]
+        for drug in prescription.get("drugs", []) or []:
+            if isinstance(drug, str):
+                part_items.append(drug)
+                continue
+
+            drug_name = drug.get("drug_name") or drug.get("name") or ""
+            dose = drug.get("dose") or drug.get("dosage") or ""
+            unit = drug.get("unit") or ""
+            drug_text = f"{drug_name}{dose}{unit}".strip()
+            if drug_text:
+                part_items.append(drug_text)
+        prescription_parts.append("，".join(part_items))
+
+    if not prescription_parts:
+        return "【未明确】"
+    return f"【{'，'.join(prescription_parts)}】"
+
+
+def build_known_result_context(record_info: Dict[str, Any]) -> str:
+    return f"""
+【已知结果】
+诊断结果：{record_info.get("diagnosis_illness") or "未明确"}
+辨证结果：{record_info.get("diagnosis_disease") or "未明确"}
+处方明细：{format_known_prescription_details(record_info.get("internal_prescriptions", []) or [])}
+""".strip()
+
+
+def append_known_result_context(user_prompt: str, known_result_context: str = "") -> str:
+    if not known_result_context:
+        return user_prompt
+    return f"{user_prompt}\n\n{known_result_context}".strip()
+
+
 def call_llm(
     patient_context: str,
     knowledge_context: str,
     most_similar_template_info: str,
+    known_result_context: str = "",
     model: str = "qwen3.6-flash",
 ) -> Dict[str, Any]:
     client = OpenAI(
@@ -258,6 +303,7 @@ def call_llm(
         knowledge_context=knowledge_context,
         most_similar_template_info=most_similar_template_info,
     )
+    user_prompt = append_known_result_context(user_prompt, known_result_context)
 
     completion = client.chat.completions.create(
         model=model,
@@ -357,9 +403,8 @@ def build_sft_data(record_info, response, patient_context, knowledge_context):
     sft_system_prompt = SFT_PRESCRIPTION_SYSTEM_PROMPT 
     llm_response = validate_llm_result(response)
     sft_json_out = {
-        "中医诊断": record_info["diagnosis_sickness"],
         "中医证型": record_info["diagnosis_disease"],
-        "西医诊断": record_info["diagnosis_illness"],
+        "诊断结果": record_info["diagnosis_illness"],
         "处方建议": format_prescription_for_sft(record_info["internal_prescriptions"], llm_response),
         "治则治法": llm_response["治则治法"],
         "调理建议": llm_response["调理建议"],
@@ -435,8 +480,21 @@ def gen_datasets(
             patient_context = build_patient_context(record)
             knowledge_context = knowledge_builder(record)
             most_similar_template_info = get_most_similar_template(record, templates)
-            user_prompt = build_user_prompt(patient_context, knowledge_context, most_similar_template_info)
-            response = llm_caller(patient_context, knowledge_context, most_similar_template_info)
+            known_result_context = build_known_result_context(record)
+            print(f"known_result_context: {known_result_context}")
+            user_prompt = append_known_result_context(
+                build_user_prompt(patient_context, knowledge_context, most_similar_template_info),
+                known_result_context,
+            )
+            if llm_caller is call_llm:
+                response = llm_caller(
+                    patient_context,
+                    knowledge_context,
+                    most_similar_template_info,
+                    known_result_context=known_result_context,
+                )
+            else:
+                response = llm_caller(patient_context, knowledge_context, most_similar_template_info)
             print(f"llm response: {response}")
             knowledge_symptoms_context = build_knowledge_symptoms_context(record)
             sft_data = build_sft_data(record, response, patient_context, knowledge_context)

@@ -843,7 +843,7 @@ def _format_disease_relation_item(item: dict[str, Any]) -> str | None:
 
 
 def _append_disease_relation_section(lines: list[str], relations: list[dict[str, Any]]) -> None:
-    lines.append("【诊断关系参考】")
+    lines.append("【疾病知识参考】")
 
     relation_groups = [
         ("疾病可能的并发症", "COMPLICATES_WITH"),
@@ -851,11 +851,10 @@ def _append_disease_relation_section(lines: list[str], relations: list[dict[str,
         ("疾病关联生活建议", "HAS_ADVICE"),
         ("疾病关联的病例", "HAS_DISEASE"),
         ("疾病分期", "HAS_STAGE"),
-        ("疾病表现的证候", "MANIFESTS_AS"),
+        ("疾病表现的其他证候", "MANIFESTS_AS"),
     ]
 
     for title, relation_type in relation_groups:
-        lines.append(f"{title}：")
         relation_texts = []
         seen = set()
         for item in relations:
@@ -868,17 +867,17 @@ def _append_disease_relation_section(lines: list[str], relations: list[dict[str,
             seen.add(relation_text)
 
         if relation_texts:
+            lines.append(f"{title}：")
             for relation_text in relation_texts:
                 lines.append(f"- {relation_text}")
-        else:
-            lines.append("- 知识图谱中暂无相关信息。")
-    lines.append("")
+        # else:
+        #     lines.append("- 知识图谱中暂无相关信息。")
+            lines.append("")
 
 
 def _append_relation_section(
     lines: list[str], title: str, relations: list[dict[str, Any]], max_relations: int
 ) -> None:
-    lines.append(title)
     relation_texts = []
     seen = set()
     for item in relations:
@@ -891,11 +890,10 @@ def _append_relation_section(
             break
 
     if relation_texts:
+        lines.append(f"{title}：")
         for relation_text in relation_texts:
             lines.append(f"- {relation_text}")
-    else:
-        lines.append("- 知识图谱中暂无相关关系。")
-    lines.append("")
+        lines.append("")
 
 
 def format_kg_context_for_llm(
@@ -910,9 +908,6 @@ def format_kg_context_for_llm(
 
     lines = []
     lines.append("【知识图谱参考】")
-    lines.append(f"疾病：{disease}")
-    lines.append(f"证候：{syndrome}")
-    lines.append("")
 
     # 病机
     pathogenesis = kg.get("病机信息") or []
@@ -920,8 +915,6 @@ def format_kg_context_for_llm(
     if pathogenesis:
         for item in pathogenesis:
             lines.append(f"- {item.get('name')}")
-    else:
-        lines.append("- 知识图谱中暂无明确病机描述。")
     lines.append("")
 
     _append_relation_section(lines, "【诊断-证候关系参考】", kg.get("诊断证候相关关系") or [], max_relations)
@@ -1080,7 +1073,7 @@ if __name__ == "__main__":
         disease="玫瑰痤疮",
         syndrome="湿毒蕴肤证", # 名字写错，也找不到。。。
     )
-    print(f"诊断-证候关系：{format_disease_properties(context_relations[0].get("source", {}).get("properties"))}")
+    print(f"诊断-证候关系：{format_disease_properties(context_relations[0].get('source', {}).get('properties'))}")
 
     # 诊断关系，包含疾病可能的并发症、疾病鉴别诊断关系、疾病关联生活建议、疾病关联的病例、疾病分期、疾病表现的证候
     disease_relations = retriever.get_disease_relations(
