@@ -47,9 +47,7 @@ def normalize_doctor_runs(dialogue: list[dict[str, str]]) -> list[dict[str, str]
     for turn in dialogue:
         if normalized_dialogue and normalized_dialogue[-1]["speaker"] == DOCTOR_SPEAKER and turn["speaker"] == DOCTOR_SPEAKER:
             normalized_dialogue.append({"speaker": PATIENT_SPEAKER, "content": BRIDGE_PATIENT_REPLY})
-
         normalized_dialogue.append(turn)
-
     return normalized_dialogue
 
 
@@ -60,7 +58,6 @@ def ensure_even_dialogue(dialogue: list[dict[str, str]]) -> list[dict[str, str]]
 
     if dialogue[-1]["speaker"] == PATIENT_SPEAKER:
         return dialogue[:-1]
-
     return dialogue + [{"speaker": PATIENT_SPEAKER, "content": DEFAULT_PATIENT_REPLY}]
 
 

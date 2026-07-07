@@ -6,25 +6,32 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 from medical.config import config
 from openai import OpenAI
-from medical.data_utils.knowledge import TCMKnowledgeRetriever, format_kg_context_for_llm
+from medical.data_utils.knowledge import (
+    TCMKnowledgeRetriever,
+    format_kg_context_for_llm,
+    format_relations_as_text,
+    _PROPERTY_LABELS,
+    _format_similar_cases,
+)
 from medical.data_utils.sft_generate_prescription.template import get_most_similar_template
 
 
 DEFAULT_TEMPLATE_FILE = Path("medical/data/wuweiping_template_prescription.json")
 DEFAULT_RECORD_FILE = Path("medical/data/sft_generate_prescription/extract_valid_record.json")
-DEFAULT_OUTPUT_FILE = Path("medical/data/sft_generate_prescription/prescription_sft_dataset.json")
-DEFAULT_FALLBACK_FILE = Path("medical/data/sft_generate_prescription/prescription_sft_fallback.json")
+DEFAULT_OUTPUT_DIR = Path("medical/data/processed_data")
+DEFAULT_DOCTOR_ID = os.getenv("KG_DOCTOR_ID", "wuweiping")
 retriever = TCMKnowledgeRetriever(
     uri="bolt://127.0.0.1:7687",
     user=config.NEO4J_USER,
     password=config.NEO4J_PASSWORD,
     database=config.NEO4J_DATABASE,
+    doctor_id=DEFAULT_DOCTOR_ID,
 )
 
 
 SFT_PRESCRIPTION_SYSTEM_PROMPT = """
-你是一名资深中医皮肤科医生，擅长根据患者病历、舌面分析、患处分析、检查报告、知识图谱知识及模板方信息进行辨证论治并开具处方。
-你的任务是根据输入信息完成辨证分析、治则治法、配伍组方及最终处方生成。
+你是一名资深中医皮肤科医生，擅长根据患者病历信息、知识图谱知识及模板方信息进行辨证论治并开具处方、给出调理建议。
+你的任务是根据输入信息完成辨证分析、治则治法、配伍组方、调理建议及最终处方生成。
 请先在 <think> 中完成辨证分析，再输出固定格式的 JSON。
 【<think> 生成要求】
 请严格依据输入信息进行辨证，不得凭空推断。
@@ -43,17 +50,19 @@ SFT_PRESCRIPTION_SYSTEM_PROMPT = """
 - 知识图谱知识（如有）
 
 辨证逻辑必须做到有据可循，每一个判断都必须对应具体依据。
+<think> 要求：
+- 需要依次分析：
+1. 病位：结合主诉和病名，说明病位在面部肌肤，可关联肺胃、肝脾等，但必须说明依据。
+2. 病性：依据患者已提供症状判断寒热虚实、湿热毒瘀等；信息不足时说明“证据不足”。
+3. 病机演变：结合病程长短、症状变化、治疗反应分析，但不得过度推断。
+4. 证候判断：优先依据患者当前症状；知识图谱候选证型仅作参考。信息不足时输出“倾向某证”。
+5. 组方思路：说明内服、外洗、外涂等不同剂型的分工；若患者信息不足，应避免过重处方。
+6. 君臣佐使：必须围绕实际处方药物说明，不得虚构药物作用。
+7. 调理依据：饮食、运动建议必须与证候、病机、诱因控制一致。
+- 有明确推理依据。
+- 不超过300字。
+- 不得输出任何没有依据的信息。
 
-需要依次分析：
-1. 主症依据。
-2. 兼症依据。
-3. 舌象依据（未提供请说明"未提供"，不得推断）。
-4. 患处依据（未提供请说明"未提供"，不得推断）。
-5. 检查依据（未提供请说明"未提供"，不得推断）。
-6. 结合上述依据分析病机。
-7. 根据病机确定证候。
-8. 根据证候确定治则治法。
-9. 根据治则治法分析最终组方思路。
 
 模板方使用规则：
 1. 若最高模板方匹配度小于0.55，不得参考模板方，不得说明模板方内容，应完全依据病历、辨证及治法完成组方。
@@ -63,17 +72,11 @@ SFT_PRESCRIPTION_SYSTEM_PROMPT = """
 - 新增了哪些药物及依据；
 - 调整了哪些药物剂量及依据。
 
-<think> 要求：
-- 简洁专业。
-- 有明确推理依据。
-- 不超过300字。
-- 不得输出任何没有依据的信息。
-
 【JSON 输出要求】
 
 1. <think> 后仅输出 JSON。
-2. 不要 Markdown。
-3. 不要解释。
+2. 不要 Markdown,不要解释。
+3. 知识图谱中的[相似病例参考]是按本患者刻下症检索到的相似历史病例及其真实处方（含剂量），仅供参考：须结合本患者刻下症辨证后进行组方，不得照搬；剂量须参考常见区间，不得臆造。
 4. JSON 字段名称必须完全一致。
 5. 不得新增、删除或修改字段名称。
 6. 不得输出病历中不存在的信息。
@@ -86,13 +89,20 @@ LLM_SYSTEM_PROMPT = """
 你必须严格遵守以下要求：
 
 【辨证逻辑】
-1. 必须以知识图谱信息和病史信息中已知的诊断结果、辨证结果为最终约束，辨证结论必须与已知诊断结果、辨证结果严格一致。
-2. 必须结合患者主诉、症状变化、既往病史、检查报告结果【如有】、舌面结果【如有】、患处分析结果【如有】反推辨证逻辑。
-3. 每个辨证判断都必须绑定具体依据，不能凭空推断。
-4. 未提供的信息必须说明“未提供”，不得作为依据。
-5. 需要区分主症、兼症、舌面/患处/检查报告依据，并说明这些依据如何支持已知证型、病机、治则治法。
-6. 如果病史依据不足以完全支持已知诊断或辨证结果，应说明“病史信息支持不足，但需与已知诊断结果、辨证结果保持一致”，不得改写诊断或证型。
-7. 辨证内容不超过300字。
+1. 必须先依据患者当前病史、主诉、现病史、舌象、患处、检查报告、既往史进行辨证。
+2. 知识图谱、三元组事实、相似病例、模板方只作为参考锚点，不得替代患者当前病情。
+3. 不得出现“需与已知诊断结果/辨证结果保持一致”“根据既定证型”“已知辨证为”等倒推式表达。
+4. 若病历信息不足，必须明确说明“不足以完全定证”，只能输出“倾向证候”或“待补充信息后确认”。
+5. 不得根据相似病例或模板方反推患者存在未提供的症状、舌象、脉象、二便、睡眠、丘疹、脓疱、瘙痒等信息。
+6. 辨证内容不超过300字。
+
+【临床症状】
+1. 必须根据主诉和现病史提取中医四诊相关内容，返回症状 list。
+2. 每个症状必须是中文字符串，必须来自病历原文或对原文症状变化的概括，不得编造。
+3. 可提取内容包括但不限于：舌象症状、患处症状、二便情况、女性患者月经情况、饮食睡眠情况、异常指标情况。
+4. 如果现病史中包含多次问诊或复诊记录，应优先总结最新一次问诊的刻下症状，并保留明确的症状变化，如“较前减轻”“新发”“加重”“仍有”“消失”。
+5. 不要把诊断名、证候名、处方药名、治疗建议当作临床症状。
+6. 未提取到症状时返回空数组 []。
 
 【治则治法】
 1. 必须根据已知辨证结果、辨证逻辑和知识图谱知识反推治则治法。
@@ -131,6 +141,7 @@ LLM_SYSTEM_PROMPT = """
 {
   "辨证逻辑": "",
   "治则治法": "",
+  "临床症状": [],
   "模板匹配": {
     "是否参考模板方": false,
     "候选模板方": "",
@@ -175,6 +186,7 @@ def validate_llm_result(data: Dict[str, Any]) -> Dict[str, Any]:
     default = {
         "辨证逻辑": "",
         "治则治法": "",
+        "临床症状": [],
         "模板匹配": {
             "是否参考模板方": False,
             "候选模板方": "",
@@ -195,6 +207,10 @@ def validate_llm_result(data: Dict[str, Any]) -> Dict[str, Any]:
     for key in ["辨证逻辑", "治则治法", "配伍逻辑"]:
         if key not in data or not isinstance(data[key], str):
             data[key] = default[key]
+
+    if not isinstance(data.get("临床症状"), list):
+        data["临床症状"] = default["临床症状"]
+    data["临床症状"] = [str(symptom).strip() for symptom in data["临床症状"] if str(symptom).strip()]
 
     if not isinstance(data.get("模板匹配"), dict):
         data["模板匹配"] = default["模板匹配"]
@@ -235,14 +251,15 @@ def build_user_prompt(
 
 
 请严格输出 JSON，字段固定为：
-辨证逻辑、治则治法、模板匹配、配伍逻辑、调理建议。
+辨证逻辑、治则治法、临床症状、模板匹配、配伍逻辑、调理建议。
 
 注意：
 1. 如果最高模板匹配度 < 0.55，则“是否参考模板方”为 false，“加减逻辑”为空字符串。
 2. 如果最高模板匹配度 >= 0.55，则“是否参考模板方”为 true，并说明保留、去除、新增、剂量调整依据。
 3. 不得编造患者未提供的检查报告、舌象、患处表现。
 4. 调理建议必须包含“饮食”和“运动”。
-4. 辩证逻辑必须和诊断结果一致，不得编造。
+5. 临床症状必须为 list，根据主诉和现病史总结最新刻下症状及明确症状变化。
+6. 辩证逻辑必须和诊断结果一致，不得编造。
 """.strip()
 
 
@@ -346,18 +363,111 @@ def get_records():
 def build_patient_context(record_info):
     """"""
     context = f"""患者性别{record_info["patient_sex"]},年龄{record_info["patient_age"]},病史信息：主诉{record_info.get("doc_ass_stu_appeal", "无")},现病史(可能包含中医四诊结果、检查报告结果):{record_info["new_medical_history"]},
-既往史:{record_info.get("old_medical_history", "无")},过敏史:{record_info.get("allergic_history", "无")},
-家族史:{record_info.get("family_history", "无")},个人史:{record_info.get("personal_history", "无")},
-婚育史:{record_info.get("birth_detail", "无")}\n
-    """
+既往史:{record_info["old_medical_history"] if record_info.get("old_medical_history") else "无"},过敏史:{record_info["allergic_history"] if record_info.get("allergic_history") else "无"},
+家族史:{record_info["family_history"] if record_info.get("family_history") else "无"},个人史:{record_info["personal_history"] if record_info.get("personal_history") else "无"},
+婚育史:{record_info["birth_detail"] if record_info.get("birth_detail") else "无"}\n"""
     return context
 
-def build_knowledge_symptoms_context(record_info):
-    """根据诊断结果获取知识图谱信息，获取相似病历信息"""
-    pass
+def _normalize_symptoms(symptoms):
+    """Normalize symptoms from LLM output to a clean list."""
+    if not symptoms:
+        return []
+    if isinstance(symptoms, str):
+        symptoms = re.split(r"[、,，；;\n]+", symptoms)
+    if not isinstance(symptoms, list):
+        return []
+    return [str(symptom).strip() for symptom in symptoms if str(symptom).strip()]
 
 
-def build_knowledge_context(record_info):
+def _extract_internal_herbs(record_info):
+    """Extract internal prescription herb names from a record."""
+    herbs = []
+    for prescription in record_info.get("internal_prescriptions", []) or []:
+        if prescription.get("usage_type") != "内服":
+            continue
+        for herb_item in prescription.get("drugs", []) or []:
+            if isinstance(herb_item, dict) and herb_item.get("drug_name"):
+                herbs.append(herb_item["drug_name"])
+        break
+    return herbs
+
+
+def _format_property_section(title, properties):
+    """Format node properties as a text section."""
+    if not properties:
+        return f"{title}\n- 知识图谱中暂无相关属性。"
+
+    lines = [title]
+    for key, value in properties.items():
+        if value in (None, "", []):
+            continue
+        if isinstance(value, list):
+            value = "、".join(str(item) for item in value if item)
+        lines.append(f"- {key}：{value}")
+    if len(lines) == 1:
+        lines.append("- 知识图谱中暂无相关属性。")
+    return "\n".join(lines)
+
+
+def _format_node_properties(properties, max_items=20):
+    """Format node properties with Chinese labels."""
+    lines = []
+    for key, value in (properties or {}).items():
+        if value in (None, "", []):
+            continue
+        if isinstance(value, list):
+            value = "、".join(str(item) for item in value if item)
+        label = _PROPERTY_LABELS.get(key, key)
+        lines.append(f"- {label}：{value}")
+        if len(lines) >= max_items:
+            break
+    return "\n".join(lines) if lines else "- 知识图谱中暂无相关属性。"
+
+
+def _format_syndrome_relations(title, relations, max_relations=20):
+    """Format syndrome relations from KG as readable text."""
+    return format_relations_as_text(
+        relations,
+        title=title,
+        max_relations=max_relations,
+        empty_text="- 知识图谱中暂无相关证候关系。",
+    )
+
+
+def build_knowledge_sft_context(record_info, symptoms: list | str | None = None, doctor_id: str ="wuweiping"):
+    """根据症状检索相似案例、同疾病知识、同证候知识，并格式化为文本。"""
+    symptoms = _normalize_symptoms(symptoms)
+
+    disease = record_info.get("diagnosis_illness", "")
+    syndrome = record_info.get("diagnosis_disease", "")
+
+    # 先根据症状list检索相似病例
+    symptom_similar_cases = retriever.get_similar_cases(
+        disease=disease,
+        syndrome=syndrome,
+        symptoms=symptoms,
+        limit=3,
+        doctor_id=doctor_id,
+    )
+    # 再检索同疾病知识、同证候知识
+    disease_properties = retriever.get_disease_properties(disease, doctor_id=doctor_id)
+    disease_relations = retriever.get_disease_relations(disease, doctor_id=doctor_id)
+    syndrome_relations = retriever.get_syndrome_relations(syndrome, doctor_id=doctor_id)
+
+    sections = [
+        f"症状检索词：{'、'.join(symptoms) if symptoms else '无'}",
+        "【同疾病知识】",
+        _format_node_properties(disease_properties),
+        "",
+        format_relations_as_text(disease_relations, "【疾病知识参考】", 10),
+        format_relations_as_text(syndrome_relations, "【同证候关系知识】", 10),
+        "",
+        _format_similar_cases("【症状相似病例】", symptom_similar_cases, max_cases=3),
+    ]
+    return "\n".join(sections)
+
+
+def build_knowledge_context(record_info, doctor_id="wuweiping"):
     """"""
     prescriptions = []
     for prescription in record_info.get("internal_prescriptions", []):
@@ -367,14 +477,17 @@ def build_knowledge_context(record_info):
 
     disease = record_info.get("diagnosis_illness", "")
     syndrome = record_info.get("diagnosis_disease", "")
-    # TODO 症状未确定
-    # symptoms = [record_info.get("doc_ass_stu_appeal", "")]
     symptoms = []
     herbs = [herb_item["drug_name"] for herb_item in prescriptions if herb_item.get("drug_name")]
-    print(f"disease: {disease}, syndrome: {syndrome}, symptoms: {symptoms}, herbs: {herbs}")
-    knowledge_context = retriever.get_syndrome_diagnosis_context(disease, syndrome, symptoms, herbs)
-    knowledge_context = format_kg_context_for_llm(knowledge_context)
-    print(f"knowledge context: {knowledge_context}")
+    print(f"doctor_id: {doctor_id}, disease: {disease}, syndrome: {syndrome}, symptoms: {symptoms}, herbs: {herbs}")
+    knowledge_context = retriever.get_syndrome_diagnosis_context(
+        disease,
+        syndrome,
+        symptoms,
+        herbs,
+        doctor_id=doctor_id,
+    )
+
     return knowledge_context
 
 
@@ -395,20 +508,22 @@ def format_prescription_for_sft(prescriptions, llm_response):
         result.append({f"处方{idx+1}": prescription_json})
     return result
 
-def build_sft_data(record_info, response, patient_context, knowledge_context):
+def build_sft_data(record_info, response, patient_context, knowledge_sft_context):
     """
     根据response生成assistant_content
     """
-    user_prompt = f"""请根据患者病史信息:{patient_context}, 知识图谱信息:{knowledge_context}，相似病例信息，先进行中医辨证，再输出诊断结果、处方结果、调理建议、模版匹配结果"""
+    print(f"sft 知识图谱信息 {knowledge_sft_context}")
+    user_prompt = f"""请根据患者病史信息:{patient_context}, 知识图谱信息:{knowledge_sft_context}，先进行中医辨证，再输出诊断结果、处方结果、调理建议"""
     sft_system_prompt = SFT_PRESCRIPTION_SYSTEM_PROMPT 
     llm_response = validate_llm_result(response)
+    # 模板匹配中新增模板明细信息，用于
     sft_json_out = {
         "中医证型": record_info["diagnosis_disease"],
         "诊断结果": record_info["diagnosis_illness"],
+        "临床症状": llm_response["临床症状"],
         "处方建议": format_prescription_for_sft(record_info["internal_prescriptions"], llm_response),
         "治则治法": llm_response["治则治法"],
         "调理建议": llm_response["调理建议"],
-        "模板匹配": llm_response["模板匹配"],
     }
     assistant_content = (
         f"<think>{llm_response['辨证逻辑']}</think>"
@@ -479,25 +594,28 @@ def gen_datasets(
         try:
             patient_context = build_patient_context(record)
             knowledge_context = knowledge_builder(record)
+            llm_knowledge_context = format_kg_context_for_llm(knowledge_context)
             most_similar_template_info = get_most_similar_template(record, templates)
+            # print(f"*********llm_knowledge_context {llm_knowledge_context}")
             known_result_context = build_known_result_context(record)
             print(f"known_result_context: {known_result_context}")
             user_prompt = append_known_result_context(
-                build_user_prompt(patient_context, knowledge_context, most_similar_template_info),
+                build_user_prompt(patient_context, llm_knowledge_context, most_similar_template_info),
                 known_result_context,
             )
             if llm_caller is call_llm:
                 response = llm_caller(
                     patient_context,
-                    knowledge_context,
+                    llm_knowledge_context,
                     most_similar_template_info,
                     known_result_context=known_result_context,
                 )
             else:
-                response = llm_caller(patient_context, knowledge_context, most_similar_template_info)
+                response = llm_caller(patient_context, llm_knowledge_context, most_similar_template_info)
             print(f"llm response: {response}")
-            knowledge_symptoms_context = build_knowledge_symptoms_context(record)
-            sft_data = build_sft_data(record, response, patient_context, knowledge_context)
+            llm_response = validate_llm_result(response)
+            knowledge_sft_context = build_knowledge_sft_context(record, llm_response.get("临床症状", record["doc_ass_stu_appeal"]))
+            sft_data = build_sft_data(record, llm_response, patient_context, knowledge_sft_context)
             datasets.append(sft_data)
         except Exception as error:
             fallback_items.append(
@@ -511,7 +629,6 @@ def gen_datasets(
                     user_prompt=user_prompt,
                 )
             )
-
     return datasets
 
 
@@ -519,21 +636,30 @@ def gen_datasets(
 def main():
     parser = argparse.ArgumentParser(description="生成处方 SFT 数据集。")
     parser.add_argument("--limit", type=int, default=None, help="限制处理的数据条数，默认处理全部数据。")
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_FILE, help="最终 SFT 数据集输出路径。")
+    parser.add_argument("--output", type=Path, default=None, help="最终 SFT 数据集输出路径。")
     parser.add_argument(
         "--fallback-output",
         type=Path,
-        default=DEFAULT_FALLBACK_FILE,
+        default=None,
         help="失败 fallback 数据输出路径。",
+    )
+    parser.add_argument(
+        "--doctor-id",
+        choices=["wuweiping", "hukaiwen"],
+        default=DEFAULT_DOCTOR_ID,
+        help="知识图谱检索的医生 ID，默认读取 KG_DOCTOR_ID 或 wuweiping。",
     )
     args = parser.parse_args()
 
+    retriever.doctor_id = args.doctor_id
+    output = args.output or DEFAULT_OUTPUT_DIR / f"{args.doctor_id}_prescription_sft_dataset.json"
+    fallback_output = args.fallback_output or DEFAULT_OUTPUT_DIR / f"{args.doctor_id}_prescription_sft_fallback.json"
     fallback_items = []
     datasets = gen_datasets(limit=args.limit, fallback_items=fallback_items)
-    save_json(datasets, args.output)
-    save_json(fallback_items, args.fallback_output)
-    print(f"saved dataset: {args.output} ({len(datasets)} items)")
-    print(f"saved fallback: {args.fallback_output} ({len(fallback_items)} items)")
+    save_json(datasets, output)
+    save_json(fallback_items, fallback_output)
+    print(f"saved dataset: {output} ({len(datasets)} items)")
+    print(f"saved fallback: {fallback_output} ({len(fallback_items)} items)")
 
 if __name__ == "__main__":
     main()

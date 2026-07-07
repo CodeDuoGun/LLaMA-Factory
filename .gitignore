@@ -185,3 +185,4 @@ predictions_score.json
 medical/data/
 medical/processed_data
 logs
+tests/data_utils/*
