@@ -1,9 +1,9 @@
 # ruff: noqa: D205, D212, D301, D415, W605
 """
 处理总院线下医生的病历数据为结构化数据
-门诊病历表：medical/data/hukaiwen/胡凯文门诊病历20250101-20260630.xlsx
+门诊病历表：medical/data/zongyuan_hukaiwen/胡凯文门诊病历20250101-20260630(1).xlsx
     问诊单ID、费用类别【中药费、中成药费、西药费】、数量、剂数、计价单位、剂量【数量/剂数】
-处方明细表：medical/data/hukaiwen/胡凯文门诊收费明细20250101-20260630-2.xlsx
+处方明细表：medical/data/zongyuan_hukaiwen/胡凯文门诊收费明细20250101-20260630-2.xlsx
     问诊单ID\患者性别、挂号年龄、正文【需要调用llm，提取患者主诉、现病史、过敏史、既往史、家族史、个人史、婚育史】、中医主诊断、西医主诊断、中医症候名称
 处理步骤：
 1、分别读取两个文件，获取数据 raw_data
@@ -30,13 +30,41 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "medical/processed_data"
 DOCTOR_ALIASES = {
     "hukaiwen": "hukaiwen",
     "胡凯文": "hukaiwen",
+    "chuyuping": "chuyuping",
+    "初玉平": "chuyuping",
+    "liugenshang": "liugenshang",
+    "刘根尚": "liugenshang",
+    "liuluming": "liuluming",
+    "刘鲁明": "liuluming",
+    "wangsumei": "wangsumei",
+    "王素梅": "wangsumei",
 }
 
 DOCTOR_CONFIGS = {
     "hukaiwen": {
         "doctor_display_name": "胡凯文",
-        "record_file": PROJECT_ROOT / "medical/data/hukaiwen/胡凯文门诊病历20250101-20260630.xlsx",
-        "prescription_file": PROJECT_ROOT / "medical/data/hukaiwen/胡凯文门诊收费明细20250101-20260630-2.xlsx",
+        "record_file": PROJECT_ROOT / "medical/data/zongyuan_hukaiwen/胡凯文门诊病历20250101-20260630(1).xlsx",
+        "prescription_file": PROJECT_ROOT / "medical/data/zongyuan_hukaiwen/胡凯文门诊收费明细20250101-20260630-2(1).xlsx",
+    },
+    "chuyuping": {
+        "doctor_display_name": "初玉平",
+        "record_file": PROJECT_ROOT / "medical/data/zongyuan_chuyuping/初玉平-门诊病历-20240101-20260706.xlsx",
+        "prescription_file": PROJECT_ROOT / "medical/data/zongyuan_chuyuping/初玉平-门诊收费明细-20240101-20260706.xlsx",
+    },
+    "liugenshang": {
+        "doctor_display_name": "刘根尚",
+        "record_file": PROJECT_ROOT / "medical/data/zongyuan_liugenshang/刘根尚-门诊病历-20240101-20260701.xlsx",
+        "prescription_file": PROJECT_ROOT / "medical/data/zongyuan_liugenshang/刘根尚-门诊收费明细-20240101-20260706.xlsx",
+    },
+    "liuluming": {
+        "doctor_display_name": "刘鲁明",
+        "record_file": PROJECT_ROOT / "medical/data/zongyuan_liuluming/刘鲁明-门诊病历-20240101-20260701.xlsx",
+        "prescription_file": PROJECT_ROOT / "medical/data/zongyuan_liuluming/刘鲁明-门诊收费明细-20240101-20260706.xlsx",
+    },
+    "wangsumei": {
+        "doctor_display_name": "王素梅",
+        "record_file": PROJECT_ROOT / "medical/data/zongyuan_wangsumei/王素梅-门诊病历-20240101-20260701.xlsx",
+        "prescription_file": PROJECT_ROOT / "medical/data/zongyuan_wangsumei/王素梅-门诊收费明细-20240101-20260706.xlsx",
     },
 }
 
@@ -98,6 +126,22 @@ def normalize_id(value: Any) -> str:
     return re.sub(r"\.0$", "", text).strip()
 
 
+def clean_dose(value: Any) -> str:
+    """
+    规范剂量字段。
+    - 如果 "单量" 字段包含小括号（如 "10g(每日3次)"），优先取括号内的内容作为剂量。
+    - 否则直接清理后返回。
+    """
+    text = clean_cell(value)
+    if not text:
+        return ""
+    # 去掉小括号再使用里面的内容：优先取括号内，否则取括号外
+    inner = re.findall(r"\(([^)]+)\)", text)
+    if inner:
+        return clean_cell(inner[0])
+    return text
+
+
 def normalize_doctorname(doctorname: str) -> str:
     """统一 doctorname 参数。"""
     key = (doctorname or "").strip()
@@ -144,7 +188,7 @@ def resolve_paths(args: argparse.Namespace) -> tuple[str, Path, Path, Path]:
         raise ValueError("未知 doctorname 时必须同时传入 --record-file 和 --prescription-file")
 
     today = datetime.now().strftime("%Y%m%d")
-    output = args.output or args.output_dir / f"{doctorname}_zongyuan_records_{today}.json"
+    output = args.output or args.output_dir / f"zongyuan_{doctorname}" / f"{doctorname}_zongyuan_records_{today}.json"
     return doctorname, Path(record_file), Path(prescription_file), Path(output)
 
 
@@ -166,25 +210,12 @@ def format_number(value: float) -> str:
     return f"{value:.6g}"
 
 
-def calculate_dose(row: pd.Series) -> str:
-    """按 数量 / 剂数 计算剂量，并拼接计价单位。"""
-    quantity = to_number(row.get("数量"))
-    dose_count = to_number(row.get("剂数"))
-    unit = clean_cell(row.get("计价单位"))
-    if quantity is None:
-        return ""
-    if dose_count and dose_count != 0:
-        dose = quantity / dose_count
-    else:
-        dose = quantity
-    return f"{format_number(dose)}{unit}".strip()
-
 
 def build_drug_item(row: pd.Series) -> OrderedDict[str, Any]:
     """把收费明细中的一行转换为一个 drug 条目。"""
     return OrderedDict(
         drug_name=clean_cell(row.get("医院项目名称")) or clean_cell(row.get("医保项目名称")),
-        dose=calculate_dose(row),
+        dose=clean_cell(row.get("单量")),
         unit=clean_cell(row.get("计价单位")),
         decoction_name="",
     )
@@ -471,13 +502,17 @@ def process_records(args: argparse.Namespace) -> Path:
     raw_prescription_df = read_excel_all_sheets(prescription_file)
     print(f"      raw_data: {len(raw_prescription_df)} 行")
 
+    # 过滤掉病历表中医案ID为空的行
+    raw_record_df = raw_record_df.dropna(subset=ID_CANDIDATES, how="all").copy()
+    print(f"      过滤空ID后: 病历 {len(raw_record_df)} 行")
+
     id_column = pick_id_column(raw_record_df, raw_prescription_df)
     print(f"[3/4] 使用关联字段: {id_column}")
     raw_record_df["问诊单ID"] = raw_record_df[id_column].map(normalize_id)
     raw_prescription_df["问诊单ID"] = raw_prescription_df[id_column].map(normalize_id)
     raw_record_df = raw_record_df[raw_record_df["问诊单ID"] != ""].copy()
     raw_prescription_df = raw_prescription_df[raw_prescription_df["问诊单ID"] != ""].copy()
-    raw_prescription_df["剂量"] = raw_prescription_df.apply(calculate_dose, axis=1)
+    raw_prescription_df["剂量"] = raw_prescription_df["单量"].map(clean_dose)
 
     if args.limit:
         raw_record_df = raw_record_df.head(args.limit).copy()
