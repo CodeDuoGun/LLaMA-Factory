@@ -68,7 +68,7 @@ DOCTOR_CONFIGS = {
     },
 }
 
-ID_CANDIDATES = ("问诊单ID", "就诊ID", "门诊号", "病历ID")
+ID_CANDIDATES = ("就诊ID", "门诊号", "病历ID")
 FEE_CATEGORIES = ("中药费", "中成药费", "西药费")
 CLINICAL_FIELDS = ("患者主诉", "现病史", "过敏史", "既往史", "家族史", "个人史", "婚育史")
 DIAGNOSIS_FIELDS = ("中医主诊断", "西医主诊断", "中医症候名称")
@@ -371,7 +371,7 @@ def extract_json_payload(response_text: str) -> str:
 def build_llm_prompt(text: str) -> list[dict[str, str]]:
     """构造正文病史字段抽取提示词。"""
     fields = "、".join(CLINICAL_FIELDS)
-    return [
+    result_msg = [
         {
             "role": "system",
             "content": (
@@ -389,10 +389,14 @@ def build_llm_prompt(text: str) -> list[dict[str, str]]:
                 "1. 只返回 JSON 对象，不要输出解释。\n"
                 "2. JSON key 只能包含上述 7 个中文字段名，不能新增其他字段。\n"
                 "3. value 必须为字符串；未提取到的内容统一写“无”。\n\n"
+                "4. 禁止出现冗余字符，如果字段内容出现多余符号，一律删除。如：既往史：发现乙肝病史10余年，膀胱切除] , 结果应为：‘既往史：发现乙肝病史10余年，膀胱切除’ "
                 f"正文：\n{text}"
             ),
         },
     ]
+    # print(result_msg)
+    return result_msg
+
 
 
 def llm_extract_clinical_fields(text: str, model: str) -> dict[str, str]:
@@ -411,6 +415,7 @@ def llm_extract_clinical_fields(text: str, model: str) -> dict[str, str]:
     )
     response_text = response.choices[0].message.content or "{}"
     parsed = json.loads(extract_json_payload(response_text))
+    print(parsed)
     return {field: clean_cell(parsed.get(field)) or "无" for field in CLINICAL_FIELDS}
 
 

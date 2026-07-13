@@ -766,14 +766,17 @@
     "description": "中医玫瑰痤疮多轮问诊数据集，含初诊192条、复诊612条，按初诊和复诊流程进行多轮问诊并给出谨慎医嘱。"
   },
   "wuweiping_prescription": {
-    "file_name": "medical/processed_data/wuweiping_prescription_sft_dataset.json",
+    "file_name": "wuweiping_prescription_sft_dataset.json",
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages"
     },
     "tags": {
       "role_tag": "role",
-      "content_tag": "content"
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "system_tag": "system"
     },
     "description": "中医辨证开方数据集，assistant回复包含<think>思考链和JSON处方输出"
   }
