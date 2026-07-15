@@ -186,3 +186,12 @@ medical/data/
 medical/processed_data
 logs
 tests/data_utils/*
+
+# api key
+medical/config.yaml
+# agent
+AGENTS.md
+# sft data
+data/medical_consult_sharegpt.json
+data/wuweiping_prescription_sft_dataset.json
+data/wuweiping_prescription_test_20260714_sample.json

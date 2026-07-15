@@ -18,7 +18,7 @@ from medical.data_utils.sft_generate_prescription.template import get_most_simil
 
 DEFAULT_TEMPLATE_FILE = Path("medical/data/wuweiping_template_prescription.json")
 DEFAULT_RECORD_FILE = Path("medical/data/sft_generate_prescription/extract_valid_record.json")
-DEFAULT_OUTPUT_DIR = Path("medical/data/processed_data")
+DEFAULT_OUTPUT_DIR = Path("medical/processed_data")
 DEFAULT_DOCTOR_ID = os.getenv("KG_DOCTOR_ID", "wuweiping")
 retriever = TCMKnowledgeRetriever(
     uri="bolt://127.0.0.1:7687",
@@ -344,19 +344,21 @@ def call_llm(
     return validate_llm_result(data)
 
 
-def get_template_prescription():
+def get_template_prescription(template_file: Path | None = None):
     """读取文件 medical/data/wuweiping_template_prescription.json 并获取templates字段值"""
-    with DEFAULT_TEMPLATE_FILE.open("r", encoding="utf-8") as f:
+    template_file = template_file or DEFAULT_TEMPLATE_FILE
+    with template_file.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
     return data.get("templates", [])
 
 
-def get_records():
+def get_records(record_file: Path | None = None):
     """
     读取文件medical/data/sft_generate_prescription/extract_valid_record.json
-    """ 
-    with DEFAULT_RECORD_FILE.open("r", encoding="utf-8") as f:
+    """
+    record_file = record_file or DEFAULT_RECORD_FILE
+    with record_file.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -569,6 +571,8 @@ def save_json(data: Any, output_file: Path) -> None:
 
 def gen_datasets(
     limit: int | None = None,
+    record_file: Path | None = None,
+    template_file: Path | None = None,
     records: list[Dict[str, Any]] | None = None,
     templates: list[Dict[str, Any]] | None = None,
     knowledge_builder: Callable[[Dict[str, Any]], str] = build_knowledge_context,
@@ -578,8 +582,8 @@ def gen_datasets(
     if limit is not None and limit < 0:
         raise ValueError("limit 必须大于等于 0")
 
-    records = list(get_records() if records is None else records)
-    templates = get_template_prescription() if templates is None else templates
+    records = list(get_records(record_file) if records is None else records)
+    templates = get_template_prescription(template_file) if templates is None else templates
     if limit is not None:
         records = records[:limit]
 
@@ -636,6 +640,8 @@ def gen_datasets(
 def main():
     parser = argparse.ArgumentParser(description="生成处方 SFT 数据集。")
     parser.add_argument("--limit", type=int, default=None, help="限制处理的数据条数，默认处理全部数据。")
+    parser.add_argument("--record-file", type=Path, default=None, help=f"有效病历输入路径，默认 {DEFAULT_RECORD_FILE}")
+    parser.add_argument("--template-file", type=Path, default=None, help=f"模板方输入路径，默认 {DEFAULT_TEMPLATE_FILE}")
     parser.add_argument("--output", type=Path, default=None, help="最终 SFT 数据集输出路径。")
     parser.add_argument(
         "--fallback-output",
@@ -655,7 +661,12 @@ def main():
     output = args.output or DEFAULT_OUTPUT_DIR / f"{args.doctor_id}_prescription_sft_dataset.json"
     fallback_output = args.fallback_output or DEFAULT_OUTPUT_DIR / f"{args.doctor_id}_prescription_sft_fallback.json"
     fallback_items = []
-    datasets = gen_datasets(limit=args.limit, fallback_items=fallback_items)
+    datasets = gen_datasets(
+        limit=args.limit,
+        record_file=args.record_file,
+        template_file=args.template_file,
+        fallback_items=fallback_items,
+    )
     save_json(datasets, output)
     save_json(fallback_items, fallback_output)
     print(f"saved dataset: {output} ({len(datasets)} items)")

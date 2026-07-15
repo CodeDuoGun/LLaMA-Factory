@@ -779,5 +779,20 @@
       "system_tag": "system"
     },
     "description": "中医辨证开方数据集，assistant回复包含<think>思考链和JSON处方输出"
+  },
+  "wuweiping_prescription_test_20260714": {
+    "file_name": "wuweiping_prescription_test_20260714.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "system_tag": "system"
+    }
   }
+
 }

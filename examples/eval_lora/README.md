@@ -12,6 +12,24 @@ llamafactory-cli train examples/eval_lora/qwen3.5_lora_predict_prescription.yaml
 
 推理结果会保存在 `saves/qwen3.5-9b/lora/predict/prescription/` 目录，包含模型生成的标准 JSON 输出。
 
+如需更快的批量生成评测，推荐使用 vLLM：
+
+```bash
+examples/eval_lora/qwen3.5_lora_vllm_predict_prescription.sh
+```
+
+默认输出到 `saves/qwen3.5-9b/lora/vllm_predict/prescription/`，包含：
+
+- `generated_predictions.jsonl`：逐条生成结果
+- `predict_results.json`：BLEU/ROUGE 与吞吐统计
+
+可通过环境变量切换测试集或限制样本数：
+
+```bash
+DATASET=wuweiping_prescription_test_20260714 MAX_SAMPLES=100 \
+  examples/eval_lora/qwen3.5_lora_vllm_predict_prescription.sh
+```
+
 ### 2. 评估指标说明
 
 该配置设置 `predict_with_generate: true`，会对 eval_dataset 中每条数据：

@@ -1,5 +1,5 @@
 ### model
-model_name_or_path: Qwen/Qwen3.5-9B-Instruct
+model_name_or_path: Qwen/Qwen3.5-9B
 adapter_name_or_path: saves/qwen3.5-9b/lora/sft/prescription
 trust_remote_code: true
 
@@ -9,7 +9,7 @@ do_predict: true
 finetuning_type: lora
 
 ### dataset
-eval_dataset: wuweiping_prescription
+eval_dataset: wuweiping_prescription_test_20260714
 template: qwen3_5
 cutoff_len: 8192
 max_samples: 100

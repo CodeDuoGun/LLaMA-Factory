@@ -1,7 +1,7 @@
 # ruff: noqa: D205, D212, D301, D415, W605
 """
 处理总院线下医生的病历数据为结构化数据
-门诊病历表：medical/data/zongyuan_hukaiwen/胡凯文门诊病历20250101-20260630(1).xlsx
+门诊病历表：medical/data/zongyuan_hukaiwen/胡凯文门诊病历-20240101-20260712.xlsx
     问诊单ID、费用类别【中药费、中成药费、西药费】、数量、剂数、计价单位、剂量【数量/剂数】
 处方明细表：medical/data/zongyuan_hukaiwen/胡凯文门诊收费明细20250101-20260630-2.xlsx
     问诊单ID\患者性别、挂号年龄、正文【需要调用llm，提取患者主诉、现病史、过敏史、既往史、家族史、个人史、婚育史】、中医主诊断、西医主诊断、中医症候名称
@@ -43,7 +43,7 @@ DOCTOR_ALIASES = {
 DOCTOR_CONFIGS = {
     "hukaiwen": {
         "doctor_display_name": "胡凯文",
-        "record_file": PROJECT_ROOT / "medical/data/zongyuan_hukaiwen/胡凯文门诊病历20250101-20260630(1).xlsx",
+        "record_file": PROJECT_ROOT / "medical/data/zongyuan_hukaiwen/胡凯文门诊病历-20240101-20260712.xlsx",
         "prescription_file": PROJECT_ROOT / "medical/data/zongyuan_hukaiwen/胡凯文门诊收费明细20250101-20260630-2(1).xlsx",
     },
     "chuyuping": {
@@ -69,6 +69,8 @@ DOCTOR_CONFIGS = {
 }
 
 ID_CANDIDATES = ("就诊ID", "门诊号", "病历ID")
+RECORD_DATE_CANDIDATES = ("就诊时间", "病历书写时间")
+PRESCRIPTION_DATE_CANDIDATES = ("项目开单时间", "结算时间")
 FEE_CATEGORIES = ("中药费", "中成药费", "西药费")
 CLINICAL_FIELDS = ("患者主诉", "现病史", "过敏史", "既往史", "家族史", "个人史", "婚育史")
 DIAGNOSIS_FIELDS = ("中医主诊断", "西医主诊断", "中医症候名称")
@@ -175,6 +177,69 @@ def pick_id_column(record_df: pd.DataFrame, prescription_df: pd.DataFrame) -> st
         if column in record_df.columns and column in prescription_df.columns:
             return column
     raise ValueError(f"无法找到共同 ID 字段，候选字段: {', '.join(ID_CANDIDATES)}")
+
+
+def pick_date_column(df: pd.DataFrame, candidates: tuple[str, ...], table_name: str) -> str:
+    """从表格中选择日期字段。"""
+    for column in candidates:
+        if column in df.columns:
+            return column
+    raise ValueError(f"{table_name}无法找到日期字段，候选字段: {', '.join(candidates)}")
+
+
+def normalize_date_series(series: pd.Series) -> pd.Series:
+    """把日期时间字段标准化为 date，用于按天匹配。"""
+    return pd.to_datetime(series, errors="coerce").dt.date
+
+
+def filter_complete_same_day_records(
+    record_df: pd.DataFrame,
+    prescription_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """保留截止日期内且同一问诊单 ID 同一天同时存在病历和处方的数据。"""
+    record_date_column = pick_date_column(record_df, RECORD_DATE_CANDIDATES, "病历表")
+    prescription_date_column = pick_date_column(prescription_df, PRESCRIPTION_DATE_CANDIDATES, "处方明细表")
+
+    record_df = record_df.copy()
+    prescription_df = prescription_df.copy()
+    record_df["_join_date"] = normalize_date_series(record_df[record_date_column])
+    prescription_df["_join_date"] = normalize_date_series(prescription_df[prescription_date_column])
+
+    record_dates = record_df["_join_date"].dropna()
+    prescription_dates = prescription_df["_join_date"].dropna()
+    if record_dates.empty:
+        raise ValueError(f"病历表日期字段无有效日期: {record_date_column}")
+    if prescription_dates.empty:
+        raise ValueError(f"处方明细表日期字段无有效日期: {prescription_date_column}")
+
+    record_max_date = record_dates.max()
+    prescription_max_date = prescription_dates.max()
+    cutoff_date = min(record_max_date, prescription_max_date)
+
+    before_record_count = len(record_df)
+    before_prescription_count = len(prescription_df)
+    record_df = record_df[record_df["_join_date"].notna() & (record_df["_join_date"] <= cutoff_date)].copy()
+    prescription_df = prescription_df[
+        prescription_df["_join_date"].notna() & (prescription_df["_join_date"] <= cutoff_date)
+    ].copy()
+
+    record_pairs = record_df[["问诊单ID", "_join_date"]].drop_duplicates()
+    prescription_df = prescription_df.merge(record_pairs, on=["问诊单ID", "_join_date"], how="inner")
+    matched_pairs = prescription_df[["问诊单ID", "_join_date"]].drop_duplicates()
+    record_df = record_df.merge(matched_pairs, on=["问诊单ID", "_join_date"], how="inner")
+
+    stats = {
+        "record_date_column": record_date_column,
+        "prescription_date_column": prescription_date_column,
+        "record_max_date": record_max_date,
+        "prescription_max_date": prescription_max_date,
+        "cutoff_date": cutoff_date,
+        "before_record_count": before_record_count,
+        "before_prescription_count": before_prescription_count,
+        "after_record_count": len(record_df),
+        "after_prescription_count": len(prescription_df),
+    }
+    return record_df, prescription_df, stats
 
 
 def resolve_paths(args: argparse.Namespace) -> tuple[str, Path, Path, Path]:
@@ -456,7 +521,7 @@ def build_output_record(
         inquiry_id=inquiry_id,
         order_sn=clean_cell(record.get("门诊号")),
         inquiry_method="",
-        is_first="初诊",
+        is_first=clean_cell(record.get("初复诊")),
         patient_name=clean_cell(record.get("患者姓名")),
         patient_sex=clean_cell(record.get("患者性别")),
         patient_age=clean_cell(record.get("挂号年龄")),
@@ -519,10 +584,34 @@ def process_records(args: argparse.Namespace) -> Path:
     raw_prescription_df = raw_prescription_df[raw_prescription_df["问诊单ID"] != ""].copy()
     raw_prescription_df["剂量"] = raw_prescription_df["单量"].map(clean_dose)
 
+    raw_record_df, raw_prescription_df, date_stats = filter_complete_same_day_records(
+        raw_record_df,
+        raw_prescription_df,
+    )
+    print(
+        "      日期对齐: "
+        f"病历日期字段={date_stats['record_date_column']}，处方日期字段={date_stats['prescription_date_column']}；"
+        f"病历最大日期={date_stats['record_max_date']}，处方最大日期={date_stats['prescription_max_date']}；"
+        f"截止日期={date_stats['cutoff_date']}"
+    )
+    print(
+        "      完整性过滤后: "
+        f"病历 {date_stats['before_record_count']} -> {date_stats['after_record_count']} 行；"
+        f"处方 {date_stats['before_prescription_count']} -> {date_stats['after_prescription_count']} 行"
+    )
+
+    prescription_map = aggregate_prescriptions(raw_prescription_df, fee_categories=fee_categories)
+    before_prescription_match_count = len(raw_record_df)
+    raw_record_df = raw_record_df[raw_record_df["问诊单ID"].isin(prescription_map)].copy()
+    print(
+        "      有效处方过滤后: "
+        f"病历 {before_prescription_match_count} -> {len(raw_record_df)} 行；"
+        f"舍弃无处方/非目标费用类别记录 {before_prescription_match_count - len(raw_record_df)} 条"
+    )
+
     if args.limit:
         raw_record_df = raw_record_df.head(args.limit).copy()
 
-    prescription_map = aggregate_prescriptions(raw_prescription_df, fee_categories=fee_categories)
     matched_count = raw_record_df["问诊单ID"].isin(prescription_map).sum()
 
     print("[4/4] 合并并写出结构化表...")

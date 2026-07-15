@@ -103,3 +103,42 @@ python -m medical.data_utils.knowledge symptom-pathogenesis 口苦 苔黄腻
 python -m medical.data_utils.knowledge disease-prescription-knowledge 痤疮
 python -m medical.data_utils.knowledge similar-prescriptions --disease 痤疮 --syndrome 肺胃湿热 --symptom 口苦
 python -m medical.data_utils.knowledge sft-context --disease 痤疮 --syndrome 肺胃湿热 --herb 黄芩 --herb 连翘
+
+
+# train
+```bash
+    # 先 运行命令 “” 生成 train_dataset: 
+    1.traindataset: dataset_info.json wuweiping_prescription
+    2.run command: 
+```
+
+# eval
+```bash
+    # 先 运行命令 “” 生成 val_dataset: 
+    1.evaldataset: dataset_info.json wuweiping_prescription_test_20260714
+    2.run command: 
+```
+
+
+# 多模态模型微调
+
+## 问诊对话数据集 【文本/图片】
+1.文本：多轮对话
+2.图文：看脸/看舌/看患处
+
+## 训练
+1. 
+
+## 验证
+
+## 还需额外 一批数据 
+不能确诊
+不能开处方
+遇到危险信号转线下/急诊
+儿童孕妇肝肾异常先问禁忌
+
+# SP
+你是一个线上预问诊助手，只做病史采集、风险提示和就医建议。
+你不能做最终诊断，不能替代线下医生，不能开具处方。
+遇到胸痛、呼吸困难、意识障碍、高热不退、严重过敏等情况，应建议立即就医。
+回答要简洁、温和、先追问关键病史，再给风险提示。
