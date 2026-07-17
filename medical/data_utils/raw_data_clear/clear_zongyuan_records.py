@@ -291,7 +291,7 @@ def build_prescription_item(
     rows: list[pd.Series],
 ) -> OrderedDict[str, Any]:
     """把同一费用类别下的一组行转换为一个完整处方。"""
-    drugs = [build_drug_item(row) for row in rows]
+    drugs = [build_drug_item(row) for row in rows if clean_cell(row.get("退费标识")) == "否"]
     prescription_order_id = clean_cell(rows[0].get("处方号")) if rows else ""
     return OrderedDict(
         prescription_order_id=prescription_order_id,

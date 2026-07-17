@@ -1,11 +1,12 @@
+# ruff: noqa: D205, D212, D415
 """
 史大卓 - 线下诊疗数据清洗脚本
 =============================
 
 数据源：
-- 线下诊疗数据采集 (medical/data/shidazhuo/线下诊疗数据采集_20260603151959.xlsx)
+- 线下诊疗数据采集 (medical/data/xiqu_shidazhuo/线下诊疗数据采集_20260603151959(1).xlsx)
   每行 = 一次门诊就诊的病历主诉/病史/诊断/治疗建议，按门诊号去重。
-- 门诊病人处方明细 (medical/data/shidazhuo/门诊病人(处方明细)_20260608173446.xlsx)
+- 门诊病人处方明细 (medical/data/xiqu_shidazhuo/史大卓处方明细.xlsx)
   每行 = 一条收费/处方项目；项目代码首字母表示药品类型：
       C -> 饮片，X -> 西药，K -> 颗粒，Z -> 中成药
 
@@ -18,10 +19,16 @@ medical/processed_data/shidazhuo_record_YYYYMMDD.json
 其中 ps 按 (门诊号, 处方号, 药品类别) 分组生成饮片/西药/颗粒/中成药处方。
 
 用法:
-    .venv/bin/python medical/data_utils/clear_shidazhuo_record.py
+    python medical/data_utils/raw_data_clear/clear_xiqu_record.py \
+        --doctorname shidazhuo \
+        --record-path "medical/data/xiqu_shidazhuo/线下诊疗数据采集_20260603151959(1).xlsx" \
+        --prescription-path "medical/data/xiqu_shidazhuo/史大卓处方明细.xlsx"
 """
+
 from __future__ import annotations
 
+import argparse
+import copy
 import json
 from collections import OrderedDict
 from datetime import datetime
@@ -30,12 +37,14 @@ from typing import Any
 
 import pandas as pd
 
+
 # --------------------------------------------------------------------------- #
 # 路径配置
 # --------------------------------------------------------------------------- #
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_RECORD_XLSX = PROJECT_ROOT / "medical/data/shidazhuo/线下诊疗数据采集_20260603151959.xlsx"
-DEFAULT_PRESCRIPTION_XLSX = PROJECT_ROOT / "medical/data/shidazhuo/门诊病人(处方明细)_20260608173446.xlsx"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_DOCTORNAME = "shidazhuo"
+DEFAULT_RECORD_XLSX = PROJECT_ROOT / "medical/data/xiqu_shidazhuo/线下诊疗数据采集_20260603151959(1).xlsx"
+DEFAULT_PRESCRIPTION_XLSX = PROJECT_ROOT / "medical/data/xiqu_shidazhuo/史大卓处方明细.xlsx"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "medical/processed_data"
 
 # --------------------------------------------------------------------------- #
@@ -43,20 +52,64 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "medical/processed_data"
 # skiprows=3 后第 0 行就是表头
 # --------------------------------------------------------------------------- #
 RECORD_COLUMNS: list[str] = [
-    "idx", "dept", "doctor", "visit_time", "name", "sex", "age", "mzh",
-    "chief_complaint", "present_illness", "allergy_history", "past_history",
-    "physical_exam", "auxiliary_exam", "diagnosis", "treatment_plan",
+    "idx",
+    "dept",
+    "doctor",
+    "visit_time",
+    "name",
+    "sex",
+    "age",
+    "mzh",
+    "chief_complaint",
+    "present_illness",
+    "allergy_history",
+    "past_history",
+    "physical_exam",
+    "auxiliary_exam",
+    "diagnosis",
+    "treatment_plan",
 ]
 
 # --------------------------------------------------------------------------- #
 # 表2：处方明细 字段映射
 # --------------------------------------------------------------------------- #
 PRESCRIPTION_COLUMNS: list[str] = [
-    "idx", "dept", "fee_type", "rx_no", "mzh", "name", "id_no", "sex", "age",
-    "bill_type", "bill_no", "item_code", "item_name", "spec", "unit_price", "qty", "dose",
-    "doc_advice", "freq", "order_note", "total", "dose_count", "usage", "count", "unit",
-    "total_amt", "category", "doctor", "exec_dept", "charge_flag", "order_time",
-    "charge_time", "operator", "checkout_time", "remark",
+    "idx",
+    "dept",
+    "visit_type",
+    "fee_type",
+    "rx_no",
+    "mzh",
+    "name",
+    "id_no",
+    "sex",
+    "age",
+    "bill_type",
+    "bill_no",
+    "item_code",
+    "item_name",
+    "spec",
+    "unit_price",
+    "qty",
+    "dose",
+    "doc_advice",
+    "freq",
+    "order_note",
+    "total",
+    "dose_count",
+    "usage",
+    "count",
+    "unit",
+    "total_amt",
+    "category",
+    "doctor",
+    "exec_dept",
+    "charge_flag",
+    "order_time",
+    "charge_time",
+    "operator",
+    "checkout_time",
+    "remark",
 ]
 
 # 项目代码首字母 -> (处方类别名 / 药品来源类别名)
@@ -86,23 +139,24 @@ def read_record_xlsx(path: Path = DEFAULT_RECORD_XLSX) -> pd.DataFrame:
     # 整型字段处理缺失（age 字段带"岁"字，需先剥掉）
     df["idx"] = df["idx"].astype("Int64").astype(str).str.replace("<NA>", "", regex=False)
     df["age"] = (
-        df["age"]
-        .astype(str)
-        .str.replace("<NA>", "", regex=False)
-        .str.replace(r"\.0$", "", regex=True)
-        .str.strip()
+        df["age"].astype(str).str.replace("<NA>", "", regex=False).str.replace(r"\.0$", "", regex=True).str.strip()
     )
 
     df["visit_time"] = pd.to_datetime(df["visit_time"], errors="coerce")
     df = df.dropna(subset=["mzh"])
     df = df[df["mzh"] != ""]
+    # 主诉缺失的行不能构成有效病历。
+    chief_complaint = df["chief_complaint"].fillna("").astype(str).str.strip()
+    df = df[(chief_complaint != "") & (chief_complaint.str.lower() != "nan")]
     return df.reset_index(drop=True)
 
 
 def read_prescription_xlsx(path: Path = DEFAULT_PRESCRIPTION_XLSX) -> pd.DataFrame:
-    """读取表2（处方明细），过滤出药品类条目，并规范字段。"""
+    """读取表2（处方明细），仅保留正常收费条目，并规范字段。"""
     df = pd.read_excel(path, skiprows=3)
     df.columns = PRESCRIPTION_COLUMNS
+    df["charge_flag"] = df["charge_flag"].fillna("").astype(str).str.strip()
+    df = df[df["charge_flag"] == "正常"].copy()
     df["mzh"] = (
         df["mzh"]
         .astype("Int64")
@@ -113,14 +167,14 @@ def read_prescription_xlsx(path: Path = DEFAULT_PRESCRIPTION_XLSX) -> pd.DataFra
     )
     df["rx_no"] = df["rx_no"].astype(str).str.strip().replace({"nan": ""})
     df["item_code"] = df["item_code"].astype(str).str.strip()
-    # 仅保留药品类：项目代码首字母 ∈ {C, X, K, Z}
+    # 项目代码首字母 ∈ {C, X, K, Z} 的条目会在处方聚合时保留。
     df["item_prefix"] = df["item_code"].str[:1]
-    df = df[df["item_prefix"].isin(ITEM_PREFIX_MAP.keys())].copy()
     # 剂量字段转字符串，保留原始单位（"20g" / "47.5mg"）
     df["dose"] = df["dose"].astype(str).str.strip()
     # 剂数 / 频次 / 用法
     for col in ("dose_count", "freq", "usage"):
         df[col] = df[col].astype(str).str.strip().replace({"nan": ""})
+    df["visit_type"] = df["visit_type"].fillna("").astype(str).str.strip().replace({"nan": ""})
     # 剂数整理：浮点 .0 -> 整数字符串
     df["dose_count"] = df["dose_count"].apply(_normalize_int_str)
     return df.reset_index(drop=True)
@@ -138,7 +192,7 @@ def build_drug_entry(row: pd.Series) -> dict[str, Any]:
         drug_name=row["item_name"],
         unit_name=str(row.get("unit", "")).strip() or "g",
         spec_name=str(row["spec"]).strip(),
-        drug_num=str(row["dose"]).strip(),       # 每次剂量（带单位，例如 "20g"）
+        drug_num=str(row["dose"]).strip(),  # 每次剂量（带单位，例如 "20g"）
         drug_weight=_extract_dose_value(row["dose"]),
         sale_price=str(row["unit_price"]).strip(),
         item_code=row["item_code"],
@@ -155,6 +209,7 @@ def _extract_dose_value(dose: Any) -> float | None:
     if not s or s.lower() == "nan":
         return None
     import re
+
     m = re.search(r"[-+]?\d*\.?\d+", s)
     if not m:
         return None
@@ -184,11 +239,10 @@ def aggregate_prescriptions(prescription_df: pd.DataFrame) -> dict[str, list[dic
     同一 (门诊号, 处方号, 项目首字母) 归并到一张处方。
     """
     out: dict[str, list[dict[str, Any]]] = {}
+    drug_df = prescription_df[prescription_df["item_prefix"].isin(ITEM_PREFIX_MAP)].copy()
 
     # 按 门诊号 + 处方号 + 药品类别 分组
-    grouped = prescription_df.groupby(
-        ["mzh", "rx_no", "item_prefix"], dropna=False, sort=False
-    )
+    grouped = drug_df.groupby(["mzh", "rx_no", "item_prefix"], dropna=False, sort=False)
 
     for (mzh, rx_no, prefix), group in grouped:
         if not mzh:
@@ -218,6 +272,15 @@ def aggregate_prescriptions(prescription_df: pd.DataFrame) -> dict[str, list[dic
         )
         out.setdefault(mzh, []).append(ps_entry)
     return out
+
+
+def build_visit_type_map(prescription_df: pd.DataFrame) -> dict[str, str]:
+    """按门诊号获取“初复诊”信息。"""
+    visit_type_map: dict[str, str] = {}
+    for mzh, group in prescription_df.groupby("mzh", sort=False):
+        visit_type = next((value for value in group["visit_type"] if value), "")
+        visit_type_map[mzh] = visit_type
+    return visit_type_map
 
 
 def _infer_usage_type(prefix: str, usage: str) -> str:
@@ -251,9 +314,26 @@ def _build_usage_desc(dose_count: Any, freq: Any, usage: Any) -> str:
 # --------------------------------------------------------------------------- #
 # 主表 -> JSON 记录
 # --------------------------------------------------------------------------- #
+def clean_output_value(value: Any) -> Any:
+    """递归将输出结构中的缺失值转为空字符串。"""
+    if isinstance(value, dict):
+        return {key: clean_output_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [clean_output_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(clean_output_value(item) for item in value)
+    if isinstance(value, str):
+        return "" if value.strip().lower() in {"nan", "nat", "none", "<na>"} else value
+    try:
+        return "" if pd.isna(value) else value
+    except (TypeError, ValueError):
+        return value
+
+
 def build_record_dict(
     row: pd.Series,
     prescription_map: dict[str, list[dict[str, Any]]],
+    visit_type_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """构造一条最终的病历 JSON。"""
     mzh = row["mzh"]
@@ -267,15 +347,16 @@ def build_record_dict(
     # 拆分初步诊断为「中医诊断 / 西医诊断」
     tcm_diag, west_diag = _split_diagnosis(str(row["diagnosis"]))
 
-    ps_list = prescription_map.get(mzh, [])
+    treatment_plan = clean_output_value(row.get("treatment_plan", ""))
+    ps_list = copy.deepcopy(prescription_map.get(mzh, []))
+    for prescription in ps_list:
+        prescription["doctor_advice"] = treatment_plan
 
-    return OrderedDict(
+    record = OrderedDict(
         idx=str(row.get("idx", "")).strip(),
-        order_sn=f"ZX{visit_time_str.replace('-', '').replace(' ', '').replace(':', '')}"
-        if visit_time_str
-        else "",
+        order_sn=f"ZX{visit_time_str.replace('-', '').replace(' ', '').replace(':', '')}" if visit_time_str else "",
         inquiry_method="",
-        is_first="",
+        is_first=(visit_type_map or {}).get(mzh, ""),
         created_at=visit_time_str,
         start_time=visit_time_str,
         stop_time="",
@@ -289,13 +370,13 @@ def build_record_dict(
         patient_height="",
         patient_weight="",
         patient_appeal="",
-        chief_complaint=str(row["chief_complaint"]).strip(),       # 主诉
+        chief_complaint=str(row["chief_complaint"]).strip(),  # 主诉
         doc_ass_stu_appeal=str(row["chief_complaint"]).strip(),
-        new_medical_history=str(row["present_illness"]).strip(),   # 现病史
+        new_medical_history=str(row["present_illness"]).strip(),  # 现病史
         is_old_medical_history="",
-        old_medical_history=str(row["past_history"]).strip(),      # 既往史
+        old_medical_history=str(row["past_history"]).strip(),  # 既往史
         is_allergic_history="",
-        allergic_history=str(row["allergy_history"]).strip(),      # 过敏史
+        allergic_history=str(row["allergy_history"]).strip(),  # 过敏史
         is_personal_history="",
         personal_history="",
         is_special="",
@@ -310,16 +391,17 @@ def build_record_dict(
         admin_report_img=[],
         admin_face_img=[],
         admin_face_describe="",
-        diagnosis_illness=west_diag,                               # 西医诊断
-        diagnosis_disease=tcm_diag,                               # 中医诊断
+        diagnosis_illness=west_diag,  # 西医诊断
+        diagnosis_disease=tcm_diag,  # 中医诊断
         diagnosis_sickness="",
-        physical_exam=str(row["physical_exam"]).strip(),           # 体格检查
-        auxiliary_exam=str(row["auxiliary_exam"]).strip(),         # 辅助检查
-        treatment_plan=str(row["treatment_plan"]).strip(),         # 治疗计划及建议
-        disposition=str(row["treatment_plan"]).strip(),
+        physical_exam=str(row["physical_exam"]).strip(),  # 体格检查
+        auxiliary_exam=str(row["auxiliary_exam"]).strip(),  # 辅助检查
+        treatment_plan=treatment_plan,  # 治疗计划及建议
+        disposition=treatment_plan,
         im_msg=[],
         ps=ps_list,
     )
+    return clean_output_value(record)
 
 
 def _extract_age(age: Any) -> str:
@@ -328,6 +410,7 @@ def _extract_age(age: Any) -> str:
     if not s or s == "<NA>" or s.lower() == "nan":
         return ""
     import re
+
     m = re.search(r"\d+", s)
     return m.group(0) if m else s
 
@@ -339,6 +422,7 @@ def _split_diagnosis(diag: Any) -> tuple[str, str]:
         return "", ""
     tcm, west = "", ""
     import re
+
     m_west = re.search(r"西医诊断[:：]?\s*([\s\S]+?)(?:\n|$)", s)
     m_tcm = re.search(r"中医诊断[:：]?\s*([\s\S]+?)(?:\n|$)", s)
     if m_west:
@@ -355,10 +439,11 @@ def _split_diagnosis(diag: Any) -> tuple[str, str]:
 # 主流程
 # --------------------------------------------------------------------------- #
 def main(
+    doctorname: str = DEFAULT_DOCTORNAME,
     record_path: Path = DEFAULT_RECORD_XLSX,
     prescription_path: Path = DEFAULT_PRESCRIPTION_XLSX,
-    output_dir: Path = DEFAULT_OUTPUT_DIR,
 ) -> Path:
+    output_dir = DEFAULT_OUTPUT_DIR / doctorname
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[1/4] 读取病历主表: {record_path}")
@@ -367,7 +452,8 @@ def main(
 
     print(f"[2/4] 读取处方明细表: {prescription_path}")
     prescription_df = read_prescription_xlsx(prescription_path)
-    print(f"      共 {len(prescription_df)} 条药品条目")
+    drug_count = prescription_df["item_prefix"].isin(ITEM_PREFIX_MAP).sum()
+    print(f"      正常收费 {len(prescription_df)} 条，其中药品条目 {drug_count} 条")
     print("      类别分布:")
     for prefix, (cat_name, _) in ITEM_PREFIX_MAP.items():
         n = (prescription_df["item_prefix"] == prefix).sum()
@@ -376,6 +462,7 @@ def main(
 
     print("[3/4] 按门诊号聚合处方...")
     prescription_map = aggregate_prescriptions(prescription_df)
+    visit_type_map = build_visit_type_map(prescription_df)
     print(f"      涉及 {len(prescription_map)} 个门诊号")
 
     print("[4/4] 生成最终 JSON...")
@@ -385,10 +472,10 @@ def main(
         mzh = row["mzh"]
         if mzh in prescription_map:
             matched += 1
-        records.append(build_record_dict(row, prescription_map))
+        records.append(build_record_dict(row, prescription_map, visit_type_map))
 
     today = datetime.now().strftime("%Y%m%d")
-    out_path = output_dir / f"shidazhuo_record_{today}.json"
+    out_path = output_dir / f"{doctorname}_record_{today}.json"
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
 
@@ -414,5 +501,27 @@ def main(
     return out_path
 
 
+def parse_args() -> argparse.Namespace:
+    """解析命令行参数。"""
+    parser = argparse.ArgumentParser(description="清洗西区医生病历和处方明细。")
+    parser.add_argument("--doctorname", default=DEFAULT_DOCTORNAME, help="医生标识，用于生成输出文件名。")
+    parser.add_argument(
+        "--record-path", "--record_path", type=Path, default=DEFAULT_RECORD_XLSX, help="病历主表 Excel 路径。"
+    )
+    parser.add_argument(
+        "--prescription-path",
+        "--prescription_path",
+        type=Path,
+        default=DEFAULT_PRESCRIPTION_XLSX,
+        help="处方明细 Excel 路径。",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(
+        doctorname=args.doctorname,
+        record_path=args.record_path,
+        prescription_path=args.prescription_path,
+    )
