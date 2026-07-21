@@ -1,0 +1,229 @@
+<!--
+Copyright 2025 the LlamaFactory team.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+-->
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="疾病、病情、处方关系与复诊调方分析" />
+    <title>问诊处方分析</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div>
+        <p class="eyebrow">MULTI-DOCTOR · CLINICAL ANALYSIS</p>
+        <h1>问诊处方分析</h1>
+        <p class="subtitle">从疾病核心用药到复诊随症加减，观察诊疗模式，不推断疗效因果。</p>
+      </div>
+      <div class="header-context">
+        <label class="doctor-control">
+          <span>当前医生</span>
+          <select id="doctor-select" aria-label="选择医生"></select>
+        </label>
+        <div class="source-status" aria-live="polite">
+          <span class="status-dot"></span>
+          <span id="source-status">正在载入数据</span>
+        </div>
+      </div>
+    </header>
+
+    <nav class="tabs" aria-label="分析模块">
+      <button class="tab is-active" type="button" data-view="overview" aria-selected="true">总览</button>
+      <button class="tab" type="button" data-view="disease" aria-selected="false">疾病与处方</button>
+      <button class="tab" type="button" data-view="base-formula" aria-selected="false">基础方图谱</button>
+      <button class="tab" type="button" data-view="revisit" aria-selected="false">复诊调方</button>
+      <button class="tab" type="button" data-view="patient" aria-selected="false">患者时间轴</button>
+    </nav>
+
+    <main>
+      <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+      <section id="view-overview" class="view is-active" aria-labelledby="overview-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">DATA PULSE</p>
+            <h2 id="overview-title">数据全景</h2>
+          </div>
+          <p id="overview-note" class="section-note"></p>
+        </div>
+        <div id="overview-metrics" class="metric-grid skeleton-grid" aria-live="polite"></div>
+        <div class="two-column">
+          <article class="panel">
+            <div class="panel-heading">
+              <h3>主要疾病分布</h3>
+              <span>按问诊次数</span>
+            </div>
+            <div id="disease-chart" class="bar-chart" aria-label="主要疾病分布图"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading">
+              <h3>内服方高频药物</h3>
+              <span>按就诊覆盖率</span>
+            </div>
+            <div id="drug-chart" class="bar-chart" aria-label="高频药物分布图"></div>
+          </article>
+        </div>
+        <article class="panel quality-panel">
+          <div class="panel-heading">
+            <h3>分析边界与数据质量</h3>
+            <span>进入关联分析前需关注</span>
+          </div>
+          <div id="quality-list" class="quality-grid"></div>
+        </article>
+      </section>
+
+      <section id="view-disease" class="view" aria-labelledby="disease-title" hidden>
+        <div class="section-heading with-controls">
+          <div>
+            <p class="section-kicker">DISEASE × FORMULA</p>
+            <h2 id="disease-title">疾病与处方</h2>
+          </div>
+          <label class="control-label">
+            diagnosis_illness
+            <select id="disease-select"></select>
+          </label>
+        </div>
+        <div id="disease-metrics" class="metric-grid compact"></div>
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>同种疾病高频核心药物</h3>
+            <span>病种严格使用 diagnosis_illness 原值，不做类别合并</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>药物</th><th>处方次数</th><th>患者数</th><th>病种内使用率</th><th>全局使用率</th><th>Lift</th><th>中位剂量</th></tr></thead>
+              <tbody id="disease-drug-table"></tbody>
+            </table>
+          </div>
+        </article>
+        <div class="two-column comparison-layout">
+          <article class="panel">
+            <div class="panel-heading">
+              <h3>同病不同处方病例</h3>
+              <span id="same-disease-meta">按处方明细区分</span>
+            </div>
+            <div id="same-disease-cases" class="case-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading">
+              <h3>同处方不同病病例</h3>
+              <span id="same-formula-meta">按药味相似度 ≥ 80%</span>
+            </div>
+            <div id="same-formula-cases" class="case-list"></div>
+          </article>
+        </div>
+        <article class="panel llm-panel">
+          <div class="panel-heading">
+            <h3>LLM 处方原因与配伍逻辑</h3>
+            <span id="llm-status">从病例中选择“分析处方”</span>
+          </div>
+          <div id="llm-analysis-content" class="llm-analysis empty-analysis">选择一个病例后，系统将使用性别、年龄、new_medical_history、过敏史、家族史、个人史、既往史和本次处方调用 LLM。</div>
+        </article>
+      </section>
+
+      <section id="view-base-formula" class="view" aria-labelledby="base-formula-title" hidden>
+        <div class="section-heading with-controls">
+          <div>
+            <p class="section-kicker">DISEASE × SYNDROME × BASE FORMULA</p>
+            <h2 id="base-formula-title">基础方图谱</h2>
+          </div>
+          <div class="filter-row">
+            <label class="control-label">最低独立患者数
+              <select id="base-formula-min-patients">
+                <option value="10">10 位</option>
+                <option value="20">20 位</option>
+                <option value="30" selected>30 位</option>
+                <option value="50">50 位</option>
+              </select>
+            </label>
+            <label class="checkbox-control"><input id="base-formula-eligible-only" type="checkbox" checked />仅显示可挖掘组合</label>
+          </div>
+        </div>
+        <div id="base-formula-metrics" class="metric-grid compact" aria-live="polite"></div>
+        <article class="panel formula-filter-panel">
+          <div class="panel-heading">
+            <h3>疾病—证候筛选</h3>
+            <span>基础方按独立患者加权，避免高频复诊患者支配结果</span>
+          </div>
+          <div class="filter-row formula-filter-row">
+            <label class="control-label">疾病<select id="base-formula-disease"><option value="">全部疾病</option></select></label>
+            <label class="control-label">证候<select id="base-formula-syndrome"><option value="">全部证候</option></select></label>
+          </div>
+        </article>
+        <div class="formula-section-heading">
+          <div><h3>可能的基础方</h3><p id="base-formula-list-note">选择组合查看完整挖掘结果</p></div>
+          <span class="formula-legend"><i></i>支持度表示患者内平均处方覆盖率</span>
+        </div>
+        <div id="base-formula-cards" class="base-formula-grid" aria-live="polite"></div>
+        <article id="base-formula-detail-panel" class="panel base-formula-detail-panel" hidden>
+          <div class="panel-heading">
+            <h3 id="base-formula-detail-title">基础方详情</h3>
+            <span id="base-formula-detail-meta"></span>
+          </div>
+          <div id="base-formula-detail"></div>
+        </article>
+        <p class="formula-boundary">候选基础方仅表示当前医生历史数据中的稳定共现模式，不代表临床标准方、疗效或因果关系。</p>
+      </section>
+
+      <section id="view-revisit" class="view" aria-labelledby="revisit-title" hidden>
+        <div class="section-heading with-controls">
+          <div>
+            <p class="section-kicker">LONGITUDINAL CHANGE</p>
+            <h2 id="revisit-title">复诊调方规律</h2>
+          </div>
+          <div class="filter-row">
+            <label class="control-label">疾病<select id="revisit-disease"><option value="">全部疾病</option></select></label>
+            <label class="control-label">当前症状<select id="revisit-symptom"><option value="">全部症状</option></select></label>
+            <label class="control-label">本次反馈<select id="revisit-outcome"><option value="">全部</option><option>改善</option><option>稳定</option><option>加重</option><option>不明确</option></select></label>
+          </div>
+        </div>
+        <div id="revisit-metrics" class="metric-grid compact"></div>
+        <div class="three-column">
+          <article class="panel mini-list-panel"><div class="panel-heading"><h3>常新增</h3><span>相对前方</span></div><ol id="top-added" class="rank-list"></ol></article>
+          <article class="panel mini-list-panel"><div class="panel-heading"><h3>常停用</h3><span>相对前方</span></div><ol id="top-removed" class="rank-list"></ol></article>
+          <article class="panel mini-list-panel"><div class="panel-heading"><h3>常调剂量</h3><span>增减合计</span></div><ol id="top-dose" class="rank-list"></ol></article>
+        </div>
+        <article class="panel">
+          <div class="panel-heading"><h3>相邻就诊变化</h3><span>点击患者编号查看完整时间轴</span></div>
+          <div class="table-wrap">
+            <table class="wide-table">
+              <thead><tr><th>患者</th><th>日期</th><th>疾病 / 反馈</th><th>相似度</th><th>新增</th><th>停用</th><th>剂量变化</th></tr></thead>
+              <tbody id="revisit-table"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section id="view-patient" class="view" aria-labelledby="patient-title" hidden>
+        <div class="section-heading with-controls">
+          <div>
+            <p class="section-kicker">ANONYMIZED JOURNEY</p>
+            <h2 id="patient-title">患者时间轴</h2>
+          </div>
+          <form id="patient-search-form" class="search-form">
+            <label class="control-label">患者 ID<input id="patient-query" type="search" placeholder="请输入 patient_id" autocomplete="off" /></label>
+            <button type="submit" class="primary-button">查询</button>
+          </form>
+        </div>
+        <div class="patient-layout">
+          <aside class="panel patient-list-panel">
+            <div class="panel-heading"><h3>多次就诊患者</h3><span>显示 patient_id 字段</span></div>
+            <div id="patient-list" class="patient-list"></div>
+          </aside>
+          <article class="panel timeline-panel">
+            <div class="panel-heading"><h3 id="timeline-title">选择一位患者</h3><span id="timeline-meta"></span></div>
+            <div id="timeline" class="timeline empty-state">从左侧选择患者 ID，查看病情与调方过程。</div>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer>姓名及联系方式不展示 · 分析结果用于诊疗模式研究，不作为临床决策依据</footer>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
