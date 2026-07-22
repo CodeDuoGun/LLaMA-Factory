@@ -26,14 +26,24 @@ from medical.analysis.base_formula import (  # noqa: E402
     WeightedTransaction,
     build_base_formula_catalog,
     discover_base_formulas,
+    discover_base_formulas_by_dimensions,
+    formula_dimension_metadata,
     formula_strata,
+    multidimensional_formula_strata,
     weighted_fp_growth,
 )
 from medical.analysis.engine import MedicalAnalysis  # noqa: E402
 from medical.analysis.app import app, base_formula_query  # noqa: E402
 
 
-def _record(visit_id: int, patient_id: int, drugs: list[str], syndrome: str = "肝胃不和证") -> dict:
+def _record(
+    visit_id: int,
+    patient_id: int,
+    drugs: list[str],
+    syndrome: str = "肝胃不和证",
+    tcm_disease: str = "胃痞病",
+    visit_type: str = "初诊",
+) -> dict:
     return {
         "id": visit_id,
         "patient_id": patient_id,
@@ -41,8 +51,9 @@ def _record(visit_id: int, patient_id: int, drugs: list[str], syndrome: str = "�
         "patient_mobile": f"1380000{patient_id:04d}",
         "patient_idcard": f"11010119900101{patient_id:04d}",
         "start_time": "2026-01-01 09:00:00",
-        "is_first": "初诊",
+        "is_first": visit_type,
         "diagnosis_illness": "慢性萎缩性胃炎",
+        "diagnosis_sickness": tcm_disease,
         "diagnosis_disease": syndrome,
         "ps": [
             {
@@ -166,6 +177,49 @@ def test_catalog_mines_eligible_groups_and_marks_small_groups() -> None:
     assert "patient_id" not in json.dumps(catalog, ensure_ascii=False)
 
 
+def test_multidimensional_strata_and_discovery_use_exact_values() -> None:
+    records = [
+        _record(1, 1, ["白术", "茯苓", "甘草"]),
+        _record(2, 2, ["白术", "茯苓", "陈皮"]),
+        _record(3, 3, ["白术", "厚朴"], visit_type="复诊"),
+    ]
+    service = MedicalAnalysis(records)
+    dimensions = ["diagnosis_sickness", "diagnosis_disease", "is_first"]
+    strata = multidimensional_formula_strata(service, dimensions, minimum_patients=2)
+
+    assert strata["stratum_count"] == 2
+    assert strata["items"][0]["dimension_values"] == {
+        "diagnosis_sickness": "胃痞病",
+        "diagnosis_disease": "肝胃不和证",
+        "is_first": "初诊",
+    }
+    assert strata["items"][0]["status"] == "eligible"
+    report = discover_base_formulas_by_dimensions(
+        service,
+        strata["items"][0]["dimension_values"],
+        minimum_support=0.5,
+        maximum_pattern_length=4,
+        component_count=2,
+        bootstrap_rounds=20,
+    )
+    assert report["scope"]["dimensions"] == dimensions
+    assert report["representative_base_formula"]["drugs"] == ["白术", "茯苓"]
+
+
+def test_dimension_metadata_marks_unavailable_dimensions_disabled() -> None:
+    metadata = formula_dimension_metadata(MedicalAnalysis([_record(1, 1, ["白术", "茯苓"])]))
+    by_name = {item["name"]: item for item in metadata["dimensions"]}
+
+    assert {name for name, item in by_name.items() if item["supported"]} == {
+        "diagnosis_illness",
+        "diagnosis_sickness",
+        "diagnosis_disease",
+        "is_first",
+    }
+    assert by_name["disease_course"]["supported"] is False
+    assert by_name["etiology_pathogenesis"]["reason"] == "暂无结构化数据支持"
+
+
 def test_base_formula_query_api_returns_ready_and_insufficient_results() -> None:
     records = [
         _record(1, 1, ["白术", "茯苓", "甘草"]),
@@ -202,4 +256,10 @@ def test_base_formula_query_api_returns_ready_and_insufficient_results() -> None
     assert insufficient["status"] == "insufficient_sample"
     assert insufficient["base_formula"] is None
     assert len(state.base_formula_cache) == 1
-    assert {route.path for route in app.routes} >= {"/api/base-formulas", "/api/base-formulas/strata"}
+    assert {route.path for route in app.routes} >= {
+        "/api/base-formulas",
+        "/api/base-formulas/strata",
+        "/api/base-formulas/dimensions",
+        "/api/base-formulas/multidimensional/strata",
+        "/api/base-formulas/multidimensional",
+    }

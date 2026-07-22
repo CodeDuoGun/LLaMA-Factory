@@ -37,6 +37,15 @@ from medical.analysis.engine import MedicalAnalysis, Visit
 
 EPSILON = 1e-12
 
+FORMULA_DIMENSIONS: dict[str, dict[str, Any]] = {
+    "diagnosis_illness": {"label": "西医诊断", "visit_attribute": "disease", "supported": True},
+    "diagnosis_sickness": {"label": "中医诊断", "visit_attribute": "tcm_disease", "supported": True},
+    "diagnosis_disease": {"label": "中医证候", "visit_attribute": "syndrome", "supported": True},
+    "is_first": {"label": "初诊/复诊", "visit_attribute": "is_first", "supported": True},
+    "disease_course": {"label": "病程", "supported": False, "reason": "暂无结构化数据支持"},
+    "etiology_pathogenesis": {"label": "病因病机", "supported": False, "reason": "暂无结构化数据支持"},
+}
+
 
 @dataclass
 class _FPNode:
@@ -177,6 +186,99 @@ def formula_strata(
         "source": analysis.source_name,
         "minimum_patients": minimum_patients,
         "visit_type": visit_type,
+        "process_type": process_type,
+        "stratum_count": len(items),
+        "eligible_count": sum(item["status"] == "eligible" for item in items),
+        "items": items,
+    }
+
+
+def _validate_dimensions(dimensions: Iterable[str]) -> list[str]:
+    selected = list(dimensions)
+    if not selected:
+        raise ValueError("At least one analysis dimension is required.")
+    if len(selected) != len(set(selected)):
+        raise ValueError("Analysis dimensions must not contain duplicates.")
+    unknown = [dimension for dimension in selected if dimension not in FORMULA_DIMENSIONS]
+    if unknown:
+        raise ValueError(f"Unknown analysis dimensions: {', '.join(unknown)}.")
+    unsupported = [dimension for dimension in selected if not FORMULA_DIMENSIONS[dimension]["supported"]]
+    if unsupported:
+        raise ValueError(f"Unsupported analysis dimensions: {', '.join(unsupported)}.")
+    return selected
+
+
+def _dimension_value(visit: Visit, dimension: str) -> str:
+    return str(getattr(visit, FORMULA_DIMENSIONS[dimension]["visit_attribute"], "") or "").strip()
+
+
+def formula_dimension_metadata(analysis: MedicalAnalysis) -> dict[str, Any]:
+    """Describe selectable dimensions and their observed, privacy-safe value counts."""
+    dimensions = []
+    for name, definition in FORMULA_DIMENSIONS.items():
+        row = {"name": name, "label": definition["label"], "supported": definition["supported"]}
+        if definition["supported"]:
+            counts = Counter(_dimension_value(visit, name) for visit in analysis.visits if visit.internal_drugs)
+            counts.pop("", None)
+            row.update(
+                {
+                    "value_count": len(counts),
+                    "nonempty_visit_count": sum(counts.values()),
+                    "values": [
+                        {"value": value, "visit_count": count}
+                        for value, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+                    ],
+                }
+            )
+        else:
+            row["reason"] = definition["reason"]
+        dimensions.append(row)
+    return {"source": analysis.source_name, "dimensions": dimensions}
+
+
+def multidimensional_formula_strata(
+    analysis: MedicalAnalysis,
+    dimensions: Iterable[str],
+    minimum_patients: int = 30,
+    include_unspecified: bool = False,
+    process_type: str | None = None,
+) -> dict[str, Any]:
+    """List exact-value groups for any supported dimension combination."""
+    selected = _validate_dimensions(dimensions)
+    if minimum_patients < 1:
+        raise ValueError("minimum_patients must be positive.")
+    grouped: dict[tuple[str, ...], list[Visit]] = defaultdict(list)
+    for visit in analysis.visits:
+        if not visit.internal_drugs or (process_type and visit.process_types != [process_type]):
+            continue
+        values = tuple(_dimension_value(visit, dimension) for dimension in selected)
+        if not include_unspecified and any(not value for value in values):
+            continue
+        grouped[values].append(visit)
+
+    items = []
+    for values, visits in grouped.items():
+        raw_values = dict(zip(selected, values))
+        display_values = {dimension: value or "未明确" for dimension, value in raw_values.items()}
+        patient_count = len({visit.patient_id for visit in visits})
+        items.append(
+            {
+                "dimension_values": raw_values,
+                "display_dimension_values": display_values,
+                "label": " · ".join(
+                    f"{FORMULA_DIMENSIONS[dimension]['label']}：{display_values[dimension]}" for dimension in selected
+                ),
+                "visit_count": len(visits),
+                "patient_count": patient_count,
+                "status": "eligible" if patient_count >= minimum_patients else "insufficient_sample",
+            }
+        )
+    items.sort(key=lambda row: (-row["patient_count"], -row["visit_count"], row["label"]))
+    return {
+        "source": analysis.source_name,
+        "dimensions": selected,
+        "dimension_labels": {dimension: FORMULA_DIMENSIONS[dimension]["label"] for dimension in selected},
+        "minimum_patients": minimum_patients,
         "process_type": process_type,
         "stratum_count": len(items),
         "eligible_count": sum(item["status"] == "eligible" for item in items),
@@ -377,12 +479,10 @@ def _dose_summary(visits: list[Visit], core_drugs: set[str]) -> list[dict[str, A
     return rows
 
 
-def discover_base_formulas(
+def _discover_for_visits(
     analysis: MedicalAnalysis,
-    disease: str,
-    syndrome: str | None = None,
-    visit_type: str | None = None,
-    process_type: str | None = None,
+    visits: list[Visit],
+    scope: dict[str, Any],
     minimum_support: float = 0.3,
     maximum_pattern_length: int = 10,
     pattern_limit: int = 30,
@@ -391,12 +491,11 @@ def discover_base_formulas(
     bootstrap_rounds: int = 500,
     seed: int = 42,
 ) -> dict[str, Any]:
-    """Discover aggregate empirical base-formula candidates for one clinical stratum."""
+    """Run the shared mining pipeline over an already selected visit stratum."""
     if not 0 < minimum_support <= 1:
         raise ValueError("minimum_support must be in (0, 1].")
     if maximum_pattern_length < 1 or pattern_limit < 1:
         raise ValueError("maximum_pattern_length and pattern_limit must be positive.")
-    visits = [visit for visit in analysis.visits if _visit_matches(visit, disease, syndrome, visit_type, process_type)]
     transactions, by_patient = _weighted_transactions(visits)
     if not by_patient:
         raise ValueError("No internal prescriptions matched the requested stratum.")
@@ -444,10 +543,7 @@ def discover_base_formulas(
     return {
         "scope": {
             "source": analysis.source_name,
-            "disease": disease,
-            "syndrome": syndrome,
-            "visit_type": visit_type,
-            "process_type": process_type,
+            **scope,
             "visit_count": len(visits),
             "patient_count": len(by_patient),
             "minimum_patient_weighted_support": minimum_support,
@@ -481,6 +577,77 @@ def discover_base_formulas(
             "Dose summaries keep process type and unit separate and are descriptive only.",
         ],
     }
+
+
+def discover_base_formulas(
+    analysis: MedicalAnalysis,
+    disease: str,
+    syndrome: str | None = None,
+    visit_type: str | None = None,
+    process_type: str | None = None,
+    minimum_support: float = 0.3,
+    maximum_pattern_length: int = 10,
+    pattern_limit: int = 30,
+    component_count: int = 3,
+    drugs_per_component: int = 12,
+    bootstrap_rounds: int = 500,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Discover aggregate empirical base-formula candidates for one legacy disease-syndrome stratum."""
+    visits = [visit for visit in analysis.visits if _visit_matches(visit, disease, syndrome, visit_type, process_type)]
+    return _discover_for_visits(
+        analysis,
+        visits,
+        {"disease": disease, "syndrome": syndrome, "visit_type": visit_type, "process_type": process_type},
+        minimum_support,
+        maximum_pattern_length,
+        pattern_limit,
+        component_count,
+        drugs_per_component,
+        bootstrap_rounds,
+        seed,
+    )
+
+
+def discover_base_formulas_by_dimensions(
+    analysis: MedicalAnalysis,
+    dimension_values: dict[str, str],
+    process_type: str | None = None,
+    minimum_support: float = 0.3,
+    maximum_pattern_length: int = 10,
+    pattern_limit: int = 30,
+    component_count: int = 3,
+    drugs_per_component: int = 12,
+    bootstrap_rounds: int = 500,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Discover a base formula for one exact multidimensional value combination."""
+    dimensions = _validate_dimensions(dimension_values)
+    normalized = {dimension: str(dimension_values[dimension]).strip() for dimension in dimensions}
+    visits = [
+        visit
+        for visit in analysis.visits
+        if visit.internal_drugs
+        and all(_dimension_value(visit, dimension) == value for dimension, value in normalized.items())
+        and (not process_type or visit.process_types == [process_type])
+    ]
+    return _discover_for_visits(
+        analysis,
+        visits,
+        {
+            "dimensions": dimensions,
+            "dimension_values": normalized,
+            "dimension_labels": {dimension: FORMULA_DIMENSIONS[dimension]["label"] for dimension in dimensions},
+            "process_type": process_type,
+        },
+        minimum_support,
+        maximum_pattern_length,
+        pattern_limit,
+        component_count,
+        drugs_per_component,
+        bootstrap_rounds,
+        seed,
+    )
 
 
 def build_base_formula_catalog(

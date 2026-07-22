@@ -122,6 +122,34 @@ def test_diagnosis_illness_is_not_merged() -> None:
     assert analysis.disease_detail("肺腺癌")["visit_count"] == 1
 
 
+def test_overview_contains_three_independent_diagnosis_distributions() -> None:
+    first = _record(111, "2026-03-01 09:00:00", "初诊", [_drug(1, "黄芪", 20)], "乏力")
+    second = _record(112, "2026-03-02 09:00:00", "初诊", [_drug(1, "黄芪", 20)], "纳差")
+    first["patient_id"] = 1
+    second["patient_id"] = 2
+    first.update({"diagnosis_illness": "胃癌", "diagnosis_sickness": "胃积病", "diagnosis_disease": "脾胃虚弱证"})
+    second.update({"diagnosis_illness": "胃癌", "diagnosis_sickness": "胃积病", "diagnosis_disease": "气血两虚证"})
+
+    distributions = MedicalAnalysis([first, second]).overview()["diagnosis_distributions"]
+
+    assert distributions["diagnosis_illness"][0] == {"value": "胃癌", "visit_count": 2, "patient_count": 2}
+    assert distributions["diagnosis_sickness"][0] == {"value": "胃积病", "visit_count": 2, "patient_count": 2}
+    assert {row["value"] for row in distributions["diagnosis_disease"]} == {"脾胃虚弱证", "气血两虚证"}
+
+
+def test_overview_returns_complete_diagnosis_distribution() -> None:
+    records = []
+    for index in range(12):
+        record = _record(300 + index, "2026-03-01 09:00:00", "初诊", [_drug(1, "黄芪", 20)], "乏力")
+        record["patient_id"] = index
+        record["diagnosis_illness"] = f"西医诊断{index}"
+        records.append(record)
+
+    rows = MedicalAnalysis(records).overview()["diagnosis_distributions"]["diagnosis_illness"]
+
+    assert len(rows) == 12
+
+
 def test_disease_case_contains_required_clinical_fields() -> None:
     record = _record(201, "2026-04-01 09:00:00", "初诊", [_drug(1, "黄芪", 20)], "乏力，纳差")
     record.update(

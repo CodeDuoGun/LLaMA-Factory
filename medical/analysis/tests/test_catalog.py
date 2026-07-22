@@ -52,6 +52,9 @@ def test_catalog_discovers_doctors_and_merges_supplements(tmp_path: Path) -> Non
         [_record(1, 1, "甲医生"), _record(2, 1, "甲医生")],
     )
     _write(tmp_path / "online_beta" / "乙医生_AI医生分身混合问诊数据_2_20260101000000.json", [_record(3, 2, "乙医生")])
+    wuweiping = _record(4, 0, "")
+    wuweiping["doctor_id"] = None
+    _write(tmp_path / "zongyuan_wuweiping" / "wuweiping_record_20260525.json", [wuweiping])
 
     catalog = DoctorCatalog.discover(tmp_path, default_doctor="alpha")
     doctors = catalog.list_doctors()
@@ -59,8 +62,9 @@ def test_catalog_discovers_doctors_and_merges_supplements(tmp_path: Path) -> Non
     beta = catalog.get("beta")
 
     assert doctors["default_doctor"] == "alpha"
-    assert {item["key"] for item in doctors["items"]} == {"alpha", "beta"}
+    assert {item["key"] for item in doctors["items"]} == {"alpha", "beta", "wuweiping"}
     assert next(item["doctor_name"] for item in doctors["items"] if item["key"] == "alpha") == "甲医生"
+    assert next(item["doctor_name"] for item in doctors["items"] if item["key"] == "wuweiping") == "吴卫平"
     assert alpha.raw_record_count == 2
     assert beta.raw_record_count == 1
     assert catalog.sources["alpha"].duplicate_records == 1

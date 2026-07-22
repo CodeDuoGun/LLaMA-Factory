@@ -26,7 +26,13 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from medical.analysis.base_formula import discover_base_formulas, formula_strata
+from medical.analysis.base_formula import (
+    discover_base_formulas,
+    discover_base_formulas_by_dimensions,
+    formula_dimension_metadata,
+    formula_strata,
+    multidimensional_formula_strata,
+)
 from medical.analysis.catalog import DoctorCatalog
 from medical.analysis.engine import MedicalAnalysis
 from medical.analysis.llm import PrescriptionLLMService
@@ -125,6 +131,113 @@ def base_formula_strata(
         visit_type=visit_type,
         process_type=process_type,
     )
+
+
+@app.get("/api/base-formulas/dimensions")
+def base_formula_dimensions(request: Request, doctor: str | None = None) -> dict[str, object]:
+    return formula_dimension_metadata(analysis(request, doctor))
+
+
+@app.get("/api/base-formulas/multidimensional/strata")
+def multidimensional_base_formula_strata(
+    request: Request,
+    dimensions: str = Query("diagnosis_illness,diagnosis_disease"),
+    minimum_patients: int = Query(30, ge=1, le=1000),
+    include_unspecified: bool = False,
+    process_type: str | None = None,
+    doctor: str | None = None,
+) -> dict[str, object]:
+    try:
+        return multidimensional_formula_strata(
+            analysis(request, doctor),
+            [dimension.strip() for dimension in dimensions.split(",") if dimension.strip()],
+            minimum_patients=minimum_patients,
+            include_unspecified=include_unspecified,
+            process_type=process_type,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.get("/api/base-formulas/multidimensional")
+def multidimensional_base_formula_query(
+    request: Request,
+    diagnosis_illness: str | None = None,
+    diagnosis_sickness: str | None = None,
+    diagnosis_disease: str | None = None,
+    is_first: str | None = Query(None, pattern="^(初诊|复诊)$"),
+    minimum_patients: int = Query(30, ge=1, le=1000),
+    minimum_support: float = Query(0.3, gt=0, le=1),
+    maximum_pattern_length: int = Query(15, ge=1, le=25),
+    pattern_limit: int = Query(30, ge=1, le=200),
+    component_count: int = Query(3, ge=1, le=12),
+    bootstrap_rounds: int = Query(500, ge=0, le=2000),
+    process_type: str | None = None,
+    doctor: str | None = None,
+) -> dict[str, object]:
+    service = analysis(request, doctor)
+    dimension_values = {
+        name: value
+        for name, value in {
+            "diagnosis_illness": diagnosis_illness,
+            "diagnosis_sickness": diagnosis_sickness,
+            "diagnosis_disease": diagnosis_disease,
+            "is_first": is_first,
+        }.items()
+        if value is not None
+    }
+    if not dimension_values:
+        raise HTTPException(status_code=422, detail="At least one dimension value is required.")
+    try:
+        strata = multidimensional_formula_strata(
+            service,
+            dimension_values,
+            minimum_patients=minimum_patients,
+            include_unspecified=True,
+            process_type=process_type,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    stratum = next((item for item in strata["items"] if item["dimension_values"] == dimension_values), None)
+    if stratum is None:
+        raise HTTPException(status_code=404, detail="Multidimensional stratum not found.")
+    if stratum["status"] != "eligible":
+        return {
+            "status": "insufficient_sample",
+            "stratum": stratum,
+            "minimum_patients": minimum_patients,
+            "base_formula": None,
+        }
+
+    cache = getattr(request.app.state, "base_formula_cache", None)
+    if cache is None:
+        cache = request.app.state.base_formula_cache = {}
+    cache_key = (
+        id(service),
+        "multidimensional",
+        tuple(dimension_values.items()),
+        process_type,
+        minimum_support,
+        maximum_pattern_length,
+        pattern_limit,
+        component_count,
+        bootstrap_rounds,
+    )
+    if cache_key not in cache:
+        try:
+            cache[cache_key] = discover_base_formulas_by_dimensions(
+                service,
+                dimension_values=dimension_values,
+                process_type=process_type,
+                minimum_support=minimum_support,
+                maximum_pattern_length=maximum_pattern_length,
+                pattern_limit=pattern_limit,
+                component_count=component_count,
+                bootstrap_rounds=bootstrap_rounds,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+    return {"status": "ready", "stratum": stratum, "base_formula": cache[cache_key]}
 
 
 @app.get("/api/base-formulas")

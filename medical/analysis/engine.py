@@ -200,6 +200,7 @@ class Visit:
     date: str
     is_first: str
     disease: str
+    tcm_disease: str
     raw_diagnosis: str
     attributes: list[str]
     syndrome: str
@@ -308,6 +309,7 @@ class MedicalAnalysis:
             date=_date(record),
             is_first=_clean(record.get("is_first")),
             disease=diagnosis or "未明确",
+            tcm_disease=_clean(record.get("diagnosis_sickness")),
             raw_diagnosis=diagnosis,
             attributes=diagnosis_attributes("。".join((diagnosis, history))),
             # diagnosis_disease stores the structured syndrome/pattern; diagnosis_sickness is a TCM disease name
@@ -421,8 +423,27 @@ class MedicalAnalysis:
             },
             "revisit_summary": pair_summary,
             "top_diseases": self.diseases(limit=10)["items"],
+            "diagnosis_distributions": {
+                "diagnosis_illness": self._diagnosis_distribution("raw_diagnosis"),
+                "diagnosis_sickness": self._diagnosis_distribution("tcm_disease"),
+                "diagnosis_disease": self._diagnosis_distribution("syndrome"),
+            },
             "top_drugs": self.top_drugs(limit=12),
         }
+
+    def _diagnosis_distribution(self, attribute: str) -> list[dict[str, Any]]:
+        visits = Counter()
+        patients: dict[str, set[str]] = defaultdict(set)
+        for visit in self.visits:
+            value = str(getattr(visit, attribute, "") or "").strip()
+            if not value:
+                continue
+            visits[value] += 1
+            patients[value].add(visit.patient_id)
+        return [
+            {"value": value, "visit_count": count, "patient_count": len(patients[value])}
+            for value, count in sorted(visits.items(), key=lambda item: (-item[1], item[0]))
+        ]
 
     def top_drugs(self, limit: int = 20) -> list[dict[str, Any]]:
         names = {}

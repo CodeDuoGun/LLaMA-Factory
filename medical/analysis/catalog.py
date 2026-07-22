@@ -24,6 +24,10 @@ from pathlib import Path
 from .engine import MedicalAnalysis
 
 
+DATASET_DIRECTORY_PREFIXES = ("online_", "zongyuan_")
+DOCTOR_NAME_ALIASES = {"wuweiping": "吴卫平"}
+
+
 @dataclass
 class DoctorSource:
     key: str
@@ -35,7 +39,7 @@ class DoctorSource:
 
 
 class DoctorCatalog:
-    """Dataset registry grouped by ``medical/data/online_<doctor>`` directory."""
+    """Dataset registry grouped by supported ``medical/data/<source>_<doctor>`` directories."""
 
     def __init__(self, sources: list[DoctorSource], default_doctor: str | None = None) -> None:
         if not sources:
@@ -57,20 +61,25 @@ class DoctorCatalog:
 
         root = Path(data_root).expanduser().resolve()
         sources = []
-        for directory in sorted(root.glob("online_*")):
-            if not directory.is_dir():
+        for directory in sorted(root.iterdir()):
+            if not directory.is_dir() or not directory.name.startswith(DATASET_DIRECTORY_PREFIXES):
                 continue
-            files = sorted(file for file in directory.glob("*.json") if file.is_file())
+            pattern = "*_record_????????.json" if directory.name.startswith("zongyuan_") else "*.json"
+            files = sorted(file for file in directory.glob(pattern) if file.is_file())
             if files:
                 sources.append(cls._source_from_files(directory, files))
         return cls(sources, default_doctor=default_doctor)
 
     @staticmethod
     def _source_from_files(directory: Path, files: list[Path]) -> DoctorSource:
-        key = directory.name.removeprefix("online_")
+        key = directory.name
+        for prefix in DATASET_DIRECTORY_PREFIXES:
+            if key.startswith(prefix):
+                key = key.removeprefix(prefix)
+                break
         metadata_file = next((file for file in files if "AI医生" in file.name), files[0])
         filename = metadata_file.stem
-        name = filename.split("_", 1)[0].strip() or key
+        name = DOCTOR_NAME_ALIASES.get(key, filename.split("_", 1)[0].strip() or key)
         doctor_id_match = re.search(r"_(\d+)_\d{14}$", filename)
         doctor_id = doctor_id_match.group(1) if doctor_id_match else ""
         return DoctorSource(key=key, name=name, doctor_id=doctor_id, files=files)

@@ -18,15 +18,40 @@ from pathlib import Path
 STATIC = Path(__file__).resolve().parents[1] / "static"
 
 
-def test_base_formula_view_has_navigation_filters_and_detail_region() -> None:
+def test_overview_has_western_tcm_disease_and_syndrome_distributions() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="western-diagnosis-chart"' in html
+    assert 'id="tcm-diagnosis-chart"' in html
+    assert 'id="syndrome-chart"' in html
+    assert 'id="overview-diagnosis-limit"' in html
+    assert '<option value="9" selected>前 9 项</option>' in html
+    assert '<option value="18">前 18 项</option>' in html
+    assert '<option value="all">全部</option>' in html
+    assert 'rows("diagnosis_illness")' in script
+    assert 'rows("diagnosis_sickness")' in script
+    assert 'rows("diagnosis_disease")' in script
+    assert "renderDiagnosisDistributions" in script
+
+
+def test_base_formula_view_has_dimensions_comparison_and_detail_regions() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
 
     assert 'data-view="base-formula"' in html
     assert 'id="view-base-formula"' in html
     assert 'id="base-formula-min-patients"' in html
     assert 'id="base-formula-eligible-only"' in html
-    assert 'id="base-formula-disease"' in html
-    assert 'id="base-formula-syndrome"' in html
+    assert 'value="diagnosis_illness"' in html
+    assert 'value="diagnosis_sickness"' in html
+    assert 'value="diagnosis_disease"' in html
+    assert 'value="is_first"' in html
+    assert 'value="disease_course" disabled' in html
+    assert 'value="etiology_pathogenesis" disabled' in html
+    assert 'id="base-formula-compare-button"' in html
+    assert 'id="base-formula-experiment-schemes"' in html
+    assert 'id="base-formula-add-scheme"' in html
+    assert 'id="base-formula-comparison-panel"' in html
     assert 'id="base-formula-cards"' in html
     assert 'id="base-formula-detail-panel"' in html
 
@@ -34,9 +59,14 @@ def test_base_formula_view_has_navigation_filters_and_detail_region() -> None:
 def test_base_formula_frontend_uses_lazy_directory_and_detail_queries() -> None:
     script = (STATIC / "app.js").read_text(encoding="utf-8")
 
-    assert "/api/base-formulas/strata?minimum_patients=" in script
-    assert "/api/base-formulas?${params}" in script
+    assert "/api/base-formulas/dimensions" in script
+    assert "/api/base-formulas/multidimensional/strata?${params}" in script
+    assert "/api/base-formulas/multidimensional?${params}" in script
     assert "slice(0, 6)" in script
+    assert "renderBaseFormulaComparison" in script
+    assert '[["diagnosis_illness"], ["diagnosis_illness", "diagnosis_sickness"]]' in script
+    assert "compareBaseFormulaSchemes" in script
+    assert "formula-experiment-results" in script
     assert 'if (view === "base-formula")' in script
     assert "baseFormulaVersion" in script
 
@@ -47,4 +77,7 @@ def test_base_formula_cards_have_responsive_styles() -> None:
     assert ".base-formula-grid" in styles
     assert ".base-formula-card" in styles
     assert ".formula-hero" in styles
+    assert ".formula-dimension-grid" in styles
+    assert ".base-formula-comparison-panel" in styles
+    assert ".formula-experiment-results" in styles
     assert "grid-template-columns: 1fr" in styles

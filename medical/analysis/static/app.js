@@ -14,7 +14,9 @@ const state = {
   selectedPatient: null,
   llmConfigured: null,
   baseFormulaVersion: 0,
-  baseFormula: { strata: null, results: {}, loading: new Set(), selected: null },
+  baseFormula: { metadata: null, strata: null, results: {}, loading: new Set(), selected: null, dimensions: ["diagnosis_illness", "diagnosis_disease"] },
+  formulaExperimentVersion: 0,
+  formulaExperimentSchemes: [["diagnosis_illness"], ["diagnosis_illness", "diagnosis_sickness"]],
 };
 const $ = (selector) => document.querySelector(selector);
 const number = new Intl.NumberFormat("zh-CN");
@@ -70,7 +72,7 @@ async function loadOverview() {
     metric("diagnosis_illness 病种", number.format(data.disease_count), "按字段原值统计，不做类别合并"),
     metric("前方保留率", percent(data.revisit_summary.median_retention), `相似度中位数 ${percent(data.revisit_summary.median_jaccard)}`),
   ].join("");
-  renderBars("#disease-chart", data.top_diseases.slice(0, 9), "disease", "visit_count");
+  renderDiagnosisDistributions();
   renderBars("#drug-chart", data.top_drugs.slice(0, 9), "drug_name", "visit_rate", (value) => percent(value, 0));
   const quality = [
     [data.quality.revisit_patients_without_prior_record, "复诊患者缺少此前记录，无法构造变化对"],
@@ -79,6 +81,17 @@ async function loadOverview() {
     [data.quality.unclassified_disease, "次问诊未能归入明确疾病"],
   ];
   $("#quality-list").innerHTML = quality.map(([value, label]) => `<div class="quality-item"><strong>${number.format(value)}</strong><span>${escapeHtml(label)}</span></div>`).join("");
+}
+
+function renderDiagnosisDistributions() {
+  if (!state.overview) return;
+  const selected = $("#overview-diagnosis-limit").value;
+  const rows = (field) => selected === "all"
+    ? state.overview.diagnosis_distributions[field]
+    : state.overview.diagnosis_distributions[field].slice(0, Number(selected));
+  renderBars("#western-diagnosis-chart", rows("diagnosis_illness"), "value", "visit_count");
+  renderBars("#tcm-diagnosis-chart", rows("diagnosis_sickness"), "value", "visit_count");
+  renderBars("#syndrome-chart", rows("diagnosis_disease"), "value", "visit_count");
 }
 
 async function loadDiseases() {
@@ -94,7 +107,7 @@ async function loadDiseases() {
   if (data.items.length) await loadDiseaseDetail(data.items[0].disease);
 }
 
-const formulaKey = (item) => encodeURIComponent(JSON.stringify([item.disease, item.syndrome_value ?? item.syndrome]));
+const formulaKey = (item) => encodeURIComponent(JSON.stringify(item.dimension_values));
 
 function formulaDrugTags(drugs, limit = 20) {
   if (!drugs?.length) return '<span class="muted">暂无候选药物</span>';
@@ -106,46 +119,9 @@ function supportBar(value) {
   return `<div class="support-track" aria-label="支持度 ${percent(value)}"><span style="width:${width}%"></span></div>`;
 }
 
-function baseFormulaFilters() {
-  return {
-    disease: $("#base-formula-disease").value,
-    syndrome: $("#base-formula-syndrome").value,
-    eligibleOnly: $("#base-formula-eligible-only").checked,
-  };
-}
-
 function filteredBaseFormulaStrata() {
   const items = state.baseFormula.strata?.items || [];
-  const filters = baseFormulaFilters();
-  return items.filter((item) => (
-    (!filters.disease || item.disease === filters.disease)
-    && (!filters.syndrome || item.syndrome === filters.syndrome)
-    && (!filters.eligibleOnly || item.status === "eligible")
-  ));
-}
-
-function updateBaseFormulaSyndromes() {
-  const selectedDisease = $("#base-formula-disease").value;
-  const current = $("#base-formula-syndrome").value;
-  const eligibleOnly = $("#base-formula-eligible-only").checked;
-  const syndromes = [...new Set((state.baseFormula.strata?.items || [])
-    .filter((item) => !eligibleOnly || item.status === "eligible")
-    .filter((item) => !selectedDisease || item.disease === selectedDisease)
-    .map((item) => item.syndrome))].sort((left, right) => left.localeCompare(right, "zh-CN"));
-  $("#base-formula-syndrome").innerHTML = `<option value="">全部证候</option>${syndromes.map((syndrome) => `<option value="${escapeHtml(syndrome)}">${escapeHtml(syndrome)}</option>`).join("")}`;
-  if (syndromes.includes(current)) $("#base-formula-syndrome").value = current;
-}
-
-function populateBaseFormulaFilters() {
-  const currentDisease = $("#base-formula-disease").value;
-  const eligibleOnly = $("#base-formula-eligible-only").checked;
-  const diseases = [...new Set((state.baseFormula.strata?.items || [])
-    .filter((item) => !eligibleOnly || item.status === "eligible")
-    .map((item) => item.disease))]
-    .sort((left, right) => left.localeCompare(right, "zh-CN"));
-  $("#base-formula-disease").innerHTML = `<option value="">全部疾病</option>${diseases.map((disease) => `<option value="${escapeHtml(disease)}">${escapeHtml(disease)}</option>`).join("")}`;
-  if (diseases.includes(currentDisease)) $("#base-formula-disease").value = currentDisease;
-  updateBaseFormulaSyndromes();
+  return items.filter((item) => !$("#base-formula-eligible-only").checked || item.status === "eligible");
 }
 
 function renderBaseFormulaMetrics() {
@@ -153,7 +129,7 @@ function renderBaseFormulaMetrics() {
   if (!data) return;
   const loaded = Object.values(state.baseFormula.results).filter((result) => result.status === "ready").length;
   $("#base-formula-metrics").innerHTML = [
-    metric("疾病—证候组合", number.format(data.stratum_count), "严格使用结构化证候字段"),
+    metric("维度组合观察组", number.format(data.stratum_count), data.dimensions.map((name) => data.dimension_labels[name]).join(" × ")),
     metric("可挖掘组合", number.format(data.eligible_count), `至少 ${data.minimum_patients} 位独立患者`),
     metric("样本不足", number.format(data.stratum_count - data.eligible_count), "保留目录，不推测基础方"),
     metric("已计算基础方", number.format(loaded), "相同参数结果由服务端缓存"),
@@ -180,8 +156,9 @@ function baseFormulaCard(item) {
   } else {
     content = `<div class="formula-card-empty">尚未计算候选基础方。</div>`;
   }
+  const dimensions = Object.entries(item.display_dimension_values).map(([name, value]) => `<span><small>${escapeHtml(state.baseFormula.strata.dimension_labels[name])}</small><strong>${escapeHtml(value)}</strong></span>`).join("");
   return `<article class="base-formula-card ${selected ? "is-selected" : ""} ${eligible ? "" : "is-insufficient"}">
-    <div class="formula-card-head"><div><p>${escapeHtml(item.syndrome)}</p><h3>${escapeHtml(item.disease)}</h3></div><span class="formula-status ${eligible ? "eligible" : ""}">${eligible ? "可挖掘" : "样本不足"}</span></div>
+    <div class="formula-card-head"><div class="formula-card-dimensions">${dimensions}</div><span class="formula-status ${eligible ? "eligible" : ""}">${eligible ? "可挖掘" : "样本不足"}</span></div>
     <div class="formula-card-counts"><span><strong>${number.format(item.patient_count)}</strong> 位患者</span><span><strong>${number.format(item.visit_count)}</strong> 次问诊</span></div>
     <div class="formula-card-body">${content}</div>
     ${eligible ? `<button type="button" class="formula-card-action" data-formula-key="${key}" ${loading ? "disabled" : ""}>${representative ? "查看完整方型" : loading ? "计算中…" : "计算候选基础方"}</button>` : ""}
@@ -193,7 +170,7 @@ function renderBaseFormulaCards() {
   $("#base-formula-list-note").textContent = `当前显示 ${items.length} 个组合；自动计算患者数最多的前 6 个可挖掘组合。`;
   $("#base-formula-cards").innerHTML = items.length
     ? items.map(baseFormulaCard).join("")
-    : '<div class="panel empty-analysis formula-empty">当前筛选条件下没有疾病—证候组合</div>';
+    : '<div class="panel empty-analysis formula-empty">当前维度组合下没有可展示的观察组</div>';
   const visibleKeys = new Set(items.map(formulaKey));
   if (state.baseFormula.selected && !visibleKeys.has(state.baseFormula.selected)) {
     state.baseFormula.selected = null;
@@ -211,11 +188,12 @@ function renderBaseFormulaDetail(item, response) {
   const components = report.latent_base_formulas.components || [];
   const frequent = (report.frequent_drugs || []).slice(0, 14);
   const alternatives = (report.candidate_base_formulas || [])
-    .filter((candidate) => candidate.drugs.join("|") !== representative.drugs.join("|"))
+    .filter((candidate) => candidate.drugs.join("|") !== (representative?.drugs || []).join("|"))
     .slice(0, 8);
   $("#base-formula-detail-panel").hidden = false;
-  $("#base-formula-detail-title").textContent = `${item.disease} · ${item.syndrome}`;
+  $("#base-formula-detail-title").textContent = item.label;
   $("#base-formula-detail-meta").textContent = `${item.patient_count} 位患者 · ${item.visit_count} 次问诊`;
+  if (!representative) { $("#base-formula-detail").innerHTML = '<div class="empty-analysis">当前支持度阈值下没有候选基础方。</div>'; return; }
   $("#base-formula-detail").innerHTML = `<section class="formula-hero">
       <div><p class="formula-detail-label">代表性经验候选药组 · ${representative.length} 味</p>${formulaDrugTags(representative.drugs)}</div>
       <div class="formula-score"><strong>${percent(representative.support)}</strong><span>患者加权支持度</span><small>95% CI ${percent(representative.support_ci_low)}–${percent(representative.support_ci_high)}</small></div>
@@ -244,8 +222,6 @@ async function loadBaseFormulaDetail(item, showDetail = false) {
   state.baseFormula.loading.add(key);
   renderBaseFormulaCards();
   const params = new URLSearchParams({
-    disease: item.disease,
-    syndrome: item.syndrome_value,
     minimum_patients: $("#base-formula-min-patients").value,
     minimum_support: "0.3",
     maximum_pattern_length: "20",
@@ -253,8 +229,9 @@ async function loadBaseFormulaDetail(item, showDetail = false) {
     component_count: "3",
     bootstrap_rounds: "500",
   });
+  Object.entries(item.dimension_values).forEach(([name, value]) => params.set(name, value));
   try {
-    const response = await api(`/api/base-formulas?${params}`);
+    const response = await api(`/api/base-formulas/multidimensional?${params}`);
     if (state.doctor !== requestedDoctor || state.baseFormulaVersion !== requestVersion) return null;
     state.baseFormula.results[key] = response;
     if (showDetail && response.status === "ready") {
@@ -271,6 +248,78 @@ async function loadBaseFormulaDetail(item, showDetail = false) {
   }
 }
 
+const formulaExperimentDimensions = [
+  ["diagnosis_illness", "西医诊断"],
+  ["diagnosis_sickness", "中医诊断"],
+  ["diagnosis_disease", "中医证候"],
+  ["is_first", "初诊/复诊"],
+];
+
+function renderFormulaExperimentSchemes() {
+  $("#base-formula-experiment-schemes").innerHTML = state.formulaExperimentSchemes.map((scheme, index) => `
+    <section class="formula-experiment-scheme">
+      <div class="formula-experiment-scheme-head"><strong>对照组 ${String.fromCharCode(65 + index)}</strong>${state.formulaExperimentSchemes.length > 2 ? `<button type="button" data-remove-formula-scheme="${index}" aria-label="删除对照组 ${String.fromCharCode(65 + index)}">删除</button>` : ""}</div>
+      <p>选择该组采用的分析维度</p>
+      <div class="formula-experiment-dimensions">${formulaExperimentDimensions.map(([name, label]) => `<label><input type="checkbox" data-formula-scheme="${index}" value="${name}" ${scheme.includes(name) ? "checked" : ""} />${label}<small>${name}</small></label>`).join("")}</div>
+    </section>`).join("");
+  document.querySelectorAll("[data-formula-scheme]").forEach((input) => input.addEventListener("change", () => {
+    const index = Number(input.dataset.formulaScheme);
+    state.formulaExperimentSchemes[index] = [...document.querySelectorAll(`[data-formula-scheme="${index}"]:checked`)].map((item) => item.value);
+  }));
+  document.querySelectorAll("[data-remove-formula-scheme]").forEach((button) => button.addEventListener("click", () => {
+    state.formulaExperimentSchemes.splice(Number(button.dataset.removeFormulaScheme), 1);
+    renderFormulaExperimentSchemes();
+  }));
+  $("#base-formula-add-scheme").disabled = state.formulaExperimentSchemes.length >= 4;
+}
+
+async function loadFormulaExperimentScheme(dimensions) {
+  const minimumPatients = $("#base-formula-min-patients").value;
+  const strataParams = new URLSearchParams({dimensions: dimensions.join(","), minimum_patients: minimumPatients});
+  const strata = await api(`/api/base-formulas/multidimensional/strata?${strataParams}`);
+  const topStrata = strata.items.filter((item) => item.status === "eligible").slice(0, 2);
+  const results = await Promise.all(topStrata.map(async (item) => {
+    const params = new URLSearchParams({minimum_patients: minimumPatients, minimum_support: "0.4", maximum_pattern_length: "10", pattern_limit: "20", component_count: "2", bootstrap_rounds: "100"});
+    Object.entries(item.dimension_values).forEach(([name, value]) => params.set(name, value));
+    return {item, response: await api(`/api/base-formulas/multidimensional?${params}`)};
+  }));
+  return {dimensions, strata, results};
+}
+
+function renderBaseFormulaComparison(schemes) {
+  $("#base-formula-comparison").innerHTML = `<div class="formula-experiment-results" style="--experiment-columns:${schemes.length}">${schemes.map((scheme, index) => `
+    <section class="formula-experiment-result">
+      <div class="formula-experiment-result-head"><span>对照组 ${String.fromCharCode(65 + index)}</span><strong>${scheme.dimensions.map((name) => scheme.strata.dimension_labels[name]).join(" × ")}</strong></div>
+      <div class="formula-experiment-selected">${scheme.dimensions.map((name) => `<span>${escapeHtml(scheme.strata.dimension_labels[name])}<small>${name}</small></span>`).join("")}</div>
+      <div class="formula-experiment-metrics"><div><strong>${number.format(scheme.strata.stratum_count)}</strong><span>维度值组合</span></div><div><strong>${number.format(scheme.strata.eligible_count)}</strong><span>可分析组合</span></div></div>
+      <div class="formula-experiment-formulas"><h4>患者数最多的基础方结果</h4>${scheme.results.length ? scheme.results.map(({item, response}) => {
+        const representative = response.base_formula?.representative_base_formula;
+        return `<article><p>${escapeHtml(item.label)}</p><small>${item.patient_count} 位患者 · ${item.visit_count} 次问诊</small>${representative ? `${formulaDrugTags(representative.drugs, 15)}<div class="formula-experiment-support">患者加权支持度 <strong>${percent(representative.support)}</strong></div>` : '<div class="muted">当前阈值下无候选基础方</div>'}</article>`;
+      }).join("") : '<div class="empty-analysis">当前方案没有达到患者数阈值的组合</div>'}</div>
+    </section>`).join("")}</div>`;
+}
+
+async function compareBaseFormulaSchemes() {
+  if (state.formulaExperimentSchemes.some((scheme) => !scheme.length)) throw new Error("每个对照组至少需要选择一个维度。");
+  const signatures = state.formulaExperimentSchemes.map((scheme) => [...scheme].sort().join("|"));
+  if (new Set(signatures).size !== signatures.length) throw new Error("对照组的维度方案不能完全相同。");
+  const version = ++state.formulaExperimentVersion;
+  const button = $("#base-formula-compare-button");
+  button.disabled = true;
+  button.textContent = "正在对比…";
+  $("#base-formula-comparison").innerHTML = '<div class="empty-analysis">正在并行计算各维度方案的基础方结果…</div>';
+  try {
+    const schemes = await Promise.all(state.formulaExperimentSchemes.map(loadFormulaExperimentScheme));
+    if (version === state.formulaExperimentVersion) renderBaseFormulaComparison(schemes);
+  } finally {
+    if (version === state.formulaExperimentVersion) { button.disabled = false; button.textContent = "开始对比"; }
+  }
+}
+
+function selectedFormulaDimensions() {
+  return [...document.querySelectorAll("#base-formula-dimensions input:checked")].map((input) => input.value);
+}
+
 async function loadBaseFormulaStrata(force = false) {
   if (state.baseFormula.strata && !force) {
     renderBaseFormulaMetrics();
@@ -279,15 +328,19 @@ async function loadBaseFormulaStrata(force = false) {
   }
   const requestedDoctor = state.doctor;
   const requestVersion = ++state.baseFormulaVersion;
-  state.baseFormula = { strata: null, results: {}, loading: new Set(), selected: null };
+  const dimensions = selectedFormulaDimensions();
+  if (!dimensions.length) throw new Error("请至少选择一个分析维度。");
+  state.baseFormula = { metadata: state.baseFormula.metadata, strata: null, results: {}, loading: new Set(), selected: null, dimensions };
   $("#base-formula-detail-panel").hidden = true;
-  $("#base-formula-metrics").innerHTML = metric("正在读取", "…", "疾病—证候分层目录");
-  $("#base-formula-cards").innerHTML = '<div class="panel empty-analysis formula-empty">正在载入疾病—证候组合…</div>';
+  $("#base-formula-metrics").innerHTML = metric("正在读取", "…", "多维观察组目录");
+  $("#base-formula-cards").innerHTML = '<div class="panel empty-analysis formula-empty">正在载入多维观察组…</div>';
   const minimumPatients = $("#base-formula-min-patients").value;
-  const data = await api(`/api/base-formulas/strata?minimum_patients=${minimumPatients}`);
+  const params = new URLSearchParams({ dimensions: dimensions.join(","), minimum_patients: minimumPatients });
+  const [metadata, data] = await Promise.all([api("/api/base-formulas/dimensions"), api(`/api/base-formulas/multidimensional/strata?${params}`)]);
   if (state.doctor !== requestedDoctor || state.baseFormulaVersion !== requestVersion) return;
+  state.baseFormula.metadata = metadata;
   state.baseFormula.strata = data;
-  populateBaseFormulaFilters();
+  $("#base-formula-dimension-summary").textContent = `当前：${dimensions.map((name) => data.dimension_labels[name]).join(" × ")}`;
   renderBaseFormulaMetrics();
   renderBaseFormulaCards();
   const preload = data.items.filter((item) => item.status === "eligible").slice(0, 6);
@@ -477,7 +530,7 @@ async function loadDoctor(doctorKey) {
   state.doctor = doctorKey;
   state.selectedPatient = null;
   state.baseFormulaVersion += 1;
-  state.baseFormula = { strata: null, results: {}, loading: new Set(), selected: null };
+  state.baseFormula = { metadata: null, strata: null, results: {}, loading: new Set(), selected: null, dimensions: selectedFormulaDimensions() };
   select.disabled = true;
   $(".status-dot").classList.remove("ready");
   $("#source-status").textContent = "正在切换医生数据";
@@ -519,16 +572,20 @@ function switchView(view) {
 function bindEvents() {
   document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => switchView(tab.dataset.view)));
   $("#disease-select").addEventListener("change", (event) => loadDiseaseDetail(event.target.value).catch(showError));
+  $("#overview-diagnosis-limit").addEventListener("change", renderDiagnosisDistributions);
   $("#base-formula-min-patients").addEventListener("change", () => loadBaseFormulaStrata(true).catch(showError));
-  $("#base-formula-eligible-only").addEventListener("change", () => {
-    populateBaseFormulaFilters();
-    renderBaseFormulaCards();
+  $("#base-formula-eligible-only").addEventListener("change", renderBaseFormulaCards);
+  $("#base-formula-apply-dimensions").addEventListener("click", () => loadBaseFormulaStrata(true).catch(showError));
+  $("#base-formula-open-comparison").addEventListener("click", () => {
+    $("#base-formula-comparison-panel").hidden = false;
+    renderFormulaExperimentSchemes();
+    $("#base-formula-comparison-panel").scrollIntoView({behavior: "smooth", block: "start"});
   });
-  $("#base-formula-disease").addEventListener("change", () => {
-    updateBaseFormulaSyndromes();
-    renderBaseFormulaCards();
+  $("#base-formula-add-scheme").addEventListener("click", () => {
+    if (state.formulaExperimentSchemes.length < 4) state.formulaExperimentSchemes.push(["diagnosis_illness"]);
+    renderFormulaExperimentSchemes();
   });
-  $("#base-formula-syndrome").addEventListener("change", renderBaseFormulaCards);
+  $("#base-formula-compare-button").addEventListener("click", () => compareBaseFormulaSchemes().catch(showError));
   $("#revisit-disease").addEventListener("change", () => loadRevisits().catch(showError));
   $("#revisit-symptom").addEventListener("change", () => loadRevisits().catch(showError));
   $("#revisit-outcome").addEventListener("change", () => loadRevisits().catch(showError));

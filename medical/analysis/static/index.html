@@ -49,32 +49,51 @@ You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2
             <p class="section-kicker">DATA PULSE</p>
             <h2 id="overview-title">数据全景</h2>
           </div>
-          <p id="overview-note" class="section-note"></p>
+          <div class="overview-heading-controls">
+            <p id="overview-note" class="section-note"></p>
+            <label class="control-label">诊断分布展示数量
+              <select id="overview-diagnosis-limit">
+                <option value="9" selected>前 9 项</option>
+                <option value="18">前 18 项</option>
+                <option value="all">全部</option>
+              </select>
+            </label>
+          </div>
         </div>
         <div id="overview-metrics" class="metric-grid skeleton-grid" aria-live="polite"></div>
-        <div class="two-column">
+        <div class="three-column overview-diagnosis-grid">
           <article class="panel">
             <div class="panel-heading">
-              <h3>主要疾病分布</h3>
-              <span>按问诊次数</span>
+              <h3>西医诊断分布</h3>
+              <span>diagnosis_illness</span>
             </div>
-            <div id="disease-chart" class="bar-chart" aria-label="主要疾病分布图"></div>
+            <div id="western-diagnosis-chart" class="bar-chart" aria-label="西医诊断分布图"></div>
           </article>
           <article class="panel">
             <div class="panel-heading">
-              <h3>内服方高频药物</h3>
-              <span>按就诊覆盖率</span>
+              <h3>中医诊断分布</h3>
+              <span>diagnosis_sickness</span>
             </div>
-            <div id="drug-chart" class="bar-chart" aria-label="高频药物分布图"></div>
+            <div id="tcm-diagnosis-chart" class="bar-chart" aria-label="中医诊断分布图"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading">
+              <h3>中医证候分布</h3>
+              <span>diagnosis_disease</span>
+            </div>
+            <div id="syndrome-chart" class="bar-chart" aria-label="中医证候分布图"></div>
           </article>
         </div>
-        <article class="panel quality-panel">
-          <div class="panel-heading">
-            <h3>分析边界与数据质量</h3>
-            <span>进入关联分析前需关注</span>
-          </div>
-          <div id="quality-list" class="quality-grid"></div>
-        </article>
+        <div class="two-column overview-secondary-grid">
+          <article class="panel">
+            <div class="panel-heading"><h3>内服方高频药物</h3><span>按就诊覆盖率</span></div>
+            <div id="drug-chart" class="bar-chart" aria-label="高频药物分布图"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><h3>分析边界与数据质量</h3><span>进入关联分析前需关注</span></div>
+            <div id="quality-list" class="quality-grid overview-quality-grid"></div>
+          </article>
+        </div>
       </section>
 
       <section id="view-disease" class="view" aria-labelledby="disease-title" hidden>
@@ -129,8 +148,8 @@ You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2
       <section id="view-base-formula" class="view" aria-labelledby="base-formula-title" hidden>
         <div class="section-heading with-controls">
           <div>
-            <p class="section-kicker">DISEASE × SYNDROME × BASE FORMULA</p>
-            <h2 id="base-formula-title">基础方图谱</h2>
+            <p class="section-kicker">MULTIDIMENSIONAL BASE FORMULA ANALYSIS</p>
+            <h2 id="base-formula-title">多维基础方图谱</h2>
           </div>
           <div class="filter-row">
             <label class="control-label">最低独立患者数
@@ -147,19 +166,34 @@ You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2
         <div id="base-formula-metrics" class="metric-grid compact" aria-live="polite"></div>
         <article class="panel formula-filter-panel">
           <div class="panel-heading">
-            <h3>疾病—证候筛选</h3>
-            <span>基础方按独立患者加权，避免高频复诊患者支配结果</span>
+            <h3>分析维度</h3>
+            <span>选择一个或多个维度，按字段原值组成观察组</span>
           </div>
-          <div class="filter-row formula-filter-row">
-            <label class="control-label">疾病<select id="base-formula-disease"><option value="">全部疾病</option></select></label>
-            <label class="control-label">证候<select id="base-formula-syndrome"><option value="">全部证候</option></select></label>
+          <div id="base-formula-dimensions" class="formula-dimension-grid">
+            <label class="formula-dimension"><input type="checkbox" value="diagnosis_illness" checked /><span><strong>西医诊断</strong><small>diagnosis_illness</small></span></label>
+            <label class="formula-dimension"><input type="checkbox" value="diagnosis_sickness" /><span><strong>中医诊断</strong><small>diagnosis_sickness</small></span></label>
+            <label class="formula-dimension"><input type="checkbox" value="diagnosis_disease" checked /><span><strong>中医证候</strong><small>diagnosis_disease</small></span></label>
+            <label class="formula-dimension"><input type="checkbox" value="is_first" /><span><strong>初诊 / 复诊</strong><small>is_first</small></span></label>
+            <label class="formula-dimension is-disabled"><input type="checkbox" value="disease_course" disabled /><span><strong>病程</strong><small>暂无结构化数据</small></span></label>
+            <label class="formula-dimension is-disabled"><input type="checkbox" value="etiology_pathogenesis" disabled /><span><strong>病因病机</strong><small>暂无结构化数据</small></span></label>
           </div>
+          <div class="formula-dimension-actions"><p id="base-formula-dimension-summary">当前：西医诊断 × 中医证候</p><button id="base-formula-apply-dimensions" type="button" class="primary-button">应用维度组合</button></div>
         </article>
         <div class="formula-section-heading">
           <div><h3>可能的基础方</h3><p id="base-formula-list-note">选择组合查看完整挖掘结果</p></div>
           <span class="formula-legend"><i></i>支持度表示患者内平均处方覆盖率</span>
         </div>
         <div id="base-formula-cards" class="base-formula-grid" aria-live="polite"></div>
+        <article id="base-formula-comparison-panel" class="panel base-formula-comparison-panel" hidden>
+          <div class="panel-heading"><div><h3>维度方案对照实验</h3><span>比较不同维度划分方式得到的组合数量和基础方结果</span></div></div>
+          <div id="base-formula-experiment-schemes" class="formula-experiment-schemes"></div>
+          <div class="formula-experiment-actions">
+            <button id="base-formula-add-scheme" type="button" class="secondary-button">增加对照方案</button>
+            <button id="base-formula-compare-button" type="button" class="primary-button">开始对比</button>
+          </div>
+          <div id="base-formula-comparison"></div>
+        </article>
+        <button id="base-formula-open-comparison" type="button" class="formula-open-comparison">配置维度方案对照实验</button>
         <article id="base-formula-detail-panel" class="panel base-formula-detail-panel" hidden>
           <div class="panel-heading">
             <h3 id="base-formula-detail-title">基础方详情</h3>
