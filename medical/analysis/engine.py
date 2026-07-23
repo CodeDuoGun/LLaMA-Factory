@@ -218,6 +218,7 @@ class Visit:
     external_rx_count: int
     process_types: list[str]
     treatment_days: int | None
+    prescriptions: list[dict[str, Any]]
 
 
 class MedicalAnalysis:
@@ -297,6 +298,34 @@ class MedicalAnalysis:
             drugs[drug_id] = Drug(drug_id, name, dose, _clean(item.get("unit_name")))
         return drugs, len(internal), external_count, sorted(set(processes)), max(days) if days else None
 
+    @staticmethod
+    def _timeline_prescriptions(record: dict[str, Any]) -> list[dict[str, Any]]:
+        prescriptions = []
+        for prescription in record.get("ps") or []:
+            drugs = []
+            for item in (prescription.get("prescription_items") or {}).get("drugList") or []:
+                drug_id = str(item.get("drug_id") or _clean(item.get("drug_name") or item.get("show_name")))
+                name = _clean(item.get("drug_name") or item.get("show_name") or item.get("sub_drug_name"))
+                if not drug_id and not name:
+                    continue
+                drugs.append(
+                    {
+                        "drug_id": drug_id,
+                        "drug_name": name,
+                        "dose": _safe_float(item.get("drug_weight", item.get("drug_num"))),
+                        "unit": _clean(item.get("unit_name")),
+                    }
+                )
+            prescriptions.append(
+                {
+                    "usage_type": _clean(prescription.get("usage_type")),
+                    "process_type": _clean(prescription.get("drug_process_name")),
+                    "drug_count": len(drugs),
+                    "drugs": drugs,
+                }
+            )
+        return prescriptions
+
     def _build_visit(self, record: dict[str, Any]) -> Visit:
         history = str(record.get("new_medical_history") or "").strip()
         appeal = _clean(record.get("patient_appeal"))
@@ -329,6 +358,7 @@ class MedicalAnalysis:
             external_rx_count=external_count,
             process_types=processes,
             treatment_days=days,
+            prescriptions=self._timeline_prescriptions(record),
         )
 
     @staticmethod
@@ -816,6 +846,7 @@ class MedicalAnalysis:
                         {"drug_id": drug.drug_id, "drug_name": drug.name, "dose": drug.dose, "unit": drug.unit}
                         for drug in sorted(visit.internal_drugs.values(), key=lambda item: item.name)
                     ],
+                    "prescriptions": visit.prescriptions,
                     "change": change,
                 }
             )

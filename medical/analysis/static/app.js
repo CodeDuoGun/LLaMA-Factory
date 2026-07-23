@@ -486,11 +486,23 @@ function changeLine(label, items) {
 }
 
 function prescriptionDetails(drugs) {
-  if (!drugs?.length) return "未记录内服处方";
+  if (!drugs?.length) return "未记录处方明细";
   return drugs.map((drug) => {
     const dose = drug.dose == null ? "" : drug.dose;
     return `${escapeHtml(drug.drug_name)}${escapeHtml(dose)}${escapeHtml(drug.unit)}`;
   }).join("、");
+}
+
+function timelinePrescriptions(prescriptions) {
+  if (!prescriptions?.length) return '<div class="timeline-prescription"><strong>本次处方明细：</strong>未记录处方</div>';
+  return `<div class="timeline-prescriptions">${prescriptions.map((prescription, index) => {
+    const usageType = prescription.usage_type || "类型未知";
+    const processType = prescription.process_type ? ` · ${escapeHtml(prescription.process_type)}` : "";
+    return `<div class="timeline-prescription">
+      <strong>处方 ${index + 1} <span class="usage-type">${escapeHtml(usageType)}</span>${processType}：</strong>
+      ${prescriptionDetails(prescription.drugs)}
+    </div>`;
+  }).join("")}</div>`;
 }
 
 async function openPatient(patientKey) {
@@ -506,9 +518,9 @@ async function openPatient(patientKey) {
     const change = visit.change ? `<div class="change-block">${changeLine("新增", visit.change.added)}${changeLine("停用", visit.change.removed)}${changeLine("剂量", dose)}<p>处方相似度 ${percent(visit.change.jaccard, 0)}，保留率 ${percent(visit.change.retention, 0)}</p></div>` : "";
     return `<section class="timeline-item"><div class="timeline-date">${escapeHtml(visit.date)} · ${escapeHtml(visit.is_first)}</div>
       <div class="timeline-title">${escapeHtml(visit.raw_diagnosis || visit.disease)}</div>
-      <div class="timeline-meta-row"><span>反馈：${escapeHtml(visit.outcome)}</span><span>内服 ${visit.drug_count} 味</span><span>${escapeHtml(visit.process_types.join("、") || "剂型未知")}</span></div>
+      <div class="timeline-meta-row"><span>反馈：${escapeHtml(visit.outcome)}</span><span>共 ${visit.prescriptions?.length || 0} 张处方</span></div>
       <div class="timeline-history"><strong>本次症状与病情：</strong>${escapeHtml(visit.new_medical_history || "未记录")}</div>
-      <div class="timeline-prescription"><strong>本次处方明细：</strong>${prescriptionDetails(visit.drugs)}</div>${change}</section>`;
+      ${timelinePrescriptions(visit.prescriptions)}${change}</section>`;
   }).join("");
   await loadPatientList(patientKey);
 }

@@ -287,8 +287,11 @@ tbody tr:hover { background: rgb(29 107 80 / 5%); }
 .timeline-meta-row { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--muted); font-size: 12px; }
 .timeline-history { margin-top: 9px; color: var(--ink); font-size: 13px; line-height: 1.75; white-space: pre-line; }
 .timeline-history strong { font-weight: 600; }
+.timeline-prescriptions { display: grid; gap: 5px; margin-top: 7px; }
 .timeline-prescription { margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.timeline-prescriptions .timeline-prescription { margin-top: 0; }
 .timeline-prescription strong { color: var(--ink); font-weight: 600; }
+.usage-type { display: inline-block; padding: 0 6px; border-radius: 999px; background: var(--green-soft); color: var(--green); font-size: 11px; line-height: 20px; }
 .change-block { margin-top: 10px; border-left: 2px solid var(--green); padding-left: 10px; color: var(--muted); font-size: 12px; }
 .change-block p { margin-bottom: 5px; }
 .empty-state { place-items: center; min-height: 300px; color: var(--muted); text-align: center; }

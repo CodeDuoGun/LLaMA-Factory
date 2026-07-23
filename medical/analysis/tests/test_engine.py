@@ -85,6 +85,34 @@ def test_longitudinal_difference_uses_patient_id() -> None:
     assert timeline["timeline"][1]["new_medical_history"] == "药后乏力减轻，大便偏干"
 
 
+def test_patient_timeline_returns_all_prescriptions_with_usage_type() -> None:
+    record = _record(1, "2026-01-01 09:00:00", "初诊", [_drug(1, "黄芪", 20)], "乏力")
+    record["ps"].extend(
+        [
+            {
+                "usage_type": "外用",
+                "drug_process_name": "散剂",
+                "prescription_items": {"drugList": [_drug(2, "炉甘石", 30)]},
+            },
+            {
+                "usage_type": "代茶饮",
+                "drug_process_name": "饮片",
+                "prescription_items": {"drugList": [_drug(3, "菊花", 6)]},
+            },
+        ]
+    )
+
+    visit = MedicalAnalysis([record]).patient_timeline("10086")["timeline"][0]
+
+    assert [prescription["usage_type"] for prescription in visit["prescriptions"]] == ["内服", "外用", "代茶饮"]
+    assert [prescription["drugs"][0]["drug_name"] for prescription in visit["prescriptions"]] == [
+        "黄芪",
+        "炉甘石",
+        "菊花",
+    ]
+    assert visit["drugs"][0]["drug_name"] == "黄芪"
+
+
 def test_symptom_drug_association_support() -> None:
     records = []
     for patient_id in range(4):
