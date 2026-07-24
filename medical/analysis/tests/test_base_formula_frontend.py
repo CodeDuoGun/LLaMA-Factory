@@ -21,6 +21,7 @@ STATIC = Path(__file__).resolve().parents[1] / "static"
 def test_overview_has_western_tcm_disease_and_syndrome_distributions() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     script = (STATIC / "app.js").read_text(encoding="utf-8")
+    styles = (STATIC / "styles.css").read_text(encoding="utf-8")
 
     assert 'id="western-diagnosis-chart"' in html
     assert 'id="tcm-diagnosis-chart"' in html
@@ -33,6 +34,9 @@ def test_overview_has_western_tcm_disease_and_syndrome_distributions() -> None:
     assert 'rows("diagnosis_sickness")' in script
     assert 'rows("diagnosis_disease")' in script
     assert "renderDiagnosisDistributions" in script
+    assert ".overview-diagnosis-grid .bar-label" in styles
+    assert "white-space: pre-line" in styles
+    assert "text-overflow: clip" in styles
 
 
 def test_base_formula_view_has_dimensions_comparison_and_detail_regions() -> None:

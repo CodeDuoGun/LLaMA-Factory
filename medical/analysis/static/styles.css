@@ -115,7 +115,14 @@ select:focus, input:focus, button:focus-visible { outline: 3px solid rgb(29 107 
 .empty-analysis { min-height: 100px; place-items: center; color: var(--muted); font-size: 12px; text-align: center; }
 .quality-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; }
 .overview-diagnosis-grid { align-items: start; }
-.overview-diagnosis-grid .bar-row { grid-template-columns: minmax(72px, 105px) 1fr 42px; }
+.overview-diagnosis-grid .bar-row { grid-template-columns: minmax(0, 1fr) 42px; row-gap: 5px; }
+.overview-diagnosis-grid .bar-label {
+  grid-column: 1 / -1;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: pre-line;
+}
 .overview-secondary-grid { align-items: stretch; }
 .overview-quality-grid { grid-template-columns: repeat(2, 1fr); }
 .quality-item { border-left: 2px solid var(--orange); padding-left: 14px; }
