@@ -7,6 +7,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from medical.data_utils.config import config
 from medical.data_utils.log import logger
+from medical.data_utils.audio.audio_db_schema import AudioLable
 
 # 创建数据库引擎
 engine = create_engine(
@@ -30,7 +31,6 @@ def get_db():
 
 def check_audio_file_exists(audio_file: str) -> bool:
     """检查 audio_file 字段是否已存在记录"""
-    from medical.data_utils.audio_db_schema import AudioLable
     db = SessionLocal()
     try:
         return db.query(AudioLable).filter(AudioLable.audio_file == audio_file).first() is not None
@@ -40,7 +40,6 @@ def check_audio_file_exists(audio_file: str) -> bool:
 
 def insert_audio_label(audio_file: str, aduio_json: dict = None) -> bool:
     """向 audio_lable 表插入一条记录，返回是否成功"""
-    from medical.data_utils.audio_db_schema import AudioLable
     db = SessionLocal()
     try:
         record = AudioLable(audio_file=audio_file, aduio_json=aduio_json or {})
