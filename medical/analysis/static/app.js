@@ -69,7 +69,7 @@ async function loadOverview() {
     metric("问诊记录", number.format(data.records), `${data.first_visits} 初诊 · ${data.revisits} 复诊`),
     metric("患者", number.format(data.patients), `${data.multi_visit_patients} 位有多次就诊`),
     metric("内服方就诊", number.format(data.internal_visits), `${data.external_only_visits} 次仅外用处方`),
-    metric("diagnosis_illness 病种", number.format(data.disease_count), "按字段原值统计，不做类别合并"),
+    metric("diagnosis_illness 病种", number.format(data.disease_count), "按规范化值统计，不做类别合并"),
     metric("前方保留率", percent(data.revisit_summary.median_retention), `相似度中位数 ${percent(data.revisit_summary.median_jaccard)}`),
   ].join("");
   renderDiagnosisDistributions();

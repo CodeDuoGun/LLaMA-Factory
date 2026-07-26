@@ -87,10 +87,62 @@ NEGATION_PREFIXES = ("无", "未见", "没有", "否认", "不伴", "未", "不"
 IMPROVED_WORDS = ("好转", "改善", "减轻", "缓解", "消失", "恢复", "感觉良好", "较前好")
 WORSE_WORDS = ("加重", "恶化", "进展", "增多", "明显", "较前差", "新发")
 STABLE_WORDS = ("稳定", "同前", "无明显变化", "控制尚可", "一般")
+DIAGNOSIS_TERM_ALIASES = {
+    "咳嗽病": "咳嗽",
+    "肝气郁结": "肝气郁结证",
+    "肝气不舒": "肝气不舒证",
+    "肺结节" + "病": "肺结节",
+    "间质性肺纤维化": "间质肺纤维化",
+    "痰瘀阻肺": "痰瘀阻肺证",
+    "瘿瘤病": "瘿瘤",
+}
+COMPOUND_DIAGNOSIS_TERMS = (
+    "痰瘀阻肺证",
+    "肝气郁结证",
+    "肝气郁结",
+    "肝气不舒证",
+    "肝脾不和证",
+    "痰瘀阻肺",
+    "肝气不舒",
+)
 
 
 def _clean(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _normalize_diagnosis_part(value: str) -> str:
+    part = re.sub(r"\s+", "", value).strip()
+    return DIAGNOSIS_TERM_ALIASES.get(part, part)
+
+
+def _split_compound_diagnosis_part(value: str) -> list[str]:
+    part = _normalize_diagnosis_part(value)
+    if not part:
+        return []
+    terms = sorted(COMPOUND_DIAGNOSIS_TERMS, key=len, reverse=True)
+    items = []
+    index = 0
+    while index < len(part):
+        matched = next((term for term in terms if part.startswith(term, index)), "")
+        if not matched:
+            return [part]
+        items.append(_normalize_diagnosis_part(matched))
+        index += len(matched)
+    return items
+
+
+def normalize_diagnosis_value(value: Any) -> str:
+    """Normalize multi-item diagnosis fields without merging distinct concepts."""
+    text = _clean(value)
+    if not text:
+        return ""
+    parts = []
+    for part in re.split(r"[、，,；;：:／/|｜·+＋&＆\s]+", text):
+        parts.extend(_split_compound_diagnosis_part(part))
+    if not parts:
+        return ""
+    return "、".join(sorted(set(parts)))
 
 
 def _safe_float(value: Any) -> float | None:
@@ -330,7 +382,9 @@ class MedicalAnalysis:
         history = str(record.get("new_medical_history") or "").strip()
         appeal = _clean(record.get("patient_appeal"))
         summary = _clean(record.get("doc_ass_stu_appeal"))
-        diagnosis = _clean(record.get("diagnosis_illness", ""))
+        diagnosis = normalize_diagnosis_value(record.get("diagnosis_illness", ""))
+        tcm_disease = normalize_diagnosis_value(record.get("diagnosis_sickness"))
+        syndrome = normalize_diagnosis_value(record.get("diagnosis_disease"))
         drugs, internal_count, external_count, processes, days = self._main_internal_prescription(record)
         return Visit(
             visit_id=int(record.get("id") or 0),
@@ -338,12 +392,12 @@ class MedicalAnalysis:
             date=_date(record),
             is_first=_clean(record.get("is_first")),
             disease=diagnosis or "未明确",
-            tcm_disease=_clean(record.get("diagnosis_sickness")),
+            tcm_disease=tcm_disease,
             raw_diagnosis=diagnosis,
             attributes=diagnosis_attributes("。".join((diagnosis, history))),
             # diagnosis_disease stores the structured syndrome/pattern; diagnosis_sickness is a TCM disease name
             # and must not be used as a fallback when grouping disease-syndrome strata.
-            syndrome=_clean(record.get("diagnosis_disease")),
+            syndrome=syndrome,
             symptoms=extract_symptoms("。".join((appeal, summary, history))),
             new_medical_history=history,
             sex=_clean(record.get("patient_sex")),

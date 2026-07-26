@@ -29,11 +29,14 @@ KEEP_FIELDS = [
     "order_sn",
     "is_first",
     "inquiry_method",
+    "doctor_id",
+    "doctor_name",
     "user_info_id",
     "patient_id",
     "patient_name",
     "patient_sex",
     "patient_age",
+    "patient_appeal",
     "doc_ass_stu_appeal",
     "new_medical_history",
     "is_old_medical_history",
@@ -54,6 +57,7 @@ KEEP_FIELDS = [
     "admin_report_img",
     "admin_face_img",
     "admin_face_describe",
+    "diagnosis_illness",
     "diagnosis_disease",
     "diagnosis_sickness",
 ]
@@ -62,6 +66,7 @@ CLINICAL_SOURCE_FIELDS = [
     "is_first",
     "patient_sex",
     "patient_age",
+    "patient_appeal",
     "doc_ass_stu_appeal",
     "new_medical_history",
     "old_medical_history",
@@ -471,17 +476,22 @@ def pack_record(
     symptom_adjustment_associations: list[dict[str, Any]] | None = None,
     templates: list[dict[str, Any]] | None = None,
     linked_internal_prescription: dict[str, Any] | None = None,
+    use_raw_clinical_context: bool = False,
+    source: str = "",
 ) -> dict[str, Any]:
     packed = {field: record.get(field, [] if field.endswith("_img") else "") for field in KEEP_FIELDS}
     packed["ps"] = format_prescriptions(record.get("ps") or [])
     packed["linked_internal_prescription"] = linked_internal_prescription or {}
+    raw_clinical_context = build_clinical_context(record) if use_raw_clinical_context else ""
     packed["clinical_symptoms"] = clinical_symptoms
     packed["inspection_abnormalities"] = inspection_abnormalities
     packed["tongue_face_findings"] = tongue_face_findings
-    packed["clinical_symptoms_text"] = clinical_symptoms_text or "，".join(
+    packed["clinical_symptoms_text"] = clinical_symptoms_text or raw_clinical_context or "，".join(
         item for item in [clinical_symptoms, inspection_abnormalities, tongue_face_findings] if item
     )
     packed["symptom_adjustment_associations"] = symptom_adjustment_associations or []
+    if source:
+        packed["source"] = source
     if templates is not None:
         packed = add_most_similar_template_detail(packed, templates)
     return packed
@@ -490,6 +500,8 @@ def pack_record(
 def pack_records(
     records: Iterable[dict[str, Any]],
     templates: list[dict[str, Any]] | None = None,
+    use_raw_clinical_context: bool = False,
+    source: str = "",
 ) -> list[dict[str, Any]]:
     records = list(records)
     linked_prescriptions = build_previous_internal_prescription_map(records)
@@ -498,6 +510,8 @@ def pack_records(
             record,
             templates=templates,
             linked_internal_prescription=linked_prescriptions.get(record.get("id")),
+            use_raw_clinical_context=use_raw_clinical_context,
+            source=source,
         )
         for record in records
     ]
@@ -822,6 +836,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--template-file", type=Path, default=DEFAULT_TEMPLATE_FILE)
     parser.add_argument("--no-template-match", action="store_true", help="Skip matched template enrichment.")
     parser.add_argument(
+        "--use-raw-clinical-context",
+        action="store_true",
+        help="Use raw complaint/history fields as clinical_symptoms_text when LLM extraction is disabled.",
+    )
+    parser.add_argument("--source", default="", help="Optional source label written into each packed record.")
+    parser.add_argument(
         "--append-output",
         action="store_true",
         help="Write each processed batch to output immediately; useful for long background runs.",
@@ -836,7 +856,8 @@ def main() -> None:
     if args.limit:
         records = records[: args.limit]
     templates = None if args.no_template_match else load_templates(args.template_file)
-    print(f"templates: {templates[0]}")
+    if templates:
+        print(f"templates: {templates[0]}")
 
     if args.extract_clinical_symptoms:
         packed_records = fill_clinical_symptoms(
@@ -847,7 +868,12 @@ def main() -> None:
             append_output=args.output if args.append_output else None,
         )
     else:
-        packed_records = pack_records(records, templates=templates)
+        packed_records = pack_records(
+            records,
+            templates=templates,
+            use_raw_clinical_context=args.use_raw_clinical_context,
+            source=args.source,
+        )
 
     if not (args.extract_clinical_symptoms and args.append_output):
         write_jsonl(packed_records, args.output)

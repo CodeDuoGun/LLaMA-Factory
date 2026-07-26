@@ -153,6 +153,15 @@ class QiniuManager:
     # 辅助
     # ------------------------------------------------------------------
 
+    def exists(self, key: str) -> bool:
+        """检查云端文件是否存在。"""
+        _, info = self._bucket.stat(self.bucket_name, key)
+        if info.status_code == 200:
+            return True
+        if info.status_code == 612:
+            return False
+        raise RuntimeError(f"检查文件是否存在失败: {key} -> {info}")
+
     def get_url(self, key: str, private: bool = True, expires: int = 3600) -> str:
         """获取文件访问 URL（私有空间返回带签名链接）。"""
         base_url = f"{self.bucket_domain}/{key}"

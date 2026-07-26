@@ -249,7 +249,7 @@ def build_wuweiping_embedding_text(row: dict[str, Any]) -> str:
     """
     向量检索中，只存储诊断结果和临床表现，不存储处方和模板方内容。
     """
-    diagnosis_result = _clean_text(row.get("diagnosis_sickness"))
+    diagnosis_result = _clean_text(row.get("diagnosis_illness") or row.get("diagnosis_sickness"))
     syndrome_result = _clean_text(row.get("diagnosis_disease"))
     patient_sex = _clean_text(row.get("patient_sex"))
     patient_age = "" if row.get("patient_age") is None else str(row.get("patient_age")).strip()
@@ -268,7 +268,7 @@ def build_wuweiping_embedding_text(row: dict[str, Any]) -> str:
 
 
 def build_wuweiping_prescription_doc(row: dict[str, Any], embedding: list[float] | None = None) -> dict[str, Any]:
-    diagnosis_result = _clean_text(row.get("diagnosis_illness"))
+    diagnosis_result = _clean_text(row.get("diagnosis_illness") or row.get("diagnosis_sickness"))
     syndrome_result = _clean_text(row.get("diagnosis_disease"))
     clinical_symptoms = _clean_text(row.get("clinical_symptoms_text") or row.get("clinical_symptoms"))
     prescriptions = [_clean_text(item) for item in row.get("ps") or [] if _clean_text(item)]
@@ -282,7 +282,7 @@ def build_wuweiping_prescription_doc(row: dict[str, Any], embedding: list[float]
     text = build_wuweiping_embedding_text(row)
     source = {
         "chunk_type": "case_prescription",
-        "source": "wuweiping_es_prescription",
+        "source": _clean_text(row.get("source")) or "wuweiping_es_prescription",
         "diagnosis_result": diagnosis_result,
         "diagnosis_result_text": diagnosis_result,
         "syndrome_result": syndrome_result,
@@ -303,6 +303,8 @@ def build_wuweiping_prescription_doc(row: dict[str, Any], embedding: list[float]
             "inquiry_id": row.get("id"),
             "order_sn": row.get("order_sn"),
             "patient_id": row.get("patient_id"),
+            "doctor_id": row.get("doctor_id"),
+            "doctor_name": row.get("doctor_name"),
             "matched_template_score": row.get("matched_template_score"),
         },
     }

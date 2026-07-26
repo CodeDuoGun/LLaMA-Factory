@@ -20,7 +20,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from medical.analysis.engine import MedicalAnalysis, canonical_disease, classify_outcome, extract_symptoms  # noqa: E402
+from medical.analysis.engine import (  # noqa: E402
+    MedicalAnalysis,
+    canonical_disease,
+    classify_outcome,
+    extract_symptoms,
+    normalize_diagnosis_value,
+)
 
 
 def _drug(drug_id: int, name: str, dose: int) -> dict:
@@ -51,6 +57,22 @@ def test_normalization_and_negation() -> None:
     assert canonical_disease("胰腺癌术后，肝转移") == "胰腺癌"
     assert extract_symptoms("乏力，纳差，无腹痛，大便偏干") == ["乏力", "纳差", "便秘"]
     assert classify_outcome("药后乏力较前减轻，整体感觉良好") == "改善"
+
+
+def test_diagnosis_value_normalizes_separator_order_and_duplicates() -> None:
+    assert normalize_diagnosis_value("脾肺气虚证，痰瘀互结证") == "痰瘀互结证、脾肺气虚证"
+    assert normalize_diagnosis_value("痰瘀互结证/脾肺气虚证；脾肺气虚证") == "痰瘀互结证、脾肺气虚证"
+    assert normalize_diagnosis_value("甲状腺癌、瘿瘤") == normalize_diagnosis_value("甲状腺癌、瘿瘤病")
+    assert normalize_diagnosis_value("咳嗽病") == "咳嗽"
+    assert normalize_diagnosis_value("间质性肺纤维化") == normalize_diagnosis_value("间质肺纤维化")
+    assert normalize_diagnosis_value("肺结节" + "病") == "肺结节"
+    assert normalize_diagnosis_value("支气管扩张、肺结节") == normalize_diagnosis_value("支气管扩张、肺结节" + "病")
+    assert normalize_diagnosis_value("痰瘀阻肺证肝气郁结证") == "痰瘀阻肺证、肝气郁结证"
+    assert normalize_diagnosis_value("痰瘀阻肺 肝气郁结") == "痰瘀阻肺证、肝气郁结证"
+    assert normalize_diagnosis_value("痰瘀阻肺+肝气郁结") == "痰瘀阻肺证、肝气郁结证"
+    assert normalize_diagnosis_value("肝气不舒痰瘀阻肺") == "痰瘀阻肺证、肝气不舒证"
+    assert normalize_diagnosis_value("痰瘀阻肺证肝脾不和证") == "痰瘀阻肺证、肝脾不和证"
+    assert normalize_diagnosis_value("痰瘀阻肺证\n肝脾不和证") == "痰瘀阻肺证、肝脾不和证"
 
 
 def test_longitudinal_difference_uses_patient_id() -> None:
@@ -155,14 +177,26 @@ def test_overview_contains_three_independent_diagnosis_distributions() -> None:
     second = _record(112, "2026-03-02 09:00:00", "初诊", [_drug(1, "黄芪", 20)], "纳差")
     first["patient_id"] = 1
     second["patient_id"] = 2
-    first.update({"diagnosis_illness": "胃癌", "diagnosis_sickness": "胃积病", "diagnosis_disease": "脾胃虚弱证"})
-    second.update({"diagnosis_illness": "胃癌", "diagnosis_sickness": "胃积病", "diagnosis_disease": "气血两虚证"})
+    first.update(
+        {
+            "diagnosis_illness": "胃癌，慢性胃炎",
+            "diagnosis_sickness": "胃积病；胃痞病",
+            "diagnosis_disease": "脾胃虚弱证/气血两虚证",
+        }
+    )
+    second.update(
+        {
+            "diagnosis_illness": "慢性胃炎、胃癌",
+            "diagnosis_sickness": "胃痞病、胃积病",
+            "diagnosis_disease": "气血两虚证，脾胃虚弱证",
+        }
+    )
 
     distributions = MedicalAnalysis([first, second]).overview()["diagnosis_distributions"]
 
-    assert distributions["diagnosis_illness"][0] == {"value": "胃癌", "visit_count": 2, "patient_count": 2}
-    assert distributions["diagnosis_sickness"][0] == {"value": "胃积病", "visit_count": 2, "patient_count": 2}
-    assert {row["value"] for row in distributions["diagnosis_disease"]} == {"脾胃虚弱证", "气血两虚证"}
+    assert distributions["diagnosis_illness"][0] == {"value": "慢性胃炎、胃癌", "visit_count": 2, "patient_count": 2}
+    assert distributions["diagnosis_sickness"][0] == {"value": "胃痞病、胃积病", "visit_count": 2, "patient_count": 2}
+    assert distributions["diagnosis_disease"][0] == {"value": "气血两虚证、脾胃虚弱证", "visit_count": 2, "patient_count": 2}
 
 
 def test_overview_returns_complete_diagnosis_distribution() -> None:

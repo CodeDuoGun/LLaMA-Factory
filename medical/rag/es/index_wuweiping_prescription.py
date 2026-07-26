@@ -45,7 +45,7 @@ def batched(items: list[dict[str, Any]], batch_size: int) -> list[list[dict[str,
 
 
 def has_required_wuweiping_fields(row: dict[str, Any]) -> bool:
-    diagnosis_sickness = str(row.get("diagnosis_sickness") or "").strip()
+    diagnosis_sickness = str(row.get("diagnosis_illness") or row.get("diagnosis_sickness") or "").strip()
     diagnosis_disease = str(row.get("diagnosis_disease") or "").strip()
     prescriptions = row.get("ps") or []
     if isinstance(prescriptions, str):
