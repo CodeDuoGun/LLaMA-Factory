@@ -69,3 +69,25 @@ def test_catalog_discovers_doctors_and_merges_supplements(tmp_path: Path) -> Non
     assert beta.raw_record_count == 1
     assert catalog.sources["alpha"].duplicate_records == 1
     assert next(iter(alpha.patient_visits)) != next(iter(beta.patient_visits))
+
+
+def test_catalog_discovers_flat_online_doctor_files(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "甲医生_AI医生分身混合问诊数据_1_20260101000000.json",
+        [_record(1, 1, "甲医生")],
+    )
+    _write(
+        tmp_path / "乙医生_AI医生分身混合问诊数据_2_20260101000000.json",
+        [_record(2, 2, "乙医生")],
+    )
+    (tmp_path / "__MACOSX").mkdir()
+    (tmp_path / "__MACOSX" / "._甲医生.json").write_bytes(b"AppleDouble")
+
+    catalog = DoctorCatalog.discover(tmp_path, default_doctor="2")
+    doctors = catalog.list_doctors()
+
+    assert doctors["default_doctor"] == "2"
+    assert {item["key"] for item in doctors["items"]} == {"1", "2"}
+    assert {item["doctor_name"] for item in doctors["items"]} == {"甲医生", "乙医生"}
+    assert catalog.get("1").raw_record_count == 1
+    assert catalog.get("2").raw_record_count == 1

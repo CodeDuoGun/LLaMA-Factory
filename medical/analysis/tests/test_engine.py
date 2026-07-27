@@ -26,6 +26,7 @@ from medical.analysis.engine import (  # noqa: E402
     classify_outcome,
     extract_symptoms,
     normalize_diagnosis_value,
+    normalize_syndrome_value,
 )
 
 
@@ -64,15 +65,55 @@ def test_diagnosis_value_normalizes_separator_order_and_duplicates() -> None:
     assert normalize_diagnosis_value("痰瘀互结证/脾肺气虚证；脾肺气虚证") == "痰瘀互结证、脾肺气虚证"
     assert normalize_diagnosis_value("甲状腺癌、瘿瘤") == normalize_diagnosis_value("甲状腺癌、瘿瘤病")
     assert normalize_diagnosis_value("咳嗽病") == "咳嗽"
-    assert normalize_diagnosis_value("间质性肺纤维化") == normalize_diagnosis_value("间质肺纤维化")
-    assert normalize_diagnosis_value("肺结节" + "病") == "肺结节"
-    assert normalize_diagnosis_value("支气管扩张、肺结节") == normalize_diagnosis_value("支气管扩张、肺结节" + "病")
+    assert normalize_diagnosis_value("肺结节") == normalize_diagnosis_value("肺结节病") == "肺结节"
+    assert {
+        normalize_diagnosis_value(value)
+        for value in ("间质肺纤维化", "肺间质纤维化", "肺间质性纤维化", ".双肺间质性纤维化")
+    } == {"肺间质纤维化"}
+    assert normalize_diagnosis_value("双肺间质性改变伴纤维") == "双肺间质性改变伴纤维化"
+    assert normalize_diagnosis_value("双肺间质性改变伴纤维化") == "双肺间质性改变伴纤维化"
+    assert normalize_diagnosis_value("慢性菱缩性胃炎") == "慢性萎缩性胃炎"
+    assert normalize_diagnosis_value("支气管扩张、肺结节") == normalize_diagnosis_value("支气管扩张、肺结节病")
+    assert normalize_diagnosis_value("{'code': '', 'name': '', 'type': '2'}") == ""
+    assert normalize_diagnosis_value({"code": "", "name": "", "type": "2"}) == ""
+    assert normalize_diagnosis_value('["肺结节"]') == ""
     assert normalize_diagnosis_value("痰瘀阻肺证肝气郁结证") == "痰瘀阻肺证、肝气郁结证"
     assert normalize_diagnosis_value("痰瘀阻肺 肝气郁结") == "痰瘀阻肺证、肝气郁结证"
     assert normalize_diagnosis_value("痰瘀阻肺+肝气郁结") == "痰瘀阻肺证、肝气郁结证"
     assert normalize_diagnosis_value("肝气不舒痰瘀阻肺") == "痰瘀阻肺证、肝气不舒证"
     assert normalize_diagnosis_value("痰瘀阻肺证肝脾不和证") == "痰瘀阻肺证、肝脾不和证"
     assert normalize_diagnosis_value("痰瘀阻肺证\n肝脾不和证") == "痰瘀阻肺证、肝脾不和证"
+    assert normalize_diagnosis_value("？,耳鸣病") == "耳鸣病"
+    assert normalize_diagnosis_value("。,耳鸣病,?,.") == "耳鸣病"
+    assert normalize_diagnosis_value("慢性浅表性胃炎伴肠化、诊断") == "慢性浅表性胃炎伴肠化"
+    assert normalize_diagnosis_value("?") == ""
+    assert normalize_diagnosis_value("？、。、?、.、--") == ""
+    assert normalize_diagnosis_value("l、123") == ""
+    assert normalize_diagnosis_value("hsaxg") == ""
+    assert normalize_diagnosis_value("肝脾血瘀证,l") == "l、肝脾血瘀证"
+    assert normalize_diagnosis_value("？2型糖尿病？,HPV感染") == "2型糖尿病、HPV感染"
+    assert normalize_diagnosis_value("多囊卵巢综合征[Stein-Leventhal综合征]") == "多囊卵巢综合征"
+
+
+def test_syndrome_value_normalizes_suffix_order_and_concatenation() -> None:
+    assert normalize_syndrome_value("肝气不舒") == "肝气不舒证"
+    assert normalize_syndrome_value("肝气不舒证") == "肝气不舒证"
+    assert normalize_syndrome_value("脾肺气虚，痰瘀互结证") == "痰瘀互结证、脾肺气虚证"
+    assert normalize_syndrome_value("痰瘀互结/脾肺气虚") == "痰瘀互结证、脾肺气虚证"
+    assert normalize_syndrome_value("脾肺气虚证痰瘀互结证") == "痰瘀互结证、脾肺气虚证"
+    assert normalize_syndrome_value("痰瘀互结证、脾肺气虚、痰瘀互结") == "痰瘀互结证、脾肺气虚证"
+    assert normalize_syndrome_value("未明确") == "未明确"
+    assert normalize_syndrome_value("{'code': '', 'name': '', 'type': '2'}") == ""
+    assert normalize_syndrome_value({"code": "", "name": "", "type": "2"}) == ""
+    assert normalize_syndrome_value('["肝气不舒"]') == ""
+    assert normalize_syndrome_value("肝脾血瘀证,l") == "l、肝脾血瘀证"
+    assert normalize_syndrome_value("肝脾血瘀,l") == "l、肝脾血瘀证"
+    assert normalize_syndrome_value("l") == ""
+    assert normalize_syndrome_value("hsaxg") == ""
+    assert normalize_syndrome_value("?") == ""
+    assert normalize_syndrome_value("待填写证") == ""
+    assert normalize_syndrome_value("待填写") == ""
+    assert normalize_syndrome_value("待填写证、肝气不舒") == "肝气不舒证"
 
 
 def test_longitudinal_difference_uses_patient_id() -> None:
@@ -133,6 +174,28 @@ def test_patient_timeline_returns_all_prescriptions_with_usage_type() -> None:
         "菊花",
     ]
     assert visit["drugs"][0]["drug_name"] == "黄芪"
+
+
+def test_patients_are_grouped_and_filtered_by_visit_type() -> None:
+    initial_only = _record(1, "2026-01-01 09:00:00", "初诊", [_drug(1, "黄芪", 20)], "乏力")
+    revisit_only = _record(2, "2026-01-02 09:00:00", "复诊", [_drug(1, "黄芪", 20)], "乏力减轻")
+    both_initial = _record(3, "2026-01-03 09:00:00", "初诊", [_drug(1, "黄芪", 20)], "咳嗽")
+    both_revisit = _record(4, "2026-01-04 09:00:00", "复诊", [_drug(1, "黄芪", 20)], "咳嗽减轻")
+    initial_only["patient_id"] = 1
+    revisit_only["patient_id"] = 2
+    both_initial["patient_id"] = both_revisit["patient_id"] = 3
+    analysis = MedicalAnalysis([initial_only, revisit_only, both_initial, both_revisit])
+
+    all_patients = analysis.patients()["items"]
+    initial_patients = analysis.patients(visit_type="初诊")["items"]
+    revisit_patients = analysis.patients(visit_type="复诊")["items"]
+
+    assert {item["patient_id"] for item in all_patients} == {"1", "2", "3"}
+    assert {item["patient_id"] for item in initial_patients} == {"1", "2"}
+    assert {item["patient_id"] for item in revisit_patients} == {"3"}
+    patient_three = next(item for item in all_patients if item["patient_id"] == "3")
+    assert patient_three["patient_type"] == "复诊"
+    assert patient_three["visit_count"] == 2
 
 
 def test_symptom_drug_association_support() -> None:
@@ -196,7 +259,11 @@ def test_overview_contains_three_independent_diagnosis_distributions() -> None:
 
     assert distributions["diagnosis_illness"][0] == {"value": "慢性胃炎、胃癌", "visit_count": 2, "patient_count": 2}
     assert distributions["diagnosis_sickness"][0] == {"value": "胃痞病、胃积病", "visit_count": 2, "patient_count": 2}
-    assert distributions["diagnosis_disease"][0] == {"value": "气血两虚证、脾胃虚弱证", "visit_count": 2, "patient_count": 2}
+    assert distributions["diagnosis_disease"][0] == {
+        "value": "气血两虚证、脾胃虚弱证",
+        "visit_count": 2,
+        "patient_count": 2,
+    }
 
 
 def test_overview_returns_complete_diagnosis_distribution() -> None:

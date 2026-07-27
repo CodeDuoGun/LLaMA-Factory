@@ -26,7 +26,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATA_DIR = PROJECT_ROOT / "medical" / "data"
+DEFAULT_DATA_DIR = PROJECT_ROOT / "medical" / "data"/ "202301_online"
 DEFAULT_OUTPUT_FILE = DEFAULT_DATA_DIR / "missdata_records.xlsx"
 ONLINE_FILE_MARKER = "_AI医生分身混合问诊数据_"
 

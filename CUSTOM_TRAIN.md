@@ -142,3 +142,19 @@ python -m medical.data_utils.knowledge sft-context --disease 痤疮 --syndrome �
 你不能做最终诊断，不能替代线下医生，不能开具处方。
 遇到胸痛、呼吸困难、意识障碍、高热不退、严重过敏等情况，应建议立即就医。
 回答要简洁、温和、先追问关键病史，再给风险提示。
+ 
+
+ai_complaint_history_consistent：主诉与现病史是否一致；true 一致，false 存在矛盾，null 表示证据不足。
+ai_complaint_history_issues：具体矛盾、遗漏或时间不一致说明。
+ai_etiology：病因，如痰湿、外感、情志不畅。
+ai_pathogenesis：病机，即疾病发生发展的中医机制。
+ai_disease_location：病位，涉及的脏腑、经络或组织。
+ai_disease_nature：病性，如寒、热、虚、实。
+ai_disease_stage：病期，如初期、进展期、恢复期。
+ai_disease_course：病程长度及演变情况。
+ai_syndrome_elements：证素，如痰、湿、热、瘀。
+ai_onset_triggers：诱因，如受凉、饮食、情绪变化。
+ai_key_symptoms：用于辨证和知识库检索的关键症状。
+ai_record_identity：增量处理唯一标识，格式为“医生ID:病历ID”。
+ai_processing_complete：该病历所有处理阶段是否成功。
+ai_processing_version：本次处理逻辑版本。

@@ -68,6 +68,17 @@ class DoctorCatalog:
             files = sorted(file for file in directory.glob(pattern) if file.is_file())
             if files:
                 sources.append(cls._source_from_files(directory, files))
+        flat_sources: dict[str, DoctorSource] = {}
+        for file in sorted(root.glob("*.json")):
+            if not file.is_file() or file.name.startswith(("._", ".")):
+                continue
+            source = cls._source_from_files(root, [file])
+            source.key = source.doctor_id or source.name or file.stem
+            if source.key in flat_sources:
+                flat_sources[source.key].files.append(file)
+            else:
+                flat_sources[source.key] = source
+        sources.extend(flat_sources.values())
         return cls(sources, default_doctor=default_doctor)
 
     @staticmethod

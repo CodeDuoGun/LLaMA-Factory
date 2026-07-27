@@ -280,7 +280,8 @@ tbody tr:hover { background: rgb(29 107 80 / 5%); }
 .chip { border-radius: 5px; padding: 2px 5px; background: var(--green-soft); }
 .chip.removed { background: var(--orange-soft); }
 
-.patient-layout { display: grid; grid-template-columns: minmax(260px, .32fr) 1fr; gap: 16px; }
+.patient-layout { display: grid; grid-template-columns: minmax(260px, .32fr) 1fr; align-items: start; gap: 16px; }
+.patient-list-panel { position: sticky; top: 20px; max-height: calc(100vh - 40px); overflow-y: auto; }
 .patient-list { display: grid; gap: 4px; }
 .patient-button { display: grid; grid-template-columns: 1fr auto; gap: 5px 10px; width: 100%; border: 0; border-radius: 10px; padding: 11px; color: var(--ink); background: transparent; text-align: left; cursor: pointer; }
 .patient-button:hover, .patient-button.is-active { background: var(--green-soft); }
@@ -327,7 +328,7 @@ footer { border-top: 1px solid var(--line); padding: 22px 0 34px; color: var(--m
   .filter-row, .search-form { width: 100%; flex-wrap: wrap; }
   .control-label { flex: 1; }
   select, input { width: 100%; min-width: 140px; }
-  .patient-list-panel { max-height: 310px; overflow-y: auto; }
+  .patient-list-panel { position: static; max-height: 310px; overflow-y: auto; }
   .formula-section-heading { align-items: start; flex-direction: column; }
   .formula-dimension-grid { grid-template-columns: repeat(2, 1fr); }
   .formula-dimension-actions, .formula-comparison-bar { align-items: stretch; flex-direction: column; }

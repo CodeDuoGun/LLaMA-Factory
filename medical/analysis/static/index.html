@@ -240,13 +240,20 @@ You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2
             <h2 id="patient-title">患者时间轴</h2>
           </div>
           <form id="patient-search-form" class="search-form">
+            <label class="control-label">就诊类型
+              <select id="patient-visit-type">
+                <option value="">全部患者</option>
+                <option value="初诊">初诊患者（1 次问诊）</option>
+                <option value="复诊">复诊患者（多次问诊）</option>
+              </select>
+            </label>
             <label class="control-label">患者 ID<input id="patient-query" type="search" placeholder="请输入 patient_id" autocomplete="off" /></label>
             <button type="submit" class="primary-button">查询</button>
           </form>
         </div>
         <div class="patient-layout">
           <aside class="panel patient-list-panel">
-            <div class="panel-heading"><h3>多次就诊患者</h3><span>显示 patient_id 字段</span></div>
+            <div class="panel-heading"><h3>患者列表</h3><span>按 patient_id 聚合</span></div>
             <div id="patient-list" class="patient-list"></div>
           </aside>
           <article class="panel timeline-panel">

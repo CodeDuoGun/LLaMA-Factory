@@ -39,6 +39,20 @@ def test_overview_has_western_tcm_disease_and_syndrome_distributions() -> None:
     assert "text-overflow: clip" in styles
 
 
+def test_patient_view_filters_grouped_patients_by_visit_type() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    script = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="patient-visit-type"' in html
+    assert '<option value="初诊">初诊患者（1 次问诊）</option>' in html
+    assert '<option value="复诊">复诊患者（多次问诊）</option>' in html
+    assert "按 patient_id 聚合" in html
+    assert "visit_type=${encodeURIComponent(visitType)}" in script
+    assert "openPatient(button.dataset.key, true)" in script
+    assert "async function openPatient(patientKey, preservePatientList = false)" in script
+    assert "renderPatientTimelines" not in script
+
+
 def test_base_formula_view_has_dimensions_comparison_and_detail_regions() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
 

@@ -474,11 +474,14 @@ async function loadRevisits() {
 }
 
 async function loadPatientList(query = "") {
-  const data = await api(`/api/patients?limit=50&query=${encodeURIComponent(query)}`);
-  const repeated = data.items.filter((item) => item.visit_count > 1);
-  $("#patient-list").innerHTML = repeated.length ? repeated.map((item) => `<button class="patient-button ${state.selectedPatient === item.patient_id ? "is-active" : ""}" data-key="${escapeHtml(item.patient_id)}">
-    <strong>${escapeHtml(item.patient_id)}</strong><span>${item.visit_count} 诊</span><small>${escapeHtml(item.diseases.join(" · "))} · ${item.first_date}—${item.last_date}</small></button>`).join("") : '<div class="empty-state">未找到匹配的多次就诊患者</div>';
-  document.querySelectorAll(".patient-button").forEach((button) => button.addEventListener("click", () => openPatient(button.dataset.key)));
+  const visitType = $("#patient-visit-type").value;
+  const data = await api(`/api/patients?query=${encodeURIComponent(query)}&visit_type=${encodeURIComponent(visitType)}`);
+  $("#patient-list").innerHTML = data.items.length ? data.items.map((item) => `<button class="patient-button ${state.selectedPatient === item.patient_id ? "is-active" : ""}" data-key="${escapeHtml(item.patient_id)}">
+    <strong>${escapeHtml(item.patient_id)}</strong><span>${escapeHtml(item.patient_type)} · ${item.visit_count} 诊</span>
+    <small>${escapeHtml(item.diseases.join(" · "))} · ${item.first_date}—${item.last_date}</small></button>`).join("") : '<div class="empty-state">未找到匹配患者</div>';
+  document.querySelectorAll(".patient-button").forEach((button) => button.addEventListener("click", () => {
+    openPatient(button.dataset.key, true).catch(showError);
+  }));
 }
 
 function changeLine(label, items) {
@@ -505,15 +508,8 @@ function timelinePrescriptions(prescriptions) {
   }).join("")}</div>`;
 }
 
-async function openPatient(patientKey) {
-  switchView("patient");
-  state.selectedPatient = patientKey;
-  $("#patient-query").value = patientKey;
-  const data = await api(`/api/patients/${encodeURIComponent(patientKey)}`);
-  $("#timeline-title").textContent = `患者 ID：${data.patient_id}`;
-  $("#timeline-meta").textContent = `${data.visit_count} 次就诊`;
-  $("#timeline").classList.remove("empty-state");
-  $("#timeline").innerHTML = data.timeline.map((visit) => {
+function timelineItems(timeline) {
+  return timeline.map((visit) => {
     const dose = visit.change?.dose_changes?.map((item) => `${item.drug_name} ${item.before}→${item.after}${item.unit}`) || [];
     const change = visit.change ? `<div class="change-block">${changeLine("新增", visit.change.added)}${changeLine("停用", visit.change.removed)}${changeLine("剂量", dose)}<p>处方相似度 ${percent(visit.change.jaccard, 0)}，保留率 ${percent(visit.change.retention, 0)}</p></div>` : "";
     return `<section class="timeline-item"><div class="timeline-date">${escapeHtml(visit.date)} · ${escapeHtml(visit.is_first)}</div>
@@ -522,7 +518,27 @@ async function openPatient(patientKey) {
       <div class="timeline-history"><strong>本次症状与病情：</strong>${escapeHtml(visit.new_medical_history || "未记录")}</div>
       ${timelinePrescriptions(visit.prescriptions)}${change}</section>`;
   }).join("");
-  await loadPatientList(patientKey);
+}
+
+async function openPatient(patientKey, preservePatientList = false) {
+  switchView("patient");
+  state.selectedPatient = patientKey;
+  if (!preservePatientList) {
+    $("#patient-visit-type").value = "";
+    $("#patient-query").value = patientKey;
+  }
+  const data = await api(`/api/patients/${encodeURIComponent(patientKey)}`);
+  $("#timeline-title").textContent = `患者 ID：${data.patient_id}`;
+  $("#timeline-meta").textContent = `${data.visit_count} 次就诊`;
+  $("#timeline").className = "timeline";
+  $("#timeline").innerHTML = timelineItems(data.timeline);
+  if (preservePatientList) {
+    document.querySelectorAll(".patient-button").forEach((button) => {
+      button.classList.toggle("is-active", button.dataset.key === String(patientKey));
+    });
+  } else {
+    await loadPatientList(patientKey);
+  }
 }
 
 async function loadDoctors() {
@@ -548,6 +564,7 @@ async function loadDoctor(doctorKey) {
   $("#source-status").textContent = "正在切换医生数据";
   $("#error-banner").hidden = true;
   $("#patient-query").value = "";
+  $("#patient-visit-type").value = "";
   $("#patient-list").innerHTML = "";
   $("#timeline-title").textContent = "选择一位患者";
   $("#timeline-meta").textContent = "";
@@ -602,6 +619,15 @@ function bindEvents() {
   $("#revisit-symptom").addEventListener("change", () => loadRevisits().catch(showError));
   $("#revisit-outcome").addEventListener("change", () => loadRevisits().catch(showError));
   $("#doctor-select").addEventListener("change", (event) => loadDoctor(event.target.value).catch(showError));
+  $("#patient-visit-type").addEventListener("change", () => {
+    state.selectedPatient = null;
+    $("#patient-query").value = "";
+    $("#timeline-title").textContent = "选择一位患者";
+    $("#timeline-meta").textContent = "";
+    $("#timeline").className = "timeline empty-state";
+    $("#timeline").textContent = "从左侧选择患者 ID，查看该患者的时间轴。";
+    loadPatientList().catch(showError);
+  });
   $("#patient-search-form").addEventListener("submit", (event) => {
     event.preventDefault();
     const query = $("#patient-query").value.trim();

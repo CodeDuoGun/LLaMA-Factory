@@ -21,6 +21,7 @@ import json
 import math
 import re
 import statistics
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -91,10 +92,19 @@ DIAGNOSIS_TERM_ALIASES = {
     "咳嗽病": "咳嗽",
     "肝气郁结": "肝气郁结证",
     "肝气不舒": "肝气不舒证",
-    "肺结节" + "病": "肺结节",
-    "间质性肺纤维化": "间质肺纤维化",
+    "肺结节病": "肺结节",
+    "待填写证": "",
+    "间质肺纤维化": "肺间质纤维化",
+    "间质性肺纤维化": "肺间质纤维化",
+    "肺间质性纤维化": "肺间质纤维化",
+    "双肺间质性纤维化": "肺间质纤维化",
+    "双肺间质性改变伴纤维": "双肺间质性改变伴纤维化",
+    "慢性菱缩性胃炎": "慢性萎缩性胃炎",
     "痰瘀阻肺": "痰瘀阻肺证",
     "瘿瘤病": "瘿瘤",
+    "双肺间质性炎炎症": "双肺间质性炎症",
+    "耳鸣": "耳鸣病",
+    "多囊卵巢综合征[Stein-Leventhal综合征]": "多囊卵巢综合征",
 }
 COMPOUND_DIAGNOSIS_TERMS = (
     "痰瘀阻肺证",
@@ -105,14 +115,25 @@ COMPOUND_DIAGNOSIS_TERMS = (
     "痰瘀阻肺",
     "肝气不舒",
 )
+DIAGNOSIS_SEPARATOR_PATTERN = r"[、，,；;：:／/|｜·+＋&＆\s]+"
+UNSPECIFIED_SYNDROMES = {"无", "不详", "未知", "未明确", "未辨证", "暂无"}
+EMPTY_SYNDROME_PLACEHOLDERS = {"待填写", "待填写证", "无"}
+EMPTY_DIAGNOSIS_PLACEHOLDERS = {"诊断"}
+CHINESE_CHARACTER_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002fa1f]")
 
 
 def _clean(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def _is_symbol_only(value: str) -> bool:
+    return bool(value) and all(unicodedata.category(character)[0] in {"P", "S"} for character in value)
+
+
 def _normalize_diagnosis_part(value: str) -> str:
-    part = re.sub(r"\s+", "", value).strip()
+    part = re.sub(r"\s+", "", value).strip(".。·•?？")
+    if part in EMPTY_DIAGNOSIS_PLACEHOLDERS or _is_symbol_only(part):
+        return ""
     return DIAGNOSIS_TERM_ALIASES.get(part, part)
 
 
@@ -132,17 +153,69 @@ def _split_compound_diagnosis_part(value: str) -> list[str]:
     return items
 
 
+def _is_structured_diagnosis_placeholder(value: Any) -> bool:
+    if isinstance(value, (dict, list, tuple, set)):
+        return True
+    text = _clean(value)
+    return (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]"))
+
+
+def _is_chinese_text(value: str) -> bool:
+    chinese_ranges = (
+        (0x3400, 0x4DBF),
+        (0x4E00, 0x9FFF),
+        (0xF900, 0xFAFF),
+        (0x20000, 0x2FA1F),
+    )
+    return bool(value) and all(
+        any(start <= ord(character) <= end for start, end in chinese_ranges) for character in value
+    )
+
+
 def normalize_diagnosis_value(value: Any) -> str:
     """Normalize multi-item diagnosis fields without merging distinct concepts."""
+    if _is_structured_diagnosis_placeholder(value):
+        return ""
     text = _clean(value)
-    if not text:
+    if not text or not CHINESE_CHARACTER_PATTERN.search(text):
         return ""
     parts = []
-    for part in re.split(r"[、，,；;：:／/|｜·+＋&＆\s]+", text):
+    for part in re.split(DIAGNOSIS_SEPARATOR_PATTERN, text):
         parts.extend(_split_compound_diagnosis_part(part))
     if not parts:
         return ""
     return "、".join(sorted(set(parts)))
+
+
+def normalize_syndrome_value(value: Any) -> str:
+    """Normalize syndrome suffixes, separators, duplicates, and item order."""
+    if _is_structured_diagnosis_placeholder(value):
+        return ""
+    text = _clean(value)
+    if not text or not CHINESE_CHARACTER_PATTERN.search(text):
+        return ""
+    if text in EMPTY_SYNDROME_PLACEHOLDERS:
+        return ""
+    # 如果字段没有中文符号，返回空
+
+    syndromes = []
+    for part in re.split(DIAGNOSIS_SEPARATOR_PATTERN, text):
+        for compound_part in _split_compound_diagnosis_part(part):
+            items = re.findall(r"[^证]+证|[^证]+$", compound_part)
+            for item in items:
+                syndrome = _normalize_diagnosis_part(item)
+                if syndrome in EMPTY_SYNDROME_PLACEHOLDERS:
+                    continue
+                if (
+                    syndrome
+                    and syndrome not in UNSPECIFIED_SYNDROMES
+                    and not syndrome.endswith("证")
+                    and _is_chinese_text(syndrome)
+                ):
+                    syndrome = f"{syndrome}证"
+                if syndrome:
+                    syndromes.append(syndrome)
+    return "、".join(sorted(set(syndromes)))
 
 
 def _safe_float(value: Any) -> float | None:
@@ -345,9 +418,9 @@ class MedicalAnalysis:
             drug_id = str(item.get("drug_id") or _clean(item.get("drug_name") or item.get("show_name")))
             if not drug_id:
                 continue
-            name = _clean(item.get("drug_name") or item.get("show_name") or item.get("sub_drug_name"))
-            dose = _safe_float(item.get("drug_weight", item.get("drug_num")))
-            drugs[drug_id] = Drug(drug_id, name, dose, _clean(item.get("unit_name")))
+            name = _clean(item.get("show_name") or item.get("drug_name") or item.get("sub_drug_name"))
+            dose = _safe_float(float(item["spec_number"]) * float(item["drug_num"]))
+            drugs[drug_id] = Drug(drug_id, name, dose, "g")
         return drugs, len(internal), external_count, sorted(set(processes)), max(days) if days else None
 
     @staticmethod
@@ -357,15 +430,15 @@ class MedicalAnalysis:
             drugs = []
             for item in (prescription.get("prescription_items") or {}).get("drugList") or []:
                 drug_id = str(item.get("drug_id") or _clean(item.get("drug_name") or item.get("show_name")))
-                name = _clean(item.get("drug_name") or item.get("show_name") or item.get("sub_drug_name"))
+                name = _clean(item.get("show_name") or item.get("drug_name") or item.get("sub_drug_name"))
                 if not drug_id and not name:
                     continue
                 drugs.append(
                     {
                         "drug_id": drug_id,
                         "drug_name": name,
-                        "dose": _safe_float(item.get("drug_weight", item.get("drug_num"))),
-                        "unit": _clean(item.get("unit_name")),
+                        "dose": _safe_float(float(item["spec_number"]) * float(item["drug_num"])),
+                        "unit": _clean("g"),
                     }
                 )
             prescriptions.append(
@@ -384,7 +457,7 @@ class MedicalAnalysis:
         summary = _clean(record.get("doc_ass_stu_appeal"))
         diagnosis = normalize_diagnosis_value(record.get("diagnosis_illness", ""))
         tcm_disease = normalize_diagnosis_value(record.get("diagnosis_sickness"))
-        syndrome = normalize_diagnosis_value(record.get("diagnosis_disease"))
+        syndrome = normalize_syndrome_value(record.get("diagnosis_disease"))
         drugs, internal_count, external_count, processes, days = self._main_internal_prescription(record)
         return Visit(
             visit_id=int(record.get("id") or 0),
@@ -850,15 +923,24 @@ class MedicalAnalysis:
             "items": pairs[:limit],
         }
 
-    def patients(self, query: str = "", limit: int = 50) -> dict[str, Any]:
+    def patients(
+        self,
+        query: str = "",
+        visit_type: str = "",
+        limit: int | None = None,
+    ) -> dict[str, Any]:
         query = query.strip().upper()
         items = []
         for patient_id, visits in self.patient_visits.items():
             if query and query not in patient_id.upper():
                 continue
+            patient_type = "初诊" if len(visits) == 1 else "复诊"
+            if visit_type and patient_type != visit_type:
+                continue
             items.append(
                 {
                     "patient_id": patient_id,
+                    "patient_type": patient_type,
                     "visit_count": len(visits),
                     "first_date": visits[0].date[:10],
                     "last_date": visits[-1].date[:10],
@@ -866,7 +948,10 @@ class MedicalAnalysis:
                 }
             )
         items.sort(key=lambda item: (-item["visit_count"], item["patient_id"]))
-        return {"total": len(items), "items": items[:limit]}
+        total = len(items)
+        if limit is not None:
+            items = items[:limit]
+        return {"total": total, "items": items}
 
     def patient_timeline(self, patient_id: str) -> dict[str, Any]:
         patient_id = str(patient_id)

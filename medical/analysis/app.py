@@ -39,7 +39,8 @@ from medical.analysis.llm import PrescriptionLLMService
 
 
 MODULE_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_ROOT = MODULE_DIR.parent / "data"
+DEFAULT_DATA_ROOT = MODULE_DIR.parent / "data" / "202301_online"
+DEFAULT_DOCTOR = "1314"
 
 
 @asynccontextmanager
@@ -49,7 +50,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(f"Medical analysis data file not found: {explicit_file}")
     app.state.catalog = DoctorCatalog.discover(
         os.getenv("MEDICAL_ANALYSIS_DATA_ROOT", str(DEFAULT_DATA_ROOT)),
-        default_doctor=os.getenv("MEDICAL_ANALYSIS_DEFAULT_DOCTOR", "zhangxiaoyu"),
+        default_doctor=os.getenv("MEDICAL_ANALYSIS_DEFAULT_DOCTOR", DEFAULT_DOCTOR),
         explicit_file=explicit_file,
     )
     app.state.catalog.get()
@@ -375,10 +376,11 @@ def associations(
 def patients(
     request: Request,
     query: str = "",
-    limit: int = Query(50, ge=1, le=200),
+    visit_type: str = Query("", pattern="^(|初诊|复诊)$"),
+    limit: int | None = Query(None, ge=1, le=10000),
     doctor: str | None = None,
 ) -> dict[str, object]:
-    return analysis(request, doctor).patients(query=query, limit=limit)
+    return analysis(request, doctor).patients(query=query, visit_type=visit_type, limit=limit)
 
 
 @app.get("/api/patients/{patient_id}")
@@ -418,9 +420,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the multi-doctor medical analysis dashboard.")
     parser.add_argument("--data", type=Path, help="Only expose one consultation JSON file.")
     parser.add_argument(
-        "--data-root", type=Path, default=DEFAULT_DATA_ROOT, help="Root containing online_* directories."
+        "--data-root",
+        type=Path,
+        default=DEFAULT_DATA_ROOT,
+        help="Root containing doctor JSON files or online_* directories.",
     )
-    parser.add_argument("--doctor", default="zhangxiaoyu", help="Default doctor directory key.")
+    parser.add_argument("--doctor", default=DEFAULT_DOCTOR, help="Default doctor ID or directory key.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8008)
     parser.add_argument("--reload", action="store_true")
