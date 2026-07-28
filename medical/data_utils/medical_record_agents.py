@@ -48,7 +48,7 @@ from typing import Any, TextIO
 from pydantic import BaseModel
 
 from langchain.agents import create_agent
-from langchain.agents.structured_output import StructuredOutputError, ToolStrategy
+from langchain.agents.structured_output import ProviderStrategy, StructuredOutputError
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from medical.utils.log import logger
@@ -140,6 +140,10 @@ def _json_for_prompt(value: Any) -> str:
 def _chief_complaint(record: dict[str, Any]) -> str:
     return _text(record.get("doc_ass_stu_appeal"))
 
+def _chief_patient_complaint(record: dict[str, Any]) -> str:
+    return _text(record.get("doc_ass_stu_appeal"))
+
+
 
 def _present_history(record: dict[str, Any]) -> str:
     return _text(record.get("new_medical_history") or record.get("present_history"))
@@ -185,6 +189,19 @@ def _history_payload(record: dict[str, Any], ai: bool = False) -> dict[str, str]
     return {field: _text(record.get(f"{prefix}{field}")) for field in HISTORY_FIELDS}
 
 
+def _diagnosis_payload(record: dict[str, Any], *, prefer_ai: bool = False) -> dict[str, str]:
+    diagnoses = {}
+    for field in DIAGNOSIS_FIELDS:
+        ai_value = _text(record.get(f"ai_{field}"))
+        raw_value = _text(record.get(field))
+        diagnoses[field] = (ai_value or raw_value) if prefer_ai else raw_value
+    return diagnoses
+
+
+def _has_any_diagnosis(diagnoses: dict[str, str]) -> bool:
+    return any(_text(value) for value in diagnoses.values())
+
+
 def _model_dump(model: BaseModel, *, by_alias: bool = False) -> dict[str, Any]:
     """兼容 Pydantic v1/v2 的序列化接口."""
     if hasattr(model, "model_dump"):
@@ -196,14 +213,15 @@ def _load_prompt(name: str) -> str:
     return (PROMPT_DIR / name).read_text(encoding="utf-8").strip()
 
 
-def _tool_response_format(schema: type[BaseModel]) -> ToolStrategy[Any]:
-    # 禁止 LangChain 在同一次 Agent 会话中反复调用相同结构化输出工具。
-    # 校验失败后由 _invoke_structured_agent 使用全新会话做一次有限重试。
-    return ToolStrategy(schema, handle_errors=False)
+def _provider_response_format(schema: type[BaseModel]) -> ProviderStrategy[Any]:
+    # 使用 provider 原生结构化输出，避免 ToolStrategy 发送 tool_choice=required；
+    # DashScope/DeepSeek thinking mode 与该 tool_choice 组合不兼容。
+    return ProviderStrategy(schema)
 
 
 def _invoke_structured_agent(agent: Any, message: HumanMessage, schema: type[BaseModel]) -> BaseModel:
     last_error: StructuredOutputError | None = None
+    # logger.debug(f"humanmessage: {message}")
     for attempt in range(2):
         messages = [message]
         if attempt:
@@ -289,21 +307,21 @@ class MedicalRecordAgents:
                 "与本次相关的检查；纠正明确错别字，删除乱码、重复符号和无意义文本。"
                 "不得新增原文没有的症状、诊断、时间或检查结果；无法确定本次段落时返回空字符串。"
             ),
-            response_format=_tool_response_format(CurrentVisitHistoryResult),
+            response_format=_provider_response_format(CurrentVisitHistoryResult),
             name="current_visit_history_agent",
         )
         self.inspection_agent = create_agent(
             model=vlm_model,
             tools=[],
             system_prompt=_load_prompt("inspection_report_analysis_prompt.txt"),
-            response_format=_tool_response_format(InspectionResult),
+            response_format=_provider_response_format(InspectionResult),
             name="inspection_report_agent",
         )
         self.tongue_face_agent = create_agent(
             model=vlm_model,
             tools=[],
             system_prompt=_load_prompt("tongue_face_analysis_prompt.txt"),
-            response_format=_tool_response_format(TongueFaceResult),
+            response_format=_provider_response_format(TongueFaceResult),
             name="tongue_face_agent",
         )
 
@@ -313,7 +331,7 @@ class MedicalRecordAgents:
             model=model,
             tools=[],
             system_prompt=_load_prompt("fill_diagnosis_prompt.txt"),
-            response_format=_tool_response_format(DiagnosisResult),
+            response_format=_provider_response_format(DiagnosisResult),
             name="diagnosis_completion_agent",
         )
 
@@ -323,7 +341,7 @@ class MedicalRecordAgents:
             model=model,
             tools=[],
             system_prompt=_load_prompt("clinical_record_cleaning_prompt.txt"),
-            response_format=_tool_response_format(HistoryCleaningResult),
+            response_format=_provider_response_format(HistoryCleaningResult),
             name="history_cleaning_agent",
         )
 
@@ -332,12 +350,8 @@ class MedicalRecordAgents:
         return create_agent(
             model=model,
             tools=[],
-            system_prompt=(
-                "你是中医临床知识结构化助手。仅从输入病历提取病因、病机、病位"
-                "病期、病程、关键症状。区分病历明确记载与可由症状直接归纳的内容；"
-                "不要加入方药知识或无依据诊断。无法判断的字段返回空值。列表内容需去重且简洁。"
-            ),
-            response_format=_tool_response_format(ClinicalExtractionResult),
+            system_prompt=_load_prompt("extract_prompt.txt"),
+            response_format=_provider_response_format(ClinicalExtractionResult),
             name="clinical_extraction_agent",
         )
 
@@ -353,14 +367,28 @@ class MedicalRecordAgents:
         for field in DIAGNOSIS_FIELDS:
             record.setdefault(f"ai_{field}", "")
             record.setdefault(f"ai_{field}_reason", "")
-        source_diagnoses = {field: _text(record.get(field)) for field in DIAGNOSIS_FIELDS}
+        protected_diagnoses = record.get("__original_diagnoses")
+        if not isinstance(protected_diagnoses, dict):
+            protected_diagnoses = _diagnosis_payload(record)
+        source_diagnoses = {field: _text(protected_diagnoses.get(field)) for field in DIAGNOSIS_FIELDS}
+        previous_diagnoses = record.get("__previous_diagnoses") or {}
+        if not isinstance(previous_diagnoses, dict):
+            previous_diagnoses = {}
+        previous_diagnoses = {field: _text(previous_diagnoses.get(field)) for field in DIAGNOSIS_FIELDS}
+
         result = _invoke_structured_agent(
             self.diagnosis_agent,
             HumanMessage(
                 content=(
-                    f"本次规范主诉：{_latest_chief_complaint(record)}\n"
-                    f"本次现病史（已排除“本次检查资料”补充段落）：{_diagnosis_present_history(record)}\n"
-                    f"三个原始诊断来源字段（可能错位或混填）：{_json_for_prompt(source_diagnoses)}"
+                    f"本次就诊患者主诉：{_latest_chief_complaint(record)}\n"
+                    f"本次就诊现病史：{_diagnosis_present_history(record)}\n"
+                    f"三个原始诊断结果：{_json_for_prompt(source_diagnoses)}\n"
+                    f"原始诊断为空的字段："
+                    f"{_json_for_prompt([field for field, value in source_diagnoses.items() if not value])}\n"
+                    f"上一次同患者诊断结果（如为空表示无上一诊断可参考）：{_json_for_prompt(previous_diagnoses)}\n"
+                    "要求：原始诊断字段非空时必须原样保留，不得改写；"
+                    "仅对原始诊断为空的字段补全。补全时先从其他原始诊断字段中提取对应类别结果，"
+                    "仍为空再结合本次主诉、本次现病史和上一次诊断结果补全。最终三个字段均不能为空。"
                 )
             ),
             DiagnosisResult,
@@ -372,7 +400,15 @@ class MedicalRecordAgents:
             "diagnosis_disease": normalize_syndrome_value,
         }
         for field in DIAGNOSIS_FIELDS:
+            original_value = _clean_generated_text(source_diagnoses.get(field))
+            if original_value:
+                record[f"ai_{field}"] = original_value
+                record[f"ai_{field}_reason"] = "原字段非空，按要求保留原诊断结果。"
+                continue
+
             record[f"ai_{field}"] = normalizers[field](_clean_generated_text(values.get(field)))
+            if not record[f"ai_{field}"]:
+                raise ValueError(f"DiagnosisResult.{field} 不能为空")
             record[f"ai_{field}_reason"] = (
                 _clean_generated_text(values.get(f"{field}_reason")) if record[f"ai_{field}"] else ""
             )
@@ -388,7 +424,8 @@ class MedicalRecordAgents:
                 content=(
                     f"本次就诊时间：{_visit_time(record) or '未记录'}\n"
                     f"就诊类型：{_text(record.get('is_first')) or '未记录'}\n"
-                    f"主诉：{_chief_complaint(record) or '未记录'}\n"
+                    f"患者主诉：{_chief_patient_complaint(record) or '未记录'}\n"
+                    f"医生撰写主诉：{_chief_complaint(record) or '未记录'}\n"
                     f"累积现病史原文：\n{history}"
                 )
             ),
@@ -402,7 +439,7 @@ class MedicalRecordAgents:
             self.history_agent,
             HumanMessage(
                 content=(
-                    f"原始主诉（doc_ass_stu_appeal）：{_chief_complaint(record)}\n"
+                    f"患者主诉（doc_ass_stu_appeal）：{_chief_complaint(record)}\n"
                     f"本次现病史：{_latest_present_history(record)}\n"
                     f"原始五史：{_json_for_prompt(histories)}\n"
                     f"检查报告图片分析：{_json_for_prompt(record.get('ai_inspection_report_img', {}))}\n"
@@ -484,6 +521,7 @@ class MedicalRecordAgents:
 
     def process(self, record: dict[str, Any], *, extract_current_history: bool = False) -> dict[str, Any]:
         output = dict(record)
+        output["__original_diagnoses"] = _diagnosis_payload(output)
         errors = []
 
         # step1：先做不依赖诊断类型的基础归一化，不额外存储 ai_normalized_*。
@@ -530,6 +568,8 @@ class MedicalRecordAgents:
             output["ai_processing_errors"] = errors
         else:
             output.pop("ai_processing_errors", None)
+        output.pop("__original_diagnoses", None)
+        output.pop("__previous_diagnoses", None)
         return output
 
 
@@ -673,12 +713,13 @@ def build_model(
         or model_id.startswith(("qwen", "qwq"))
     )
     if getattr(args, "disable_thinking", False) or is_dashscope_thinking_model:
-        # LangChain 的 ToolStrategy 会发送 tool_choice=required；DashScope thinking mode
-        # 不支持该组合，因此结构化输出 Agent 必须关闭 thinking mode。
-        kwargs["extra_body"] = {"enable_thinking": False}
+        # 部分 OpenAI 兼容接口默认开启 thinking mode；结构化输出场景下显式关闭。
+        if "deepseek" in model_id:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        else:
+            kwargs["extra_body"] = {"enable_thinking": False}
     logger.debug(
-        f'model={model_name} base_url={resolved_base_url} '
-        f'enable_thinking={kwargs.get("extra_body", {}).get("enable_thinking", "provider-default")}',
+        f"model={model_name} base_url={resolved_base_url} extra_body={kwargs.get('extra_body', {})}",
     )
     return ChatOpenAI(**kwargs)
 
@@ -704,29 +745,38 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     attempted = 0
     output_files: dict[Path, TextIO] = {}
     failure_files: dict[Path, TextIO] = {}
+    previous_diagnoses_by_patient: dict[str, dict[str, str]] = {}
 
     with ExitStack() as stack:
         for index, record in enumerate(iter_records(args.input), 1):
             if not _doctor_matches(record, doctor_ids):
                 continue
             identity = _record_identity(record, index)
+            patient_key = _patient_key(record)
             if identity in processed_ids:
+                skipped_diagnoses = _diagnosis_payload(record, prefer_ai=True)
+                if patient_key and _has_any_diagnosis(skipped_diagnoses):
+                    previous_diagnoses_by_patient[patient_key] = skipped_diagnoses
                 skipped += 1
                 continue
             if args.limit and attempted >= args.limit:
                 break
             attempted += 1
             record_id = _record_key(record, index)
-            patient_key = _patient_key(record)
             extract_current_history = (
                 _text(record.get("is_first")) == "复诊"
                 and bool(patient_key)
                 and patient_visit_counts[patient_key] > 1
             )
+            working_record = dict(record)
+            if patient_key and patient_key in previous_diagnoses_by_patient:
+                working_record["__previous_diagnoses"] = previous_diagnoses_by_patient[patient_key]
             try:
-                enriched = agents.process(record, extract_current_history=extract_current_history)
+                enriched = agents.process(working_record, extract_current_history=extract_current_history)
             except Exception as exc:  # 单条失败不能中断其他医生/病历
-                enriched = dict(record)
+                enriched = dict(working_record)
+                enriched.pop("__previous_diagnoses", None)
+                enriched.pop("__original_diagnoses", None)
                 enriched["ai_processing_errors"] = [
                     {"stage": "record", "error": f"{type(exc).__name__}: {exc}"}
                 ]
@@ -743,6 +793,8 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                     raise
             else:
                 enriched["ai_record_identity"] = identity
+                enriched.pop("__previous_diagnoses", None)
+                enriched.pop("__original_diagnoses", None)
                 if enriched.get("ai_processing_errors"):
                     failed += 1
                     enriched["ai_processing_complete"] = False
@@ -764,6 +816,9 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                         output_files[output_path] = stack.enter_context(output_path.open("a", encoding="utf-8"))
                     _write_jsonl(output_files[output_path], enriched)
                     processed_ids.add(identity)
+            enriched_diagnoses = _diagnosis_payload(enriched, prefer_ai=True)
+            if patient_key and _has_any_diagnosis(enriched_diagnoses):
+                previous_diagnoses_by_patient[patient_key] = enriched_diagnoses
             if args.interval > 0:
                 time.sleep(args.interval)
     return succeeded, failed, skipped
@@ -791,24 +846,24 @@ def parse_args() -> argparse.Namespace:
         "--base-url",
         "--text-base-url",
         dest="base_url",
-        default=os.getenv("MEDICAL_AGENT_BASE_URL", os.getenv("DASHSCOPE_BASE_URL", "")),
+        default=os.getenv("DASHSCOPE_BASE_URL", os.getenv("DASHSCOPE_BASE_URL", "")),
         help="文本模型 OpenAI 兼容接口地址",
     )
     parser.add_argument(
         "--api-key",
         "--text-api-key",
         dest="api_key",
-        default=os.getenv("MEDICAL_AGENT_API_KEY", os.getenv("DASHSCOPE_API_KEY", "")),
+        default=os.getenv("DASHSCOPE_API_KEY", os.getenv("DASHSCOPE_API_KEY", "")),
         help="文本模型 API Key",
     )
     parser.add_argument(
         "--vlm-base-url",
-        default=os.getenv("MEDICAL_AGENT_VLM_BASE_URL", ""),
+        default=os.getenv("DASHSCOPE_BASE_URL", ""),
         help="视觉模型 OpenAI 兼容接口地址；默认使用文本模型接口地址",
     )
     parser.add_argument(
         "--vlm-api-key",
-        default=os.getenv("MEDICAL_AGENT_VLM_API_KEY", ""),
+        default=os.getenv("DASHSCOPE_API_KEY", ""),
         help="视觉模型 API Key；默认使用文本模型 API Key",
     )
     parser.add_argument("--doctor-id", action="append", help="仅处理指定 doctor_id；可重复传入，默认所有医生")

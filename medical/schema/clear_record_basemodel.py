@@ -6,12 +6,20 @@ from pydantic import BaseModel, Field, field_validator
 class DiagnosisResult(BaseModel):
     """三个诊断字段重新分类及补全后的结果."""
 
-    diagnosis_illness: str = Field(default="", description="西医疾病诊断；证据不足时为空")
+    diagnosis_illness: str = Field(..., min_length=1, description="西医疾病诊断；不能为空或占位词")
     diagnosis_illness_reason: str = Field(default="", description="西医诊断的来源、重新分类或补全依据")
-    diagnosis_disease: str = Field(default="", description="中医证型/证候诊断；证据不足时为空")
+    diagnosis_disease: str = Field(..., min_length=1, description="中医证型/证候诊断；不能为空或占位词")
     diagnosis_disease_reason: str = Field(default="", description="中医证候的来源、重新分类或补全依据")
-    diagnosis_sickness: str = Field(default="", description="中医疾病诊断；证据不足时为空")
+    diagnosis_sickness: str = Field(..., min_length=1, description="中医疾病诊断；不能为空或占位词")
     diagnosis_sickness_reason: str = Field(default="", description="中医疾病的来源、重新分类或补全依据")
+
+    @field_validator("diagnosis_illness", "diagnosis_disease", "diagnosis_sickness", mode="before")
+    @classmethod
+    def require_diagnosis_value(cls, value: Any) -> str:
+        text = "" if value is None else str(value).strip()
+        if text.lower() in {"", "null", "none", "无", "未知", "未明确", "不详", "待查", "暂无", "正常"}:
+            raise ValueError("诊断结果不能为空或占位词")
+        return text
 
 
 class HistoryCleaningResult(BaseModel):
