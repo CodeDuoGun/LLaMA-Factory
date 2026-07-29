@@ -45,11 +45,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, TextIO
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from langchain.agents import create_agent
-from langchain.agents.structured_output import ProviderStrategy, StructuredOutputError
-from langchain_core.messages import HumanMessage
+from langchain.agents.structured_output import StructuredOutputError, ToolStrategy
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from medical.utils.log import logger
 from dotenv import load_dotenv
@@ -198,6 +198,44 @@ def _diagnosis_payload(record: dict[str, Any], *, prefer_ai: bool = False) -> di
     return diagnoses
 
 
+def _diagnosis_reason_fallback(
+    field: str,
+    diagnosis: str,
+    source_diagnoses: dict[str, str],
+    previous_diagnoses: dict[str, str],
+    chief_complaint: str,
+    present_history: str,
+) -> str:
+    """在模型遗漏 reason 时生成基于输入上下文的可核验原因."""
+    source_labels = {
+        "diagnosis_illness": "西医诊断",
+        "diagnosis_disease": "中医证候",
+        "diagnosis_sickness": "中医病名",
+    }
+    for source_field, source_value in source_diagnoses.items():
+        if source_field != field and diagnosis in source_value:
+            return (
+                f"原字段为空，从原始{source_labels[source_field]}字段“{source_value}”中"
+                f"提取并补全为“{diagnosis}”。"
+            )
+
+    def evidence_excerpt(value: str, limit: int = 80) -> str:
+        text = re.sub(r"\s+", " ", value).strip()
+        return text if len(text) <= limit else f"{text[:limit]}……"
+
+    evidence = []
+    if chief_complaint:
+        evidence.append(f"本次主诉“{evidence_excerpt(chief_complaint)}”")
+    if present_history:
+        evidence.append(f"本次现病史“{evidence_excerpt(present_history)}”")
+    previous_value = previous_diagnoses.get(field, "")
+    if previous_value and diagnosis in previous_value:
+        evidence.append(f"上一次同患者诊断“{previous_value}”")
+    if evidence:
+        return f"原字段为空，依据{'、'.join(evidence)}补全为“{diagnosis}”。"
+    return f"原字段为空，依据已有诊断上下文补全为“{diagnosis}”；当前病历未提供更具体的补全依据。"
+
+
 def _has_any_diagnosis(diagnoses: dict[str, str]) -> bool:
     return any(_text(value) for value in diagnoses.values())
 
@@ -213,15 +251,14 @@ def _load_prompt(name: str) -> str:
     return (PROMPT_DIR / name).read_text(encoding="utf-8").strip()
 
 
-def _provider_response_format(schema: type[BaseModel]) -> ProviderStrategy[Any]:
-    # 使用 provider 原生结构化输出，避免 ToolStrategy 发送 tool_choice=required；
-    # DashScope/DeepSeek thinking mode 与该 tool_choice 组合不兼容。
-    return ProviderStrategy(schema)
+def _tool_response_format(schema: type[BaseModel]) -> ToolStrategy[Any]:
+    """统一通过工具调用生成并校验结构化响应."""
+    return ToolStrategy(schema=schema, handle_errors=True)
 
 
 def _invoke_structured_agent(agent: Any, message: HumanMessage, schema: type[BaseModel]) -> BaseModel:
     last_error: StructuredOutputError | None = None
-    # logger.debug(f"humanmessage: {message}")
+    logger.debug(f"humanmessage: {message}")
     for attempt in range(2):
         messages = [message]
         if attempt:
@@ -247,6 +284,55 @@ def _invoke_structured_agent(agent: Any, message: HumanMessage, schema: type[Bas
     if last_error is not None:
         raise last_error
     raise RuntimeError(f"Agent 未返回 {schema.__name__} structured_response")
+
+
+def _response_text(response: Any) -> str:
+    """兼容 OpenAI 风格响应的字符串或内容块格式."""
+    content = getattr(response, "content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        texts = []
+        for block in content:
+            if isinstance(block, str):
+                texts.append(block)
+            elif isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
+                texts.append(_text(block.get("text")))
+        return "\n".join(text for text in texts if text).strip()
+    return _text(content)
+
+
+def _invoke_json_object_model(
+    model: Any,
+    system_prompt: str,
+    message: HumanMessage,
+    schema: type[BaseModel],
+) -> BaseModel:
+    """调用仅支持 json_object 的 OpenAI 兼容模型，并在客户端完成模型校验."""
+    last_error: json.JSONDecodeError | ValidationError | None = None
+    for attempt in range(2):
+        messages = [SystemMessage(content=system_prompt), message]
+        if attempt:
+            messages.append(
+                HumanMessage(
+                    content=(
+                        f"上一次返回内容无法通过 {schema.__name__} 校验。"
+                        "请重新返回一个完整、可解析的 json 对象，所有要求字段均不得省略，"
+                        "不要输出 Markdown、注释或额外说明。"
+                    )
+                )
+            )
+        response = model.invoke(messages)
+        raw_text = _response_text(response)
+        if raw_text.startswith("```") and raw_text.endswith("```"):
+            raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.IGNORECASE).strip()
+        try:
+            return schema.model_validate(json.loads(raw_text))
+        except (json.JSONDecodeError, ValidationError) as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"模型未返回可解析的 {schema.__name__} json 对象")
 
 
 def _image_value(item: Any) -> str:
@@ -291,9 +377,15 @@ def _multimodal_message(prompt: str, images: list[str], input_dir: Path) -> Huma
 class MedicalRecordAgents:
     """病历诊断、五史清洗、视觉分析和病机抽取 Agent 集合."""
 
-    def __init__(self, text_model: ChatOpenAI, vlm_model: ChatOpenAI, input_dir: Path) -> None:
+    def __init__(
+        self,
+        text_model: ChatOpenAI,
+        vlm_model: ChatOpenAI,
+        input_dir: Path,
+        diagnosis_model: ChatOpenAI | None = None,
+    ) -> None:
         self.input_dir = input_dir
-        self.diagnosis_agent = self._build_diagnosis_agent(text_model)
+        self.diagnosis_agent = self._build_diagnosis_agent(diagnosis_model or text_model)
         self.history_agent = self._build_history_agent(text_model)
         self.extract_agent = self._build_extract_agent(text_model)
         self.current_visit_history_agent = create_agent(
@@ -307,33 +399,29 @@ class MedicalRecordAgents:
                 "与本次相关的检查；纠正明确错别字，删除乱码、重复符号和无意义文本。"
                 "不得新增原文没有的症状、诊断、时间或检查结果；无法确定本次段落时返回空字符串。"
             ),
-            response_format=_provider_response_format(CurrentVisitHistoryResult),
+            response_format=_tool_response_format(CurrentVisitHistoryResult),
             name="current_visit_history_agent",
         )
         self.inspection_agent = create_agent(
             model=vlm_model,
             tools=[],
             system_prompt=_load_prompt("inspection_report_analysis_prompt.txt"),
-            response_format=_provider_response_format(InspectionResult),
+            response_format=_tool_response_format(InspectionResult),
             name="inspection_report_agent",
         )
         self.tongue_face_agent = create_agent(
             model=vlm_model,
             tools=[],
             system_prompt=_load_prompt("tongue_face_analysis_prompt.txt"),
-            response_format=_provider_response_format(TongueFaceResult),
+            response_format=_tool_response_format(TongueFaceResult),
             name="tongue_face_agent",
         )
 
     @staticmethod
     def _build_diagnosis_agent(model: ChatOpenAI) -> Any:
-        return create_agent(
-            model=model,
-            tools=[],
-            system_prompt=_load_prompt("fill_diagnosis_prompt.txt"),
-            response_format=_provider_response_format(DiagnosisResult),
-            name="diagnosis_completion_agent",
-        )
+        # Baichuan accepts json_object, but rejects ToolStrategy's tool_choice and
+        # ProviderStrategy's JSON Schema request body. Validate the JSON locally.
+        return model.bind(response_format={"type": "json_object"})
 
     @staticmethod
     def _build_history_agent(model: ChatOpenAI) -> Any:
@@ -341,7 +429,7 @@ class MedicalRecordAgents:
             model=model,
             tools=[],
             system_prompt=_load_prompt("clinical_record_cleaning_prompt.txt"),
-            response_format=_provider_response_format(HistoryCleaningResult),
+            response_format=_tool_response_format(HistoryCleaningResult),
             name="history_cleaning_agent",
         )
 
@@ -351,7 +439,7 @@ class MedicalRecordAgents:
             model=model,
             tools=[],
             system_prompt=_load_prompt("extract_prompt.txt"),
-            response_format=_provider_response_format(ClinicalExtractionResult),
+            response_format=_tool_response_format(ClinicalExtractionResult),
             name="clinical_extraction_agent",
         )
 
@@ -375,20 +463,24 @@ class MedicalRecordAgents:
         if not isinstance(previous_diagnoses, dict):
             previous_diagnoses = {}
         previous_diagnoses = {field: _text(previous_diagnoses.get(field)) for field in DIAGNOSIS_FIELDS}
+        chief_complaint = _latest_chief_complaint(record)
+        present_history = _diagnosis_present_history(record)
 
-        result = _invoke_structured_agent(
+        result = _invoke_json_object_model(
             self.diagnosis_agent,
+            _load_prompt("fill_diagnosis_prompt.txt"),
             HumanMessage(
                 content=(
-                    f"本次就诊患者主诉：{_latest_chief_complaint(record)}\n"
-                    f"本次就诊现病史：{_diagnosis_present_history(record)}\n"
+                    f"本次就诊患者主诉：{chief_complaint}\n"
+                    f"本次就诊现病史：{present_history}\n"
                     f"三个原始诊断结果：{_json_for_prompt(source_diagnoses)}\n"
                     f"原始诊断为空的字段："
                     f"{_json_for_prompt([field for field, value in source_diagnoses.items() if not value])}\n"
                     f"上一次同患者诊断结果（如为空表示无上一诊断可参考）：{_json_for_prompt(previous_diagnoses)}\n"
                     "要求：原始诊断字段非空时必须原样保留，不得改写；"
                     "仅对原始诊断为空的字段补全。补全时先从其他原始诊断字段中提取对应类别结果，"
-                    "仍为空再结合本次主诉、本次现病史和上一次诊断结果补全。最终三个字段均不能为空。"
+                    "仍为空再结合本次主诉、本次现病史和上一次诊断结果补全。最终所有字段值均不能为空。"
+
                 )
             ),
             DiagnosisResult,
@@ -409,9 +501,17 @@ class MedicalRecordAgents:
             record[f"ai_{field}"] = normalizers[field](_clean_generated_text(values.get(field)))
             if not record[f"ai_{field}"]:
                 raise ValueError(f"DiagnosisResult.{field} 不能为空")
-            record[f"ai_{field}_reason"] = (
-                _clean_generated_text(values.get(f"{field}_reason")) if record[f"ai_{field}"] else ""
-            )
+            reason = _clean_generated_text(values.get(f"{field}_reason"))
+            if not reason:
+                reason = _diagnosis_reason_fallback(
+                    field,
+                    record[f"ai_{field}"],
+                    source_diagnoses,
+                    previous_diagnoses,
+                    chief_complaint,
+                    present_history,
+                )
+            record[f"ai_{field}_reason"] = reason
 
     def extract_current_visit_history(self, record: dict[str, Any], enabled: bool) -> None:
         record["ai_new_medical_history"] = ""
@@ -462,6 +562,10 @@ class MedicalRecordAgents:
                     "" if original in INVALID_HISTORY_TEXT else _clean_generated_text(values.get(field))
                 )
 
+    def build_illness_knowledge(self, diagnosis_res:dict):
+        """根据不同医生--不同疾病--不同病期---不同治则治法—不同配伍用药知识库召回疾病知识."""
+        return ''
+
     def analyze_inspection_images(self, record: dict[str, Any]) -> None:
         images = _as_images(record.get("inspection_report_img") or record.get("admin_report_img"))
         if not images:
@@ -481,9 +585,9 @@ class MedicalRecordAgents:
             record["ai_tongue_face_img"] = _model_dump(TongueFaceResult())
             return
         prompt = (
-            "分析图片中的可见舌象、面象和患处。tongue 可记录舌质/舌色/舌形/苔色/苔质；"
-            "face 可记录面色/光泽/形态；lesions 可记录部位/形态/颜色/边界/范围。"
-            "只描述图像可见事实，不根据外观作确定性诊断；不存在或无法辨认的类别返回空对象。"
+            "按结构化模型分析图片中的可见舌象、面象和患处。分别记录舌体、舌苔、舌下络脉、"
+            "面神、面色、光泽、面部形态、五官局部和皮损。只描述图像可见事实，不作疾病、证候、"
+            "病因或病机推断；无法辨认的字符串字段返回空字符串，多选字段返回空数组。"
         )
         result = _invoke_structured_agent(
             self.tongue_face_agent,
@@ -492,7 +596,7 @@ class MedicalRecordAgents:
         )
         record["ai_tongue_face_img"] = _model_dump(result)
 
-    def extract_clinical_fields(self, record: dict[str, Any]) -> None:
+    def extract_clinical_fields(self, record: dict[str, Any], use_rag:bool=False) -> None:
         diagnoses = {
             field: _text(record.get(f"ai_{field}")) or _text(record.get(field))
             for field in DIAGNOSIS_FIELDS
@@ -501,6 +605,7 @@ class MedicalRecordAgents:
             field: _text(record.get(f"ai_{field}")) if f"ai_{field}" in record else _text(record.get(field))
             for field in HISTORY_FIELDS
         }
+        illness_knowledge = self.build_illness_knowledge(diagnoses) if use_rag else "无"
         result = _invoke_structured_agent(
             self.extract_agent,
             HumanMessage(
@@ -510,7 +615,9 @@ class MedicalRecordAgents:
                     f"清洗后五史：{_json_for_prompt(histories)}\n"
                     f"诊断上下文：{_json_for_prompt(diagnoses)}\n"
                     f"检查报告图片分析：{_json_for_prompt(record.get('ai_inspection_report_img', {}))}\n"
-                    f"舌面患处图片分析：{_json_for_prompt(record.get('ai_tongue_face_img', {}))}"
+                    f"舌面患处图片分析：{_json_for_prompt(record.get('ai_tongue_face_img', {}))}\n"
+                    f"疾病的知识库信息 {illness_knowledge}\n"
+                    f"严格根据知识库知识，提取患者在中医层面的病因、病机、病期、病位、病程、临床症状。若知识库无知识，根据患者病史信息完成上述内容提取。必须返回合法的 JSON 对象，不要输出 Markdown，不要输出额外解释"
                 )
             ),
             ClinicalExtractionResult,
@@ -519,7 +626,7 @@ class MedicalRecordAgents:
         for field, value in values.items():
             record[f"ai_{field}"] = _clean_generated_value(value)
 
-    def process(self, record: dict[str, Any], *, extract_current_history: bool = False) -> dict[str, Any]:
+    def process(self, record: dict[str, Any], *, extract_current_history: bool = False, use_rag:bool=False) -> dict[str, Any]:
         output = dict(record)
         output["__original_diagnoses"] = _diagnosis_payload(output)
         errors = []
@@ -556,14 +663,15 @@ class MedicalRecordAgents:
             errors.append({"stage": "clinical_cleaning", "error": f"{type(exc).__name__}: {exc}"})
 
         # step5：用最新病历补全诊断，再提取知识库字段。
-        for stage_name, stage in (
-            ("diagnosis_completion", self.complete_diagnoses),
-            ("clinical_extraction", self.extract_clinical_fields),
-        ):
-            try:
-                stage(output)
-            except Exception as exc:
-                errors.append({"stage": stage_name, "error": f"{type(exc).__name__}: {exc}"})
+        try:
+            self.complete_diagnoses(output)
+        except Exception as exc:
+            errors.append({"stage": "diagnosis_completion", "error": f"{type(exc).__name__}: {exc}"})
+
+        try:
+            self.extract_clinical_fields(output, use_rag)
+        except Exception as exc:
+            errors.append({"stage": "clinical_extraction", "error": f"{type(exc).__name__}: {exc}"})
         if errors:
             output["ai_processing_errors"] = errors
         else:
@@ -729,6 +837,12 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     doctor_ids = set(args.doctor_id or [])
 
     text_model = build_model(args.model, args)
+    diagnosis_model = build_model(
+        args.diagnosis_model,
+        args,
+        base_url=args.diagnosis_base_url,
+        api_key=args.diagnosis_api_key,
+    )
     vlm_model = build_model(
         args.vlm_model or args.model,
         args,
@@ -736,7 +850,7 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         api_key=getattr(args, "vlm_api_key", "") or args.api_key,
     )
     input_dir = args.input if args.input.is_dir() else args.input.parent
-    agents = MedicalRecordAgents(text_model, vlm_model, input_dir)
+    agents = MedicalRecordAgents(text_model, vlm_model, input_dir, diagnosis_model=diagnosis_model)
     patient_visit_counts = count_patient_visits(args.input, doctor_ids)
     processed_ids = set() if args.reprocess else load_processed_record_ids(args.output_dir)
     succeeded = 0
@@ -772,7 +886,7 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
             if patient_key and patient_key in previous_diagnoses_by_patient:
                 working_record["__previous_diagnoses"] = previous_diagnoses_by_patient[patient_key]
             try:
-                enriched = agents.process(working_record, extract_current_history=extract_current_history)
+                enriched = agents.process(working_record, extract_current_history=extract_current_history, use_rag=args.use_rag)
             except Exception as exc:  # 单条失败不能中断其他医生/病历
                 enriched = dict(working_record)
                 enriched.pop("__previous_diagnoses", None)
@@ -841,6 +955,21 @@ def parse_args() -> argparse.Namespace:
         help=f"分医生 JSONL 输出目录；默认 {DEFAULT_OUTPUT_DIR}",
     )
     parser.add_argument("--model", default=os.getenv("MEDICAL_AGENT_MODEL", "gpt-4.1-mini"), help="文本模型")
+    parser.add_argument(
+        "--diagnosis-model",
+        default=os.getenv("BAICHUAN_TEXT_MODEL", "Baichuan4-Turbo"),
+        help="诊断补全模型，默认使用 Baichuan",
+    )
+    parser.add_argument(
+        "--diagnosis-base-url",
+        default=os.getenv("BAICHUAN_BASE_URL", "https://api.baichuan-ai.com/v1/"),
+        help="诊断补全模型的 OpenAI 兼容接口地址",
+    )
+    parser.add_argument(
+        "--diagnosis-api-key",
+        default=os.getenv("BAICHUAN_API_KEY", ""),
+        help="诊断补全模型 API Key",
+    )
     parser.add_argument("--vlm-model", default=os.getenv("MEDICAL_AGENT_VLM_MODEL", ""), help="视觉模型，默认同文本模型")
     parser.add_argument(
         "--base-url",
@@ -878,6 +1007,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--reprocess", action="store_true", help="忽略已有成功记录并重新处理")
     parser.add_argument("--fail-fast", action="store_true", help="任一病历失败时立即退出")
+    parser.add_argument("--use-rag", type=bool, default=False, help="是否使用病因提取中医知识库")
     return parser.parse_args()
 
 

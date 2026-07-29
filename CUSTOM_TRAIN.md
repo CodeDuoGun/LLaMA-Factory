@@ -152,7 +152,6 @@ ai_disease_location：病位，涉及的脏腑、经络或组织。
 ai_disease_nature：病性，如寒、热、虚、实。
 ai_disease_stage：病期，如初期、进展期、恢复期。
 ai_disease_course：病程长度及演变情况。
-ai_syndrome_elements：证素，如痰、湿、热、瘀。
 ai_onset_triggers：诱因，如受凉、饮食、情绪变化。
 ai_key_symptoms：用于辨证和知识库检索的关键症状。
 ai_record_identity：增量处理唯一标识，格式为“医生ID:病历ID”。

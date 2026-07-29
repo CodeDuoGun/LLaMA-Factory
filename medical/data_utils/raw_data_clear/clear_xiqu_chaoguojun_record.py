@@ -390,6 +390,7 @@ def build_record_dict(
         is_first=(visit_type_map or {}).get(mzh, ""),
         created_at=visit_time_str,
         start_time=visit_time_str,
+        see_doc_time=visit_time_str,
         stop_time="",
         user_info_id="",
         patient_id="",

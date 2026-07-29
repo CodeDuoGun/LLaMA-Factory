@@ -21,7 +21,6 @@ class DiagnosisResult(BaseModel):
             raise ValueError("诊断结果不能为空或占位词")
         return text
 
-
 class HistoryCleaningResult(BaseModel):
     """主诉、现病史一致性校验及五史清洗结果."""
 
@@ -83,41 +82,134 @@ class InspectionResult(BaseModel):
 class TongueBodyFeatures(BaseModel):
     """舌质特征."""
 
-    color: str = Field(default="", description="淡红、淡白、淡黄、黄、红、绛、青紫、蓝、黑之一")
-    type: str = Field(default="", description="正常、胖大、瘦薄、裂纹、齿痕、芒刺、老嫩，可用顿号组合")
+    color: str = Field(default="", description="舌色：淡白、淡红、红、绛或青紫")
+    shape: list[str] = Field(
+        default_factory=list,
+        description="舌形：老、嫩、胖、大、瘦、点刺、裂纹或齿痕",
+    )
+    posture: list[str] = Field(
+        default_factory=list,
+        description="舌态：痿软、强硬、歪斜、颤动、吐弄或短缩",
+    )
+    fluid: str = Field(default="", description="舌体津液状态：润、干、少津或无津")
+    surface: list[str] = Field(default_factory=list, description="舌体表面其他可见特征，如瘀点、红点或芒刺")
 
 
 class TongueCoatFeatures(BaseModel):
     """舌苔特征."""
 
-    color: str = Field(default="", description="白、淡黄、黄、灰、黑、霉酱、绿、染之一")
-    type: str = Field(default="", description="匀、厚、薄、润、燥、滑、糙、腻、腐、剥落、有根或无根")
+    color: str = Field(default="", description="苔色：白苔、黄苔、灰苔或黑苔")
+    thickness: str = Field(default="", description="厚薄：薄苔或厚苔")
+    moisture: str = Field(default="", description="润燥：润苔、滑苔、燥苔或糙苔")
+    texture: str = Field(default="", description="腐腻：腻苔、腐苔或霉酱苔；无明显腐腻时为空")
+    integrity: str = Field(default="", description="完整程度：全苔、偏苔、剥苔、花剥苔或地图舌")
+    root: str = Field(default="", description="根性：有根苔或无根苔")
+    distribution: list[str] = Field(
+        default_factory=list,
+        description="舌苔分布：舌尖、舌中、舌边、舌根或整体",
+    )
 
 
 class TongueVeinFeatures(BaseModel):
     """舌下络脉特征."""
 
-    color: str = Field(default="", description="淡紫、略青、青紫、紫黑或暗红")
-    type: str = Field(default="", description="粗细、长度、曲张、瘀点、迂曲、怒张、囊泡、分支或对称性")
+    color: str = Field(default="", description="舌下络脉颜色：正常、淡紫、青紫、紫暗、紫黑或暗红")
+    morphology: list[str] = Field(
+        default_factory=list,
+        description="舌下络脉形态：正常、粗张、迂曲、曲张、怒张、瘀点、分支、对称或不对称",
+    )
 
 
 class TongueFeatures(BaseModel):
     """舌象结构化特征."""
 
     legal: str = Field(default="", description="图片合规性：是或否")
-    back: str = Field(default="", description="正面或反面")
-    tongue_name: TongueBodyFeatures = Field(default_factory=TongueBodyFeatures)
+    side: str = Field(default="", description="舌面方向：正面或反面")
+    tongue_body: TongueBodyFeatures = Field(default_factory=TongueBodyFeatures)
     tongue_coat: TongueCoatFeatures = Field(default_factory=TongueCoatFeatures)
-    surface: str = Field(default="", description="舌面可见异常；无异常时为正常")
-    vein: TongueVeinFeatures = Field(default_factory=TongueVeinFeatures)
+    sublingual_veins: TongueVeinFeatures = Field(default_factory=TongueVeinFeatures)
+
+
+class FaceSpiritFeatures(BaseModel):
+    """面部神态可见特征."""
+
+    level: str = Field(default="", description="神态：得神、少神、失神、假神或神志异常")
+    expression: str = Field(default="", description="表情：自然、痛苦、疲惫或其他可见表现")
+    responsiveness: str = Field(default="", description="反应状态：灵敏、迟钝或无法判断")
+    gaze: str = Field(default="", description="目光：有神、少神、呆滞或无法判断")
+
+
+class FaceComplexionFeatures(BaseModel):
+    """面色可见特征."""
+
+    category: str = Field(default="", description="面色主类别：青、赤、黄、白、黑或正常")
+    detail: str = Field(
+        default="",
+        description="面色细分，如青白、青紫、满面通红、两颧潮红、萎黄、黄胖、淡白、苍白、黧黑或晦暗",
+    )
+    distribution: str = Field(default="", description="颜色分布，如全面、两颧、局部或眼眶")
+    brightness: str = Field(default="", description="色泽明暗：明亮、暗红、鲜明、晦暗或无法判断")
+
+
+class FacialLocalFeatures(BaseModel):
+    """五官及面部局部可见特征."""
+
+    eyes: list[str] = Field(
+        default_factory=list,
+        description="眼部可见特征，如目赤、目黄、眼睑浮肿、分泌物或目光状态",
+    )
+    nose: list[str] = Field(
+        default_factory=list,
+        description="鼻部可见特征，如鼻翼煽动、鼻色变化或鼻腔分泌物",
+    )
+    lips: list[str] = Field(
+        default_factory=list,
+        description="口唇可见特征，如淡白、红、绛、青紫或干裂",
+    )
+    gums: list[str] = Field(
+        default_factory=list,
+        description="牙龈可见特征，如红肿、出血或颜色变化",
+    )
+    skin: list[str] = Field(
+        default_factory=list,
+        description="面部皮肤可见特征，如丘疹、红斑、色斑、油脂、干燥、脱屑、毛孔或结节",
+    )
+
+
+class FaceFeatures(BaseModel):
+    """面象结构化特征."""
+
+    legal: str = Field(default="", description="是否存在清晰、可分析的真实人脸：是或否")
+    spirit: FaceSpiritFeatures = Field(default_factory=FaceSpiritFeatures)
+    complexion: FaceComplexionFeatures = Field(default_factory=FaceComplexionFeatures)
+    luster: str = Field(default="", description="面部光泽：明润、荣润、少华、晦暗、枯槁、油光或浮肿发亮")
+    morphology: list[str] = Field(
+        default_factory=list,
+        description="面部形态，如浮肿、眼睑水肿、面颊消瘦、肌肉松弛、口眼歪斜、表情不对称或抽动",
+    )
+    local_features: FacialLocalFeatures = Field(default_factory=FacialLocalFeatures)
+
+
+class LesionFeatures(BaseModel):
+    """局部患处可见特征."""
+
+    location: list[str] = Field(default_factory=list, description="患处所在部位")
+    morphology: list[str] = Field(default_factory=list, description="丘疹、红斑、斑疹、脓疱、结节等形态")
+    color: list[str] = Field(default_factory=list, description="患处颜色")
+    boundary: str = Field(default="", description="边界是否清楚及边缘形态")
+    size: str = Field(default="", description="可见大小；无参照物时不估算具体尺寸")
+    extent: str = Field(default="", description="数量、范围、散在、密集、融合或对称性")
+    exudation: str = Field(default="", description="有无渗出及可见程度")
+    scaling: str = Field(default="", description="有无鳞屑及可见程度")
+    ulceration: str = Field(default="", description="有无糜烂、溃疡或结痂")
 
 
 class TongueFaceResult(BaseModel):
     """舌、面和局部患处图片分析结果."""
 
     tongue: TongueFeatures = Field(default_factory=TongueFeatures)
-    face: dict[str, Any] = Field(default_factory=dict, description="面色、光泽、形态等可见特征")
-    lesions: dict[str, Any] = Field(default_factory=dict, description="患处位置、形态、颜色、范围等可见特征")
+    face: FaceFeatures = Field(default_factory=FaceFeatures)
+    lesions: LesionFeatures = Field(default_factory=LesionFeatures)
 
 
 class ClinicalExtractionResult(BaseModel):
@@ -128,5 +220,4 @@ class ClinicalExtractionResult(BaseModel):
     disease_location: list[str] = Field(default_factory=list, description="病位")
     disease_stage: str = Field(default="", description="病期")
     disease_course: str = Field(default="", description="病程及演变")
-    onset_triggers: list[str] = Field(default_factory=list, description="诱因")
     key_symptoms: list[str] = Field(default_factory=list, description="关键症状和体征")
