@@ -40,7 +40,7 @@ import re
 import sys
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
@@ -59,6 +59,7 @@ from medical.schema.clear_record_basemodel import (
     DiagnosisResult,
     HistoryCleaningResult,
     InspectionResult,
+    TONGUE_FACE_RESULT_FIELD_CN_MAPPING,
     TongueFaceResult,
 )
 load_dotenv()
@@ -97,7 +98,8 @@ INVALID_HISTORY_TEXT = (
     "同上",
 )
 
-
+UPWARD_ABNORMAL_SYMBOL_PATTERN = re.compile(r"(?:⬆️|⬆|↑|↗|⇧|▲|△)+")
+DOWNWARD_ABNORMAL_SYMBOL_PATTERN = re.compile(r"(?:⬇️|⬇|↓|↘|⇩|▼|▽)+")
 
 
 def _text(value: Any) -> str:
@@ -130,6 +132,18 @@ def _clean_generated_value(value: Any) -> Any:
         return list(dict.fromkeys(item for item in cleaned_items if item not in ("", None)))
     if isinstance(value, dict):
         return {key: _clean_generated_value(item) for key, item in value.items()}
+    return value
+
+
+def _replace_inspection_report_symbols(value: Any) -> Any:
+    """将检查报告常见异常符号转换为中文文本，便于后续病史拼接."""
+    if isinstance(value, str):
+        text = UPWARD_ABNORMAL_SYMBOL_PATTERN.sub("升高", value)
+        return DOWNWARD_ABNORMAL_SYMBOL_PATTERN.sub("下降", text)
+    if isinstance(value, list):
+        return [_replace_inspection_report_symbols(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _replace_inspection_report_symbols(item) for key, item in value.items()}
     return value
 
 
@@ -245,6 +259,83 @@ def _model_dump(model: BaseModel, *, by_alias: bool = False) -> dict[str, Any]:
     if hasattr(model, "model_dump"):
         return model.model_dump(by_alias=by_alias)
     return model.dict(by_alias=by_alias)
+
+
+def _format_tongue_face_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, list):
+        items = [_format_tongue_face_value(item) for item in value]
+        return "、".join(dict.fromkeys(item for item in items if item))
+    return str(value).strip()
+
+
+def _normalize_tongue_face_display_value(path: str, value: str) -> str:
+    if "、" in value:
+        items = [_normalize_tongue_face_display_value(path, item) for item in value.split("、")]
+        return "、".join(item for item in items if item)
+
+    replacements = {
+        "tongue.tongue_coat.root": {
+            "有根苔": "有根",
+            "无根苔": "无根",
+        },
+        "tongue.tongue_coat.distribution": {
+            "整体": "全舌",
+        },
+    }
+    if value in replacements.get(path, {}):
+        return replacements[path][value]
+    if path in {
+        "tongue.tongue_coat.color",
+        "tongue.tongue_coat.thickness",
+        "tongue.tongue_coat.moisture",
+        "tongue.tongue_coat.texture",
+    } and value.endswith("苔"):
+        return value[:-1]
+    return value
+
+
+def _iter_tongue_face_leaf_values(value: Any, prefix: str) -> Iterator[tuple[str, Any]]:
+    if isinstance(value, BaseModel):
+        value = _model_dump(value)
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            path = f"{prefix}.{key}"
+            if isinstance(item, BaseModel) or isinstance(item, Mapping):
+                yield from _iter_tongue_face_leaf_values(item, path)
+            else:
+                yield path, item
+        return
+    yield prefix, value
+
+
+def format_tongue_face_result_descriptions(result: TongueFaceResult | Mapping[str, Any] | None) -> dict[str, str]:
+    """将舌面患处结构化结果拼接为舌象、面象、患处三段文本."""
+    if result is None:
+        data: dict[str, Any] = {}
+    elif isinstance(result, BaseModel):
+        data = _model_dump(result)
+    else:
+        data = dict(result)
+
+    descriptions = {}
+    for section in ("tongue", "face", "lesions"):
+        parts = []
+        for path, value in _iter_tongue_face_leaf_values(data.get(section, {}), section):
+            label = TONGUE_FACE_RESULT_FIELD_CN_MAPPING.get(path)
+            text = _format_tongue_face_value(value)
+            if path.endswith(".legal") and text == "是":
+                continue
+            if label and text:
+                text = _normalize_tongue_face_display_value(path, text)
+                parts.append(f"{label}：{text}")
+        descriptions[section] = "；".join(parts)
+    return descriptions
 
 
 def _load_prompt(name: str) -> str:
@@ -397,6 +488,7 @@ class MedicalRecordAgents:
                 "若存在括号日期、初诊/复诊序号等标记，选择与本次时间相同或最近且不晚于本次时间的段落。"
                 "整理为规范现病史：保留本次症状、变化、持续时间、相关治疗反应、重要阴性表现及"
                 "与本次相关的检查；纠正明确错别字，删除乱码、重复符号和无意义文本。"
+                "检查报告中的异常方向符号必须转换为中文文本描述，例如 ↑、⬆️ 写作“升高”，↓、⬇️ 写作“下降”。"
                 "不得新增原文没有的症状、诊断、时间或检查结果；无法确定本次段落时返回空字符串。"
             ),
             response_format=_tool_response_format(CurrentVisitHistoryResult),
@@ -531,7 +623,9 @@ class MedicalRecordAgents:
             ),
             CurrentVisitHistoryResult,
         )
-        record["ai_new_medical_history"] = _clean_generated_text(result.new_medical_history)
+        record["ai_new_medical_history"] = _replace_inspection_report_symbols(
+            _clean_generated_text(result.new_medical_history)
+        )
 
     def clean_histories(self, record: dict[str, Any]) -> None:
         histories = _history_payload(record)
@@ -550,7 +644,9 @@ class MedicalRecordAgents:
         )
         values = _model_dump(result)
         record["ai_patient_appeal"] = _clean_generated_text(values.get("patient_appeal"))
-        record["ai_new_medical_history"] = _clean_generated_text(values.get("new_medical_history"))
+        record["ai_new_medical_history"] = _replace_inspection_report_symbols(
+            _clean_generated_text(values.get("new_medical_history"))
+        )
         record["ai_complaint_history_consistent"] = values.get("complaint_history_consistent")
         record["ai_complaint_history_issues"] = values.get("consistency_issues") or []
         for field in HISTORY_FIELDS:
@@ -569,7 +665,9 @@ class MedicalRecordAgents:
     def analyze_inspection_images(self, record: dict[str, Any]) -> None:
         images = _as_images(record.get("inspection_report_img") or record.get("admin_report_img"))
         if not images:
-            record["ai_inspection_report_img"] = _model_dump(InspectionResult(), by_alias=True)
+            record["ai_inspection_report_img"] = _replace_inspection_report_symbols(
+                _model_dump(InspectionResult(), by_alias=True)
+            )
             return
         prompt = "逐张分类并解析图片，提取有效检查报告中可用于核对或补充本次现病史的客观事实。"
         result = _invoke_structured_agent(
@@ -577,7 +675,9 @@ class MedicalRecordAgents:
             _multimodal_message(prompt, images, self.input_dir),
             InspectionResult,
         )
-        record["ai_inspection_report_img"] = _model_dump(result, by_alias=True)
+        record["ai_inspection_report_img"] = _replace_inspection_report_symbols(
+            _model_dump(result, by_alias=True)
+        )
 
     def analyze_tongue_face_images(self, record: dict[str, Any]) -> None:
         images = _as_images(record.get("tongue_face_img") or record.get("admin_face_img"))
