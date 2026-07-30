@@ -33,10 +33,10 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from medical.analysis.engine import normalize_diagnosis_value, normalize_syndrome_value
+from medical.analysis.engine import normalize_diagnosis_value, normalize_sickness_value, normalize_syndrome_value
 
 
-DEFAULT_DATA_DIR = PROJECT_ROOT / "medical" / "data"
+DEFAULT_DATA_DIR = PROJECT_ROOT / "medical" / "data"/ "202301_online"
 DEFAULT_OUTPUT_FILE = Path(__file__).resolve().parent / "output" / "normalized_diagnoses_by_doctor.xlsx"
 ONLINE_FILE_MARKER = "_AI医生分身混合问诊数据_"
 HEADERS = (
@@ -48,16 +48,24 @@ HEADERS = (
 )
 
 
+from pathlib import Path
+
+
 def discover_online_files(data_dir: Path) -> list[Path]:
-    """Find JSON exports in online_* directories and online export files at the data root."""
-    files = []
+    """递归查找 data_dir 下的所有 JSON 文件，忽略隐藏目录和 __MACOSX。"""
+    files: list[Path] = []
+
     for path in data_dir.rglob("*.json"):
         relative_parts = path.relative_to(data_dir).parts
-        if any(part.startswith(".") or part == "__MACOSX" for part in relative_parts):
+
+        if any(
+            part.startswith(".") or part == "__MACOSX"
+            for part in relative_parts
+        ):
             continue
-        in_online_directory = any(part.startswith("online_") for part in relative_parts[:-1])
-        if in_online_directory or ONLINE_FILE_MARKER in path.name:
+        if path.is_file():
             files.append(path)
+
     return sorted(set(files))
 
 
@@ -81,7 +89,7 @@ def normalize_record(record: dict[str, Any]) -> dict[str, str]:
     return {
         "order_sn": str(record.get("order_sn") or "").strip(),
         "diagnosis_illness": normalize_diagnosis_value(record.get("diagnosis_illness")),
-        "diagnosis_sickness": normalize_diagnosis_value(record.get("diagnosis_sickness")),
+        "diagnosis_sickness": normalize_sickness_value(record.get("diagnosis_sickness")),
         "diagnosis_disease": normalize_syndrome_value(record.get("diagnosis_disease")),
     }
 

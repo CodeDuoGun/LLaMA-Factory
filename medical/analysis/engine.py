@@ -105,6 +105,56 @@ DIAGNOSIS_TERM_ALIASES = {
     "双肺间质性炎炎症": "双肺间质性炎症",
     "耳鸣": "耳鸣病",
     "多囊卵巢综合征[Stein-Leventhal综合征]": "多囊卵巢综合征",
+    "两肺散在间质性炎症": "两肺散在间质性炎",
+    "鼻鼽病": "鼻鼽",
+    "鼻渊病": "鼻渊",
+    "两肺间质性改变": "双肺间质性改变",
+    "两肺间质性": "双肺间质性",
+    "两肺间质性纤维": "双肺间质纤维化",
+    "两肺间质性肺炎": "双肺间质性肺炎",
+    "双肺肺间质性肺炎": "双肺间质性肺炎",
+    "双肺间质性疾病": "双肺间质性病",
+    "肺痿病": "肺痿",
+    "肺纤维化": "肺纤维化",
+    "间质性肺病": "间质性肺疾病",
+    "间质性肺炎伴纤维化": "间质性肺炎伴肺纤维化",
+    "特发性肺纤维化": "特发性肺纤维化",
+    "特发性间质性肺纤维化": "特发性肺纤维化",
+    "特发性间质性肺纤维": "特发性肺纤维化",
+    "特发性间质纤维化": "特发性肺纤维化",
+    "喘症": "喘病",
+    "喘证": "喘病",
+    "喘病": "喘病",
+    "慢肺阻": "慢阻肺",
+    "间质肺炎": "间质性肺炎",
+    "哮喘病": "哮喘",
+    "肺胀病": "肺胀",
+    "喉痹病": "喉痹",
+    "肺萎病": "肺萎",
+    "干眼": "干眼症",
+}
+SYNDROME_TERM_ALIASES = {
+    "湿毒蕴肤症": "湿毒蕴肤证",
+    "血热瘀滞症": "血热瘀滞证",
+    "脾肺两虚证": "脾肺两虚证",
+    "脾肺两虚": "脾肺两虚证",
+    "肺脾两虚证": "脾肺两虚证",
+    "肺脾两虚": "脾肺两虚证",
+
+}
+SICKNESS_TERM_ALIASES = {
+    "咳嗽病": "咳嗽",
+    "胃痞病": "胃痞",
+    "胃胀病": "胃胀",
+    "不寐病": "不寐",
+    "便秘病": "便秘",
+    "哮喘病": "哮喘",
+    "肺胀病": "肺胀",
+    "喉痹病": "喉痹",
+    "肺萎病": "肺萎",    
+    "鼻鼽病": "鼻鼽",
+    "鼻渊病": "鼻渊",
+    "肺积病": "肺积",
 }
 COMPOUND_DIAGNOSIS_TERMS = (
     "痰瘀阻肺证",
@@ -130,15 +180,15 @@ def _is_symbol_only(value: str) -> bool:
     return bool(value) and all(unicodedata.category(character)[0] in {"P", "S"} for character in value)
 
 
-def _normalize_diagnosis_part(value: str) -> str:
+def _normalize_diagnosis_part(value: str, aliases: dict[str, str]) -> str:
     part = re.sub(r"\s+", "", value).strip(".。·•?？")
     if part in EMPTY_DIAGNOSIS_PLACEHOLDERS or _is_symbol_only(part):
         return ""
-    return DIAGNOSIS_TERM_ALIASES.get(part, part)
+    return aliases.get(part, part)
 
 
-def _split_compound_diagnosis_part(value: str) -> list[str]:
-    part = _normalize_diagnosis_part(value)
+def _split_compound_diagnosis_part(value: str, aliases: dict[str, str]) -> list[str]:
+    part = _normalize_diagnosis_part(value, aliases)
     if not part:
         return []
     terms = sorted(COMPOUND_DIAGNOSIS_TERMS, key=len, reverse=True)
@@ -148,7 +198,7 @@ def _split_compound_diagnosis_part(value: str) -> list[str]:
         matched = next((term for term in terms if part.startswith(term, index)), "")
         if not matched:
             return [part]
-        items.append(_normalize_diagnosis_part(matched))
+        items.append(_normalize_diagnosis_part(matched, aliases))
         index += len(matched)
     return items
 
@@ -181,7 +231,22 @@ def normalize_diagnosis_value(value: Any) -> str:
         return ""
     parts = []
     for part in re.split(DIAGNOSIS_SEPARATOR_PATTERN, text):
-        parts.extend(_split_compound_diagnosis_part(part))
+        parts.extend(_split_compound_diagnosis_part(part, DIAGNOSIS_TERM_ALIASES))
+    if not parts:
+        return ""
+    return "、".join(sorted(set(parts)))
+
+
+def normalize_sickness_value(value: Any) -> str:
+    """Normalize TCM disease names without applying western diagnosis aliases."""
+    if _is_structured_diagnosis_placeholder(value):
+        return ""
+    text = _clean(value)
+    if not text or not CHINESE_CHARACTER_PATTERN.search(text):
+        return ""
+    parts = []
+    for part in re.split(DIAGNOSIS_SEPARATOR_PATTERN, text):
+        parts.extend(_split_compound_diagnosis_part(part, SICKNESS_TERM_ALIASES))
     if not parts:
         return ""
     return "、".join(sorted(set(parts)))
@@ -200,10 +265,10 @@ def normalize_syndrome_value(value: Any) -> str:
 
     syndromes = []
     for part in re.split(DIAGNOSIS_SEPARATOR_PATTERN, text):
-        for compound_part in _split_compound_diagnosis_part(part):
+        for compound_part in _split_compound_diagnosis_part(part, SYNDROME_TERM_ALIASES):
             items = re.findall(r"[^证]+证|[^证]+$", compound_part)
             for item in items:
-                syndrome = _normalize_diagnosis_part(item)
+                syndrome = _normalize_diagnosis_part(item, SYNDROME_TERM_ALIASES)
                 if syndrome in EMPTY_SYNDROME_PLACEHOLDERS:
                     continue
                 if (
@@ -456,7 +521,7 @@ class MedicalAnalysis:
         appeal = _clean(record.get("patient_appeal"))
         summary = _clean(record.get("doc_ass_stu_appeal"))
         diagnosis = normalize_diagnosis_value(record.get("diagnosis_illness", ""))
-        tcm_disease = normalize_diagnosis_value(record.get("diagnosis_sickness"))
+        tcm_disease = normalize_sickness_value(record.get("diagnosis_sickness"))
         syndrome = normalize_syndrome_value(record.get("diagnosis_disease"))
         drugs, internal_count, external_count, processes, days = self._main_internal_prescription(record)
         return Visit(

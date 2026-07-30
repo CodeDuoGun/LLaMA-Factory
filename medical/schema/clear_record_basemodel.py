@@ -1,6 +1,19 @@
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+
+class AgentReviewResult(BaseModel):
+    """评审 Agent 对业务 Agent 结构化结果的审核意见."""
+
+    followed_prompt: bool = Field(..., description="业务 Agent 的可观察行为是否遵守完整系统提示词和用户任务")
+    response_meets_requirements: bool = Field(..., description="最终响应的内容、字段语义和格式是否符合要求")
+    passed: bool = Field(..., description="结果是否完全符合原提示词约束和响应模型要求")
+    issues: list[str] = Field(default_factory=list, description="未通过的具体问题；通过时为空")
+    revision_instructions: str = Field(
+        default="",
+        description="给原 Agent 的可执行修改要求；通过时为空",
+    )
 
 
 class DiagnosisResult(BaseModel):
@@ -60,6 +73,22 @@ class CurrentVisitHistoryResult(BaseModel):
     )
 
 
+ImageCategory = Literal["舌", "面", "患处", "检验检查报告类", "其他类"]
+
+
+class ImageClassification(BaseModel):
+    """单张病历图片的分类结果."""
+
+    image_index: int = Field(..., ge=1, description="图片在输入列表中的序号，从 1 开始")
+    image_type: ImageCategory = Field(..., description="舌、面、患处、检验检查报告类或其他类")
+
+
+class ImageClassificationResult(BaseModel):
+    """一组病历图片的逐张分类结果."""
+
+    images: list[ImageClassification] = Field(default_factory=list)
+
+
 class InspectionFinding(BaseModel):
     """单张检查报告图片的分类和解析结果."""
 
@@ -67,6 +96,11 @@ class InspectionFinding(BaseModel):
     is_valid_report: bool = Field(default=False, serialization_alias="是否有效检查报告")
     report_name: str = Field(default="", description="报告或检查项目名称")
     report_date: str = Field(default="", serialization_alias="报告日期")
+    relative_to_visit_time: str = Field(
+        default="",
+        serialization_alias="相对就诊时间",
+        description="报告日期相对本次 see_doc_time 的时间，如2年前、3个月前、5天前或当天",
+    )
     content: str = Field(default="", serialization_alias="解析结果")
     abnormal_indicators: list[str] = Field(default_factory=list, serialization_alias="异常指标")
     conclusion: str = Field(default="", serialization_alias="报告结论")
@@ -82,41 +116,41 @@ class InspectionResult(BaseModel):
 class TongueBodyFeatures(BaseModel):
     """舌质特征."""
 
-    color: str = Field(default="", description="舌色：淡白、淡红、红、绛或青紫")
+    color: str = Field(default="", description="舌质可见颜色；淡白、淡红、红、绛、青紫等仅供参考")
     shape: list[str] = Field(
         default_factory=list,
-        description="舌形：老、嫩、胖、大、瘦、点刺、裂纹或齿痕",
+        description="舌体可见形态；老、嫩、胖、大、瘦、点刺、裂纹、齿痕等仅供参考",
     )
     posture: list[str] = Field(
         default_factory=list,
-        description="舌态：痿软、强硬、歪斜、颤动、吐弄或短缩",
+        description="可见舌态；痿软、强硬、歪斜、颤动、吐弄、短缩等仅供参考",
     )
-    fluid: str = Field(default="", description="舌体津液状态：润、干、少津或无津")
+    fluid: str = Field(default="", description="舌体表面可见津液状态；润、干、少津、无津等仅供参考")
     surface: list[str] = Field(default_factory=list, description="舌体表面其他可见特征，如瘀点、红点或芒刺")
 
 
 class TongueCoatFeatures(BaseModel):
     """舌苔特征."""
 
-    color: str = Field(default="", description="苔色：白苔、黄苔、灰苔或黑苔")
-    thickness: str = Field(default="", description="厚薄：薄苔或厚苔")
-    moisture: str = Field(default="", description="润燥：润苔、滑苔、燥苔或糙苔")
-    texture: str = Field(default="", description="腐腻：腻苔、腐苔或霉酱苔；无明显腐腻时为空")
-    integrity: str = Field(default="", description="完整程度：全苔、偏苔、剥苔、花剥苔或地图舌")
-    root: str = Field(default="", description="根性：有根苔或无根苔")
+    color: str = Field(default="", description="舌苔可见颜色；白苔、黄苔、灰苔、黑苔等仅供参考")
+    thickness: str = Field(default="", description="舌苔可见厚薄；薄苔、厚苔等仅供参考")
+    moisture: str = Field(default="", description="舌苔可见润燥；润苔、滑苔、燥苔、糙苔等仅供参考")
+    texture: str = Field(default="", description="舌苔可见质地；腻苔、腐苔、霉酱苔等仅供参考")
+    integrity: str = Field(default="", description="舌苔完整程度；全苔、偏苔、剥苔、花剥苔等仅供参考")
+    root: str = Field(default="", description="舌苔根性；有根苔、无根苔等仅供参考")
     distribution: list[str] = Field(
         default_factory=list,
-        description="舌苔分布：舌尖、舌中、舌边、舌根或整体",
+        description="舌苔可见分布；舌尖、舌中、舌边、舌根、整体等仅供参考",
     )
 
 
 class TongueVeinFeatures(BaseModel):
     """舌下络脉特征."""
 
-    color: str = Field(default="", description="舌下络脉颜色：正常、淡紫、青紫、紫暗、紫黑或暗红")
+    color: str = Field(default="", description="舌下络脉可见颜色；正常、淡紫、青紫、紫暗等仅供参考")
     morphology: list[str] = Field(
         default_factory=list,
-        description="舌下络脉形态：正常、粗张、迂曲、曲张、怒张、瘀点、分支、对称或不对称",
+        description="舌下络脉可见形态；粗张、迂曲、曲张、分支、对称等仅供参考",
     )
 
 
@@ -142,13 +176,13 @@ class FaceSpiritFeatures(BaseModel):
 class FaceComplexionFeatures(BaseModel):
     """面色可见特征."""
 
-    category: str = Field(default="", description="面色主类别：青、赤、黄、白、黑或正常")
+    category: str = Field(default="", description="面部可见主色；青、赤、黄、白、黑、正常等仅供参考")
     detail: str = Field(
         default="",
-        description="面色细分，如青白、青紫、满面通红、两颧潮红、萎黄、黄胖、淡白、苍白、黧黑或晦暗",
+        description="面部可见颜色细节；青白、青紫、潮红、萎黄、淡白、苍白等仅供参考",
     )
     distribution: str = Field(default="", description="颜色分布，如全面、两颧、局部或眼眶")
-    brightness: str = Field(default="", description="色泽明暗：明亮、暗红、鲜明、晦暗或无法判断")
+    brightness: str = Field(default="", description="面部可见明暗；明亮、鲜明、晦暗等仅供参考")
 
 
 class FacialLocalFeatures(BaseModel):
@@ -164,7 +198,7 @@ class FacialLocalFeatures(BaseModel):
     )
     lips: list[str] = Field(
         default_factory=list,
-        description="口唇可见特征，如淡白、红、绛、青紫或干裂",
+        description="口唇可见颜色或形态；淡白、红、绛、青紫、干裂等仅供参考",
     )
     gums: list[str] = Field(
         default_factory=list,
@@ -182,10 +216,10 @@ class FaceFeatures(BaseModel):
     legal: str = Field(default="", description="是否存在清晰、可分析的真实人脸：是或否")
     spirit: FaceSpiritFeatures = Field(default_factory=FaceSpiritFeatures)
     complexion: FaceComplexionFeatures = Field(default_factory=FaceComplexionFeatures)
-    luster: str = Field(default="", description="面部光泽：明润、荣润、少华、晦暗、枯槁、油光或浮肿发亮")
+    luster: str = Field(default="", description="面部可见光泽；明润、少华、晦暗、油光等仅供参考")
     morphology: list[str] = Field(
         default_factory=list,
-        description="面部形态，如浮肿、眼睑水肿、面颊消瘦、肌肉松弛、口眼歪斜、表情不对称或抽动",
+        description="面部可见形态；浮肿、消瘦、肌肉松弛、不对称等仅供参考",
     )
     local_features: FacialLocalFeatures = Field(default_factory=FacialLocalFeatures)
 

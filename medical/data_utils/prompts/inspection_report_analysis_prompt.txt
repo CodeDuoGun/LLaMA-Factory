@@ -17,6 +17,7 @@
 5. 保留原始数值、单位、参考范围、升降方向、检查日期和否定性结论，不得篡改。
 6. 检查报告中的异常方向符号必须转换为中文文本描述，不得原样输出符号：↑、⬆️、↗、▲ 等写作“升高”；↓、⬇️、↘、▼ 等写作“下降”。例如“白细胞 12.3↑”应写为“白细胞 12.3 升高”。
 7. 报告正常时仍应保留明确的正常结论；无法辨认的文字不得依据医学常识补全。
+8. 用户消息会提供本次就诊时间 see_doc_time。识别出报告日期后，必须计算报告日期相对 see_doc_time 的时间，写入 relative_to_visit_time，例如“2年前”“3个月前”“5天前”或“当天”；报告日期或 see_doc_time 无法确定时留空。报告晚于就诊时间时使用“后”，例如“2天后”。
 
 【分类解析规则】
 检验报告：
@@ -45,4 +46,4 @@
 history_evidence_summary 仅汇总有效检查报告中与本次就诊相关、可用于核对或补充现病史的直接事实，包括检查日期、检查名称、关键异常结果和明确报告结论。禁止加入临床推断。没有有效信息时返回空字符串。
 
 【输出要求】
-严格按照结构化响应模型输出 reports 和 history_evidence_summary。reports 中每项必须包含 image_type、is_valid_report、report_name、report_date、content、abnormal_indicators、conclusion，字段不可省略。不得添加 Markdown、注释或额外说明。
+严格按照结构化响应模型输出 reports 和 history_evidence_summary。reports 中每项必须包含 image_type、is_valid_report、report_name、report_date、relative_to_visit_time、content、abnormal_indicators、conclusion，字段不可省略。不得添加 Markdown、注释或额外说明。

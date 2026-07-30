@@ -26,6 +26,7 @@ from medical.analysis.engine import (  # noqa: E402
     classify_outcome,
     extract_symptoms,
     normalize_diagnosis_value,
+    normalize_sickness_value,
     normalize_syndrome_value,
 )
 
@@ -61,6 +62,8 @@ def test_normalization_and_negation() -> None:
 
 
 def test_diagnosis_value_normalizes_separator_order_and_duplicates() -> None:
+    assert normalize_diagnosis_value("湿毒蕴肤症") == "湿毒蕴肤症"
+    assert normalize_diagnosis_value("血热瘀滞症") == "血热瘀滞症"
     assert normalize_diagnosis_value("脾肺气虚证，痰瘀互结证") == "痰瘀互结证、脾肺气虚证"
     assert normalize_diagnosis_value("痰瘀互结证/脾肺气虚证；脾肺气虚证") == "痰瘀互结证、脾肺气虚证"
     assert normalize_diagnosis_value("甲状腺癌、瘿瘤") == normalize_diagnosis_value("甲状腺癌、瘿瘤病")
@@ -98,6 +101,8 @@ def test_diagnosis_value_normalizes_separator_order_and_duplicates() -> None:
 def test_syndrome_value_normalizes_suffix_order_and_concatenation() -> None:
     assert normalize_syndrome_value("肝气不舒") == "肝气不舒证"
     assert normalize_syndrome_value("肝气不舒证") == "肝气不舒证"
+    assert normalize_syndrome_value("湿毒蕴肤症") == "湿毒蕴肤证"
+    assert normalize_syndrome_value("血热瘀滞症") == "血热瘀滞证"
     assert normalize_syndrome_value("脾肺气虚，痰瘀互结证") == "痰瘀互结证、脾肺气虚证"
     assert normalize_syndrome_value("痰瘀互结/脾肺气虚") == "痰瘀互结证、脾肺气虚证"
     assert normalize_syndrome_value("脾肺气虚证痰瘀互结证") == "痰瘀互结证、脾肺气虚证"
@@ -114,6 +119,12 @@ def test_syndrome_value_normalizes_suffix_order_and_concatenation() -> None:
     assert normalize_syndrome_value("待填写证") == ""
     assert normalize_syndrome_value("待填写") == ""
     assert normalize_syndrome_value("待填写证、肝气不舒") == "肝气不舒证"
+
+
+def test_sickness_value_uses_tcm_disease_aliases_only() -> None:
+    assert normalize_sickness_value("咳嗽病") == "咳嗽"
+    assert normalize_sickness_value("肺结节病") == "肺结节病"
+    assert normalize_sickness_value("咳嗽病、胃痞病、咳嗽病") == "咳嗽、胃痞病"
 
 
 def test_longitudinal_difference_uses_patient_id() -> None:
