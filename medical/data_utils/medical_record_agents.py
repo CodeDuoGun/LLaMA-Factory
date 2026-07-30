@@ -32,7 +32,9 @@ JSON/JSONL 文件。
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
+import inspect
 import json
 import mimetypes
 import os
@@ -40,8 +42,7 @@ import re
 import sys
 import time
 from collections import Counter
-from collections.abc import Iterator, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack
 from datetime import date
 from pathlib import Path
@@ -67,7 +68,9 @@ from medical.schema.clear_record_basemodel import (
     TongueFaceResult,
 )
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env.local")
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -80,6 +83,7 @@ DOCTOR_RECORD_FILE_NAME = "medical_records_ai.jsonl"
 FAILURE_FILE_NAME = "medical_record_agent_failures.jsonl"
 FILTER_FILE_NAME = "filter.json"
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
+DASHSCOPE_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DIAGNOSIS_FIELDS = ("diagnosis_illness", "diagnosis_disease", "diagnosis_sickness")
 HISTORY_FIELDS = (
     "old_medical_history",
@@ -91,6 +95,7 @@ HISTORY_FIELDS = (
 IMAGE_FIELDS = ("tongue_face_img", "admin_face_img", "admin_report_img", "inspection_report_img")
 IMAGE_CATEGORIES = ("舌", "面", "患处", "检验检查报告类", "其他类")
 TONGUE_FACE_IMAGE_CATEGORIES = ("舌", "面", "患处")
+MAX_VLM_IMAGES_PER_REQUEST = 5
 CURRENT_VISIT_HISTORY_SYSTEM_PROMPT = (
     "你是临床病历现病史整理助手。输入可能包含同一患者按日期累积的多次就诊记录。"
     "必须以本次就诊时间为锚点，仅提取与本次复诊对应的现病史，不得混入既往就诊段落。"
@@ -125,6 +130,27 @@ def _text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _env(name: str, default: str = "") -> str:
+    return _text(os.getenv(name)) or default
+
+
+def _env_any(names: tuple[str, ...], default: str = "") -> str:
+    for name in names:
+        value = _env(name)
+        if value:
+            return value
+    return default
+
+
+def _mask_secret(value: str | None) -> str:
+    secret = _text(value)
+    if not secret:
+        return "<empty>"
+    if len(secret) <= 8:
+        return "***"
+    return f"{secret[:4]}...{secret[-4:]}"
 
 
 def _clean_generated_text(value: Any) -> str:
@@ -322,14 +348,13 @@ def _has_any_diagnosis(diagnoses: dict[str, str]) -> bool:
 
 
 def _should_filter_record(record: Mapping[str, Any]) -> bool:
-    """Filter records that contain no complaint, present history, or western diagnosis."""
-    required_context = (
-        record.get("doc_ass_stu_appeal"),
-        record.get("patient_appeal"),
-        record.get("new_medical_history"),
-        record.get("diagnosis_illness"),
-    )
-    return not any(_text(value) for value in required_context)
+    """Filter records with insufficient complaint/history/diagnosis context."""
+    patient_appeal = _text(record.get("patient_appeal"))
+    present_history = _text(record.get("new_medical_history"))
+    diagnosis_illness = _text(record.get("diagnosis_illness"))
+    if not any((patient_appeal, present_history, diagnosis_illness)):
+        return True
+    return bool(patient_appeal and len(patient_appeal) <= 20 and not present_history and not diagnosis_illness)
 
 
 def _filtered_record_identity(record: Mapping[str, Any]) -> str:
@@ -529,7 +554,7 @@ def _model_json_schema(schema: type[BaseModel]) -> dict[str, Any]:
     return schema.schema()
 
 
-def _invoke_structured_candidate(
+async def _invoke_structured_candidate(
     agent: Any,
     messages: list[HumanMessage],
     schema: type[BaseModel],
@@ -547,7 +572,7 @@ def _invoke_structured_candidate(
                 )
             )
         try:
-            response = agent.invoke({"messages": attempt_messages})
+            response = await agent.ainvoke({"messages": attempt_messages})
         except StructuredOutputError as exc:
             last_error = exc
             continue
@@ -632,7 +657,7 @@ def _review_message(
     return HumanMessage(content=[{"type": "text", "text": review_text}, *image_blocks])
 
 
-def _review_candidate(
+async def _review_candidate(
     reviewer_agent: Any,
     *,
     agent_name: str,
@@ -642,7 +667,7 @@ def _review_candidate(
     candidate: BaseModel,
     agent_trace: str,
 ) -> AgentReviewResult:
-    review, _ = _invoke_structured_candidate(
+    review, _ = await _invoke_structured_candidate(
         reviewer_agent,
         [
             _review_message(
@@ -677,7 +702,7 @@ def _revision_message(schema: type[BaseModel], candidate: BaseModel, review: Age
     )
 
 
-def _invoke_structured_agent(
+async def _invoke_structured_agent(
     agent: Any,
     message: HumanMessage,
     schema: type[BaseModel],
@@ -688,10 +713,10 @@ def _invoke_structured_agent(
 ) -> BaseModel:
     messages = [message]
     for review_round in range(2):
-        candidate, agent_trace = _invoke_structured_candidate(agent, messages, schema)
+        candidate, agent_trace = await _invoke_structured_candidate(agent, messages, schema)
         if reviewer_agent is None:
             return candidate
-        review = _review_candidate(
+        review = await _review_candidate(
             reviewer_agent,
             agent_name=agent_name or schema.__name__,
             system_prompt=system_prompt,
@@ -730,7 +755,7 @@ def _response_text(response: Any) -> str:
     return _text(content)
 
 
-def _invoke_json_object_model(
+async def _invoke_json_object_model(
     model: Any,
     system_prompt: str,
     message: HumanMessage,
@@ -756,7 +781,7 @@ def _invoke_json_object_model(
                         )
                     )
                 )
-            response = model.invoke(attempt_messages)
+            response = await model.ainvoke(attempt_messages)
             raw_text = _response_text(response)
             if raw_text.startswith("```") and raw_text.endswith("```"):
                 raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.IGNORECASE).strip()
@@ -771,7 +796,7 @@ def _invoke_json_object_model(
             raise RuntimeError(f"模型未返回可解析的 {schema.__name__} json 对象")
         if reviewer_agent is None:
             return candidate
-        review = _review_candidate(
+        review = await _review_candidate(
             reviewer_agent,
             agent_name=agent_name or schema.__name__,
             system_prompt=system_prompt,
@@ -845,6 +870,11 @@ def _multimodal_message(prompt: str, images: list[str], input_dir: Path) -> Huma
     return HumanMessage(content=content)
 
 
+def _chunked(values: list[str], size: int) -> Iterator[list[str]]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
 def _image_classification_message(images: list[str], input_dir: Path) -> HumanMessage:
     content: list[dict[str, Any]] = [
         {
@@ -897,9 +927,12 @@ class MedicalRecordAgents:
         reviewer_model: ChatOpenAI | None = None,
         enable_review: bool = False,
         filter_path: Path | None = None,
+        stage_timeout: float = 0.0,
     ) -> None:
         self.input_dir = input_dir
         self.filter_path = filter_path or (DEFAULT_OUTPUT_DIR / FILTER_FILE_NAME)
+        self.stage_timeout = stage_timeout
+        self.vlm_model = vlm_model
         self.diagnosis_agent = self._build_diagnosis_agent(diagnosis_model or text_model)
         self.history_agent = self._build_history_agent(text_model)
         self.extract_agent = self._build_extract_agent(text_model)
@@ -975,7 +1008,7 @@ class MedicalRecordAgents:
         # diagnosis_disease 中的西医诊断（如“高血压”）误改为“高血压证”。
         record["diagnosis_disease"] = normalize_diagnosis_value(record.get("diagnosis_disease"))
 
-    def complete_diagnoses(self, record: dict[str, Any]) -> None:
+    async def complete_diagnoses(self, record: dict[str, Any]) -> None:
         for field in DIAGNOSIS_FIELDS:
             record.setdefault(f"ai_{field}", "")
             record.setdefault(f"ai_{field}_reason", "")
@@ -991,7 +1024,7 @@ class MedicalRecordAgents:
         present_history = _diagnosis_present_history(record)
 
         diagnosis_system_prompt = _load_prompt("fill_diagnosis_prompt.txt")
-        result = _invoke_json_object_model(
+        result = await _invoke_json_object_model(
             self.diagnosis_agent,
             diagnosis_system_prompt,
             HumanMessage(
@@ -1000,8 +1033,9 @@ class MedicalRecordAgents:
                     f"本次就诊现病史：{present_history}\n"
                     f"三个原始诊断结果：{_json_for_prompt(source_diagnoses)}\n"
                     f"上一次同患者诊断结果（如为空表示无上一诊断可参考）：{_json_for_prompt(previous_diagnoses)}\n"
-                    "要求：原始诊断字段非空时必须原样保留，不得改写；"
-                    "仅对原始诊断为空的字段补全。补全时先从其他原始诊断字段中提取对应类别结果，如果其他字段仍没有可提取的诊断内容。结合本次主诉、本次现病史和上一次诊断结果补全。最终所有字段值均不能为空。"
+                    "要求：diagnosis_illness 即使非空也必须清理、拆分、重分类，保留所有有效西医诊断；"
+                    "diagnosis_disease 和 diagnosis_sickness 非空时原则上保留，空字段优先从 diagnosis_illness 或其他原始字段中提取对应类别结果。"
+                    "无效诊断文本必须丢弃并结合本次主诉、本次现病史和上一次诊断结果补全。最终所有字段值均不能为空。"
 
                 )
             ),
@@ -1017,7 +1051,7 @@ class MedicalRecordAgents:
         }
         for field in DIAGNOSIS_FIELDS:
             original_value = _clean_generated_text(source_diagnoses.get(field))
-            if original_value:
+            if field != "diagnosis_illness" and original_value:
                 record[f"ai_{field}"] = original_value
                 record[f"ai_{field}_reason"] = "原字段非空，按要求保留原诊断结果。"
                 continue
@@ -1037,12 +1071,12 @@ class MedicalRecordAgents:
                 )
             record[f"ai_{field}_reason"] = reason
 
-    def extract_current_visit_history(self, record: dict[str, Any], enabled: bool) -> None:
+    async def extract_current_visit_history(self, record: dict[str, Any], enabled: bool) -> None:
         record["ai_new_medical_history"] = ""
         history = _present_history(record)
         if not enabled or not history:
             return
-        result = _invoke_structured_agent(
+        result = await _invoke_structured_agent(
             self.current_visit_history_agent,
             HumanMessage(
                 content=(
@@ -1062,14 +1096,14 @@ class MedicalRecordAgents:
             _clean_generated_text(result.new_medical_history)
         )
 
-    def clean_histories(self, record: dict[str, Any]) -> None:
+    async def clean_histories(self, record: dict[str, Any]) -> None:
         histories = _history_payload(record)
         inspection_description = format_inspection_result_text(record.get("ai_inspection_report_img"))
         logger.info(f"检查报告分析结果： {inspection_description}")
         tongue_face_description = format_tongue_face_result_text(record.get("ai_tongue_face_img"))
-        logger.info(f"检查报告分析结果： {tongue_face_description}")
+        logger.info(f"舌面分析结果： {tongue_face_description}")
         system_prompt = _load_prompt("clinical_record_cleaning_prompt.txt")
-        result = _invoke_structured_agent(
+        result = await _invoke_structured_agent(
             self.history_agent,
             HumanMessage(
                 content=(
@@ -1105,12 +1139,63 @@ class MedicalRecordAgents:
         """根据不同医生--不同疾病--不同病期---不同治则治法—不同配伍用药知识库召回疾病知识."""
         return ''
 
-    def classify_images(self, record: dict[str, Any]) -> dict[str, list[str]]:
+    async def _ocr_image_batches(self, images: list[str], prompt: str, *, agent_name: str) -> str:
+        """Run OCR/visible-fact transcription with at most five images per VLM request."""
+        sections = []
+        for batch_index, batch_images in enumerate(_chunked(images, MAX_VLM_IMAGES_PER_REQUEST), 1):
+            start_index = (batch_index - 1) * MAX_VLM_IMAGES_PER_REQUEST + 1
+            numbered_prompt = (
+                f"{prompt}\n"
+                f"本批共 {len(batch_images)} 张图片，对应原始图片序号 {start_index} 到 "
+                f"{start_index + len(batch_images) - 1}。"
+                "请逐张输出可识别文字或可见客观事实；无法识别的图片也要保留图片序号并说明无法识别。"
+            )
+            response = await self.vlm_model.ainvoke(
+                [_multimodal_message(numbered_prompt, batch_images, self.input_dir)]
+            )
+            text = _response_text(response)
+            sections.append(f"【{agent_name} OCR 批次 {batch_index}】\n{text}")
+        return "\n\n".join(sections)
+
+    async def _extract_inspection_from_ocr(self, visit_time: str, ocr_text: str) -> InspectionResult:
+        prompt = (
+            f"本次就诊时间（see_doc_time）：{visit_time or '未记录'}\n"
+            "以下内容是多张检查报告图片按批次 OCR 后得到的文本。请只依据 OCR 文本，"
+            "逐张分类并提取有效检查报告中可用于核对或补充本次现病史的客观事实。"
+            "如能识别报告日期，请给出报告日期相对本次就诊时间的相对时间。\n"
+            f"{ocr_text}"
+        )
+        return await _invoke_structured_agent(
+            self.inspection_agent,
+            HumanMessage(content=prompt),
+            InspectionResult,
+            reviewer_agent=self.reviewer_agent,
+            agent_name="inspection_report_agent",
+            system_prompt=_load_prompt("inspection_report_analysis_prompt.txt"),
+        )
+
+    async def _extract_tongue_face_from_ocr(self, ocr_text: str) -> TongueFaceResult:
+        prompt = (
+            "以下内容是多张舌象、面象和患处图片按批次转写后的 OCR/可见事实文本。"
+            "请只依据这些文本，按结构化模型提取可见舌象、面象和患处内容；"
+            "不得补充文本中没有的疾病、证候、病因或病机推断。\n"
+            f"{ocr_text}"
+        )
+        return await _invoke_structured_agent(
+            self.tongue_face_agent,
+            HumanMessage(content=prompt),
+            TongueFaceResult,
+            reviewer_agent=self.reviewer_agent,
+            agent_name="tongue_face_agent",
+            system_prompt=_load_prompt("tongue_face_analysis_prompt.txt"),
+        )
+
+    async def classify_images(self, record: dict[str, Any]) -> dict[str, list[str]]:
         """不依赖字段名，对四个图片字段中的图片逐张分类."""
         images = _record_images(record)
         if not images:
             return {category: [] for category in IMAGE_CATEGORIES}
-        result = _invoke_structured_agent(
+        result = await _invoke_structured_agent(
             self.image_classifier_agent,
             _image_classification_message(images, self.input_dir),
             ImageClassificationResult,
@@ -1120,9 +1205,9 @@ class MedicalRecordAgents:
         )
         return _group_classified_images(result, images)
 
-    def analyze_inspection_images(self, record: dict[str, Any], images: list[str] | None = None) -> None:
+    async def analyze_inspection_images(self, record: dict[str, Any], images: list[str] | None = None) -> None:
         if images is None:
-            images = self.classify_images(record)["检验检查报告类"]
+            images = (await self.classify_images(record))["检验检查报告类"]
         if not images:
             record["ai_inspection_report_img"] = _replace_inspection_report_symbols(
                 _model_dump(InspectionResult(), by_alias=True)
@@ -1134,14 +1219,27 @@ class MedicalRecordAgents:
             "逐张分类并解析图片，提取有效检查报告中可用于核对或补充本次现病史的客观事实。"
             "如能识别报告日期，请给出报告日期相对本次就诊时间的相对时间。"
         )
-        result = _invoke_structured_agent(
-            self.inspection_agent,
-            _multimodal_message(prompt, images, self.input_dir),
-            InspectionResult,
-            reviewer_agent=self.reviewer_agent,
-            agent_name="inspection_report_agent",
-            system_prompt=_load_prompt("inspection_report_analysis_prompt.txt"),
-        )
+        if len(images) > MAX_VLM_IMAGES_PER_REQUEST:
+            logger.info(f"[INSPECTION] images={len(images)} exceeds {MAX_VLM_IMAGES_PER_REQUEST}, using OCR batches")
+            ocr_text = await self._ocr_image_batches(
+                images,
+                (
+                    "你是医学检查报告图片 OCR 助手。只转写图片中清晰可见的文字、数字、单位、"
+                    "参考范围、异常标记、报告日期、报告名称、检查所见和诊断意见。"
+                    "不得根据医学常识补全模糊或缺失内容。"
+                ),
+                agent_name="inspection_report",
+            )
+            result = await self._extract_inspection_from_ocr(visit_time, ocr_text)
+        else:
+            result = await _invoke_structured_agent(
+                self.inspection_agent,
+                _multimodal_message(prompt, images, self.input_dir),
+                InspectionResult,
+                reviewer_agent=self.reviewer_agent,
+                agent_name="inspection_report_agent",
+                system_prompt=_load_prompt("inspection_report_analysis_prompt.txt"),
+            )
         for report in result.reports:
             relative_time = _relative_report_time(report.report_date, visit_time)
             if relative_time:
@@ -1150,10 +1248,17 @@ class MedicalRecordAgents:
             _model_dump(result, by_alias=True)
         )
 
-    def analyze_tongue_face_images(self, record: dict[str, Any], images: list[str] | None = None) -> None:
+    async def analyze_tongue_face_images(self, record: dict[str, Any], images: list[str] | None = None) -> None:
+        record_id = (
+            _text(record.get("order_sn"))
+            or _text(record.get("id"))
+            or _text(record.get("record_id"))
+            or "<unknown>"
+        )
         if images is None:
-            classified_images = self.classify_images(record)
+            classified_images = await self.classify_images(record)
             images = [image for category in TONGUE_FACE_IMAGE_CATEGORIES for image in classified_images[category]]
+        logger.info(f"[TONGUE_FACE] record={record_id} images={len(images)}")
         if not images:
             record["ai_tongue_face_img"] = _model_dump(TongueFaceResult())
             return
@@ -1162,17 +1267,36 @@ class MedicalRecordAgents:
             "面神、面色、光泽、面部形态、五官局部和皮损。只描述图像可见事实，不作疾病、证候、"
             "病因或病机推断；无法辨认的字符串字段返回空字符串，多选字段返回空数组。"
         )
-        result = _invoke_structured_agent(
-            self.tongue_face_agent,
-            _multimodal_message(prompt, images, self.input_dir),
-            TongueFaceResult,
-            reviewer_agent=self.reviewer_agent,
-            agent_name="tongue_face_agent",
-            system_prompt=_load_prompt("tongue_face_analysis_prompt.txt"),
-        )
+        if len(images) > MAX_VLM_IMAGES_PER_REQUEST:
+            logger.info(
+                f"[TONGUE_FACE] record={record_id} images={len(images)} exceeds "
+                f"{MAX_VLM_IMAGES_PER_REQUEST}, using OCR batches"
+            )
+            ocr_text = await self._ocr_image_batches(
+                images,
+                (
+                    "你是舌象、面象和患处图片转写助手。请逐张记录图片中清晰可见的客观事实："
+                    "舌体、舌苔、舌下络脉、面部神色、五官局部、皮肤或患处形态颜色分布。"
+                ),
+                agent_name="tongue_face",
+            )
+            result = await self._extract_tongue_face_from_ocr(ocr_text)
+        else:
+            logger.info(f"[TONGUE_FACE] record={record_id} building multimodal message")
+            message = _multimodal_message(prompt, images, self.input_dir)
+            logger.info(f"[TONGUE_FACE] record={record_id} invoking model")
+            result = await _invoke_structured_agent(
+                self.tongue_face_agent,
+                message,
+                TongueFaceResult,
+                reviewer_agent=self.reviewer_agent,
+                agent_name="tongue_face_agent",
+                system_prompt=_load_prompt("tongue_face_analysis_prompt.txt"),
+            )
+        logger.info(f"[TONGUE_FACE] record={record_id} model returned")
         record["ai_tongue_face_img"] = _model_dump(result)
 
-    def extract_clinical_fields(self, record: dict[str, Any], use_rag:bool=False) -> None:
+    async def extract_clinical_fields(self, record: dict[str, Any], use_rag:bool=False) -> None:
         diagnoses = {
             field: _text(record.get(f"ai_{field}")) or _text(record.get(field))
             for field in DIAGNOSIS_FIELDS
@@ -1185,7 +1309,7 @@ class MedicalRecordAgents:
         inspection_description = format_inspection_result_text(record.get("ai_inspection_report_img"))
         tongue_face_description = format_tongue_face_result_text(record.get("ai_tongue_face_img"))
         system_prompt = _load_prompt("extract_prompt.txt")
-        result = _invoke_structured_agent(
+        result = await _invoke_structured_agent(
             self.extract_agent,
             HumanMessage(
                 content=(
@@ -1208,30 +1332,65 @@ class MedicalRecordAgents:
         for field, value in values.items():
             record[f"ai_{field}"] = _clean_generated_value(value)
 
-    def process(self, record: dict[str, Any], *, extract_current_history: bool = False, use_rag:bool=False) -> dict[str, Any]:
+    async def _run_stage(self, stage_name: str, record_id: str, stage: Callable[[], Any]) -> None:
+        started_at = time.monotonic()
+        logger.info(f"[STAGE START] record={record_id} stage={stage_name}")
+        try:
+            result = stage()
+            if inspect.isawaitable(result):
+                if self.stage_timeout > 0:
+                    await asyncio.wait_for(result, timeout=self.stage_timeout)
+                else:
+                    await result
+        except Exception:
+            logger.info(
+                f"[STAGE FAILED] record={record_id} stage={stage_name} elapsed={time.monotonic() - started_at:.1f}s"
+            )
+            raise
+        logger.info(f"[STAGE END] record={record_id} stage={stage_name} elapsed={time.monotonic() - started_at:.1f}s")
+
+    async def process(
+        self,
+        record: dict[str, Any],
+        *,
+        extract_current_history: bool = False,
+        use_rag: bool = False,
+    ) -> dict[str, Any]:
         output = dict(record)
+        record_id = (
+            _text(record.get("order_sn"))
+            or _text(record.get("id"))
+            or _text(record.get("record_id"))
+            or "<unknown>"
+        )
         output["__original_diagnoses"] = _diagnosis_payload(output)
         errors = []
 
-        # 主诉、现病史和西医诊断全部缺失时，不调用任何 Agent，单独保存到 filter.json。
+        # 主诉、现病史和西医诊断全部缺失时，不调用任何 Agent
         if _should_filter_record(record):
             write2filter_json(record, self.filter_path)
-            filtered_output = dict(record)
-            filtered_output["ai_processing_filtered"] = True
-            filtered_output["ai_filter_reason"] = (
-                "doc_ass_stu_appeal、patient_appeal、new_medical_history、diagnosis_illness 均为空"
+            output["ai_processing_filtered"] = True
+            output["ai_processing_complete"] = False
+            output["ai_filter_reason"] = (
+                "patient_appeal、new_medical_history、diagnosis_illness 均为空"
             )
-            return filtered_output
+            logger.info(f"[STAGE FILTER] record={record_id}")
+            return output
 
         # step1：先做不依赖诊断类型的基础归一化，不额外存储 ai_normalized_*。
         try:
-            self.normalize_diagnoses(output)
+            await self._run_stage("diagnosis_normalization", record_id, lambda: self.normalize_diagnoses(output))
         except Exception as exc:
             errors.append({"stage": "diagnosis_normalization", "error": f"{type(exc).__name__}: {exc}"})
-
         # step2：先汇总四个图片字段逐张分类；其他类图片不会进入后续解析。
         try:
-            classified_images = self.classify_images(output)
+            classified_images: dict[str, list[str]] = {}
+
+            async def classify_image_stage() -> None:
+                nonlocal classified_images
+                classified_images = await self.classify_images(output)
+
+            await self._run_stage("image_classification", record_id, classify_image_stage)
         except Exception as exc:
             errors.append({"stage": "image_classification", "error": f"{type(exc).__name__}: {exc}"})
             classified_images = {category: [] for category in IMAGE_CATEGORIES}
@@ -1247,37 +1406,39 @@ class MedicalRecordAgents:
             ),
             "tongue_face_vlm": (self.analyze_tongue_face_images, tongue_face_images),
         }
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="medical-vlm") as executor:
-            futures = {
-                name: executor.submit(stage, output, images)
-                for name, (stage, images) in image_stages.items()
-            }
-            for stage_name, future in futures.items():
-                try:
-                    future.result()
-                except Exception as exc:
-                    errors.append({"stage": stage_name, "error": f"{type(exc).__name__}: {exc}"})
-
+        tasks = {
+            name: asyncio.create_task(
+                self._run_stage(name, record_id, lambda stage=stage, images=images: stage(output, images))
+            )
+            for name, (stage, images) in image_stages.items()
+        }
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        for stage_name, result in zip(tasks, results, strict=True):
+            if isinstance(result, Exception):
+                errors.append({"stage": stage_name, "error": f"{type(result).__name__}: {result}"})
+        logger.debug("【本次复诊现病史内容抽取】】")
         # step4：从累积现病史中抽取本次复诊内容。
         try:
-            self.extract_current_visit_history(output, extract_current_history)
+            await self._run_stage(
+                "current_visit_history",
+                record_id,
+                lambda: self.extract_current_visit_history(output, extract_current_history),
+            )
         except Exception as exc:
             errors.append({"stage": "current_visit_history", "error": f"{type(exc).__name__}: {exc}"})
 
         # step5：结合图片结果校验主诉/现病史一致性，并清洗五史。
         try:
-            self.clean_histories(output)
+            await self._run_stage("clinical_cleaning", record_id, lambda: self.clean_histories(output))
         except Exception as exc:
             errors.append({"stage": "clinical_cleaning", "error": f"{type(exc).__name__}: {exc}"})
-
         # step6：用最新病历补全诊断，再提取知识库字段。
         try:
-            self.complete_diagnoses(output)
+            await self._run_stage("diagnosis_completion", record_id, lambda: self.complete_diagnoses(output))
         except Exception as exc:
             errors.append({"stage": "diagnosis_completion", "error": f"{type(exc).__name__}: {exc}"})
-
         try:
-            self.extract_clinical_fields(output, use_rag)
+            await self._run_stage("clinical_extraction", record_id, lambda: self.extract_clinical_fields(output, use_rag))
         except Exception as exc:
             errors.append({"stage": "clinical_extraction", "error": f"{type(exc).__name__}: {exc}"})
         if errors:
@@ -1286,6 +1447,7 @@ class MedicalRecordAgents:
             output.pop("ai_processing_errors", None)
         output.pop("__original_diagnoses", None)
         output.pop("__previous_diagnoses", None)
+
         return output
 
 
@@ -1346,6 +1508,16 @@ def _doctor_matches(record: dict[str, Any], doctor_ids: set[str]) -> bool:
     if not doctor_ids:
         return True
     return _text(record.get("doctor_id")) in doctor_ids
+
+
+def _selected_doctor_quota_reached(
+    doctor_id: str, doctor_ids: set[str], attempted_by_doctor: Counter[str], limit: int
+) -> bool:
+    return bool(doctor_ids and doctor_id and limit > 0 and attempted_by_doctor[doctor_id] >= limit)
+
+
+def _all_selected_doctors_reached(doctor_ids: set[str], attempted_by_doctor: Counter[str], limit: int) -> bool:
+    return bool(doctor_ids and limit > 0 and all(attempted_by_doctor[doctor_id] >= limit for doctor_id in doctor_ids))
 
 
 def count_patient_visits(path: Path, doctor_ids: set[str]) -> Counter[str]:
@@ -1450,30 +1622,25 @@ def build_model(
         kwargs["base_url"] = resolved_base_url
     if resolved_api_key:
         kwargs["api_key"] = resolved_api_key
+    logger.info(
+        f"model_name {model_name}, base_url {resolved_base_url or '<default>'}, "
+        f"apikey {_mask_secret(resolved_api_key)}"
+    )
     normalized_base_url = _text(resolved_base_url).lower()
     model_id = model_name.lower()
-    is_dashscope_thinking_model = (
-        "dashscope" in normalized_base_url
-        or "aliyuncs.com" in normalized_base_url
-        or model_id.startswith(("qwen", "qwq"))
-    )
-    if getattr(args, "disable_thinking", False) or is_dashscope_thinking_model:
-        # 部分 OpenAI 兼容接口默认开启 thinking mode；结构化输出场景下显式关闭。
-        if "deepseek" in model_id:
-            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-        else:
-            kwargs["extra_body"] = {"enable_thinking": False}
-    logger.debug(
-        f"model={model_name} base_url={resolved_base_url} extra_body={kwargs.get('extra_body', {})}",
-    )
+    # 所有 Agent 都用于结构化抽取，统一关闭 thinking mode，避免响应中混入推理内容。
+    if "deepseek" in model_id or "deepseek" in normalized_base_url:
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    else:
+        kwargs["extra_body"] = {"enable_thinking": False}
     return ChatOpenAI(**kwargs)
 
 
-def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
+async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     doctor_ids = set(args.doctor_id or [])
 
-    text_model = build_model(args.model, args)
+    text_model = build_model(args.model, args, base_url=args.base_url, api_key=args.api_key)
     diagnosis_model = build_model(
         args.diagnosis_model,
         args,
@@ -1483,8 +1650,8 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     vlm_model = build_model(
         args.vlm_model or args.model,
         args,
-        base_url=getattr(args, "vlm_base_url", "") or args.base_url,
-        api_key=getattr(args, "vlm_api_key", "") or args.api_key,
+        base_url=args.vlm_base_url or args.base_url,
+        api_key=args.vlm_api_key or args.api_key,
     )
     enable_review = bool(getattr(args, "enable_review", False))
     reviewer_model = None
@@ -1492,8 +1659,8 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         reviewer_model = build_model(
             getattr(args, "reviewer_model", "") or os.getenv("KIMI_K3", "kimi/kimi-k3"),
             args,
-            base_url=getattr(args, "reviewer_base_url", "") or os.getenv("DASHSCOPE_BASE_URL", ""),
-            api_key=getattr(args, "reviewer_api_key", "") or os.getenv("DASHSCOPE_API_KEY", ""),
+            base_url=getattr(args, "reviewer_base_url", ""),
+            api_key=getattr(args, "reviewer_api_key", ""),
         )
     input_dir = args.input if args.input.is_dir() else args.input.parent
     agents = MedicalRecordAgents(
@@ -1504,6 +1671,7 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         reviewer_model=reviewer_model,
         enable_review=enable_review,
         filter_path=args.output_dir / FILTER_FILE_NAME,
+        stage_timeout=args.timeout,
     )
     patient_visit_counts = count_patient_visits(args.input, doctor_ids)
     if args.reprocess:
@@ -1514,6 +1682,7 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     failed = 0
     skipped = 0
     attempted = 0
+    attempted_by_doctor: Counter[str] = Counter()
     output_files: dict[Path, TextIO] = {}
     failure_files: dict[Path, TextIO] = {}
     previous_diagnoses_by_patient: dict[str, dict[str, str]] = {}
@@ -1521,6 +1690,11 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     with ExitStack() as stack:
         for index, record in enumerate(iter_records(args.input), 1):
             if not _doctor_matches(record, doctor_ids):
+                continue
+            doctor_id = _text(record.get("doctor_id"))
+            if _selected_doctor_quota_reached(doctor_id, doctor_ids, attempted_by_doctor, args.limit):
+                if _all_selected_doctors_reached(doctor_ids, attempted_by_doctor, args.limit):
+                    break
                 continue
             identity = _record_identity(record, index)
             order_sn = _text(record.get("order_sn"))
@@ -1532,9 +1706,11 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 skipped += 1
                 logger.info(f"数据已经处理过，【SKIP】 {order_sn}")
                 continue
-            if args.limit and attempted >= args.limit:
+            if not doctor_ids and args.limit and attempted >= args.limit:
                 break
             attempted += 1
+            if doctor_id:
+                attempted_by_doctor[doctor_id] += 1
             record_id = _record_key(record, index)
             extract_current_history = (
                 _text(record.get("is_first")) == "复诊"
@@ -1545,7 +1721,11 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
             if patient_key and patient_key in previous_diagnoses_by_patient:
                 working_record["__previous_diagnoses"] = previous_diagnoses_by_patient[patient_key]
             try:
-                enriched = agents.process(working_record, extract_current_history=extract_current_history, use_rag=args.use_rag)
+                enriched = await agents.process(
+                    working_record,
+                    extract_current_history=extract_current_history,
+                    use_rag=args.use_rag,
+                )
             except Exception as exc:  # 单条失败不能中断其他医生/病历
                 enriched = dict(working_record)
                 enriched.pop("__previous_diagnoses", None)
@@ -1602,7 +1782,7 @@ def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
             if patient_key and _has_any_diagnosis(enriched_diagnoses):
                 previous_diagnoses_by_patient[patient_key] = enriched_diagnoses
             if args.interval > 0:
-                time.sleep(args.interval)
+                await asyncio.sleep(args.interval)
     return succeeded, failed, skipped
 
 
@@ -1622,60 +1802,70 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_DIR,
         help=f"分医生 JSONL 输出目录；默认 {DEFAULT_OUTPUT_DIR}",
     )
-    parser.add_argument("--model", default=os.getenv("MEDICAL_AGENT_MODEL", "gpt-4.1-mini"), help="文本模型")
+    default_model = _env("MEDICAL_AGENT_MODEL", "gpt-4.1-mini")
+    parser.add_argument("--model", default=default_model, help="文本模型")
     parser.add_argument(
         "--diagnosis-model",
-        default=os.getenv("DEEPSEEK_TEXT_MODEL", "Baichuan4-Turbo"),
-        help="诊断补全模型，默认使用 Baichuan",
+        default=_env_any(
+            ("MEDICAL_AGENT_DIAGNOSIS_MODEL", "DEEPSEEK_TEXT_MODEL", "BAICHUAN_TEXT_MODEL"),
+            "Baichuan4-Turbo",
+        ),
+        help="诊断补全模型，默认使用独立诊断模型配置",
     )
     parser.add_argument(
         "--diagnosis-base-url",
-        default=os.getenv("DEEPSEEK_BASE_URL", "https://api.baichuan-ai.com/v1/"),
+        default=_env_any(
+            ("MEDICAL_AGENT_DIAGNOSIS_BASE_URL", "DEEPSEEK_BASE_URL", "BAICHUAN_BASE_URL"),
+            "https://api.baichuan-ai.com/v1/",
+        ),
         help="诊断补全模型的 OpenAI 兼容接口地址",
     )
     parser.add_argument(
         "--diagnosis-api-key",
-        default=os.getenv("DEEPSEEK_API_KEY", ""),
+        default=_env_any(("MEDICAL_AGENT_DIAGNOSIS_API_KEY", "DEEPSEEK_API_KEY", "BAICHUAN_API_KEY")),
         help="诊断补全模型 API Key",
     )
-    parser.add_argument("--vlm-model", default=os.getenv("MEDICAL_AGENT_VLM_MODEL", ""), help="视觉模型，默认同文本模型")
+    parser.add_argument("--vlm-model", default=_env("MEDICAL_AGENT_VLM_MODEL"), help="视觉模型，默认同文本模型")
     parser.add_argument(
         "--base-url",
         "--text-base-url",
         dest="base_url",
-        default=os.getenv("DASHSCOPE_BASE_URL", os.getenv("DASHSCOPE_BASE_URL", "")),
+        default=_env("DASHSCOPE_BASE_URL", DASHSCOPE_COMPATIBLE_BASE_URL),
         help="文本模型 OpenAI 兼容接口地址",
     )
     parser.add_argument(
         "--api-key",
         "--text-api-key",
         dest="api_key",
-        default=os.getenv("DASHSCOPE_API_KEY", os.getenv("DASHSCOPE_API_KEY", "")),
+        default=_env("DASHSCOPE_API_KEY"),
         help="文本模型 API Key",
     )
     parser.add_argument(
         "--vlm-base-url",
-        default=os.getenv("DASHSCOPE_BASE_URL", ""),
+        default=_env("MEDICAL_AGENT_VLM_BASE_URL"),
         help="视觉模型 OpenAI 兼容接口地址；默认使用文本模型接口地址",
     )
     parser.add_argument(
         "--vlm-api-key",
-        default=os.getenv("DASHSCOPE_API_KEY", ""),
+        default=_env("MEDICAL_AGENT_VLM_API_KEY"),
         help="视觉模型 API Key；默认使用文本模型 API Key",
     )
     parser.add_argument(
         "--reviewer-model",
-        default=os.getenv("KIMI_K3", "kimi/kimi-k3"),
+        default=_env_any(("MEDICAL_AGENT_REVIEWER_MODEL", "KIMI_K3"), "kimi/kimi-k3"),
         help="评审 Agent 模型；默认使用 DashScope 的 KIMI_K3",
     )
     parser.add_argument(
         "--reviewer-base-url",
-        default=os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        default=_env_any(
+            ("MEDICAL_AGENT_REVIEWER_BASE_URL", "KIMI_BASE_URL", "DASHSCOPE_BASE_URL"),
+            DASHSCOPE_COMPATIBLE_BASE_URL,
+        ),
         help="评审 Agent 的 DashScope OpenAI 兼容接口地址",
     )
     parser.add_argument(
         "--reviewer-api-key",
-        default=os.getenv("DASHSCOPE_API_KEY", ""),
+        default=_env_any(("MEDICAL_AGENT_REVIEWER_API_KEY", "KIMI_API_KEY", "DASHSCOPE_API_KEY")),
         help="评审 Agent 的 DashScope API Key",
     )
     parser.add_argument(
@@ -1684,14 +1874,19 @@ def parse_args() -> argparse.Namespace:
         help="启用评审 Agent；默认关闭",
     )
     parser.add_argument("--doctor-id", action="append", help="仅处理指定 doctor_id；可重复传入，默认所有医生")
-    parser.add_argument("--limit", type=int, default=0, help="最多处理多少条，0 表示不限制")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="处理条数限制；指定 doctor_id 时表示每个医生最多处理多少条，默认所有医生时表示总条数",
+    )
     parser.add_argument("--interval", type=float, default=0.0, help="每条病历后的等待秒数")
     parser.add_argument("--timeout", type=float, default=120.0, help="单次模型请求超时秒数")
     parser.add_argument("--max-retries", type=int, default=2, help="模型请求重试次数")
     parser.add_argument(
         "--disable-thinking",
         action="store_true",
-        help="关闭模型 thinking mode；DashScope/Qwen 会自动关闭，其他兼容接口可显式启用此参数",
+        help="兼容旧参数；所有 Agent 默认关闭 thinking mode",
     )
     parser.add_argument("--reprocess", action="store_true", help="忽略已有成功记录并重新处理")
     parser.add_argument("--fail-fast", action="store_true", help="任一病历失败时立即退出")
@@ -1703,7 +1898,7 @@ def main() -> None:
     args = parse_args()
     if not args.input.exists():
         raise FileNotFoundError(f"输入路径不存在: {args.input}")
-    succeeded, failed, skipped = process_records(args)
+    succeeded, failed, skipped = asyncio.run(process_records(args))
     logger.info(
         f"处理完成: 成功 {succeeded} 条，失败 {failed} 条，跳过已处理或过滤 {skipped} 条，输出目录 {args.output_dir}"
     )

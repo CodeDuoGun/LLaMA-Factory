@@ -140,6 +140,7 @@ SYNDROME_TERM_ALIASES = {
     "脾肺两虚": "脾肺两虚证",
     "肺脾两虚证": "脾肺两虚证",
     "肺脾两虚": "脾肺两虚证",
+    "痰瘀互结9": "痰瘀互结"
 
 }
 SICKNESS_TERM_ALIASES = {

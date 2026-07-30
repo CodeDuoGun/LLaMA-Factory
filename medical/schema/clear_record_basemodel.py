@@ -32,6 +32,8 @@ class DiagnosisResult(BaseModel):
         text = "" if value is None else str(value).strip()
         if text.lower() in {"", "null", "none", "无", "未知", "未明确", "不详", "待查", "暂无", "正常"}:
             raise ValueError("诊断结果不能为空或占位词")
+        if any(token in text for token in ("待定", "待确定", "原因待定")):
+            raise ValueError("诊断结果不能包含待定类占位文本")
         return text
 
 class HistoryCleaningResult(BaseModel):
@@ -169,7 +171,6 @@ class FaceSpiritFeatures(BaseModel):
 
     level: str = Field(default="", description="神态：得神、少神、失神、假神或神志异常")
     expression: str = Field(default="", description="表情：自然、痛苦、疲惫或其他可见表现")
-    responsiveness: str = Field(default="", description="反应状态：灵敏、迟钝或无法判断")
     gaze: str = Field(default="", description="目光：有神、少神、呆滞或无法判断")
 
 
@@ -231,7 +232,6 @@ class LesionFeatures(BaseModel):
     morphology: list[str] = Field(default_factory=list, description="丘疹、红斑、斑疹、脓疱、结节等形态")
     color: list[str] = Field(default_factory=list, description="患处颜色")
     boundary: str = Field(default="", description="边界是否清楚及边缘形态")
-    size: str = Field(default="", description="可见大小；无参照物时不估算具体尺寸")
     extent: str = Field(default="", description="数量、范围、散在、密集、融合或对称性")
     exudation: str = Field(default="", description="有无渗出及可见程度")
     scaling: str = Field(default="", description="有无鳞屑及可见程度")
@@ -272,7 +272,6 @@ TONGUE_FACE_RESULT_FIELD_CN_MAPPING: dict[str, str] = {
     "face.spirit": "面神",
     "face.spirit.level": "神态",
     "face.spirit.expression": "表情",
-    "face.spirit.responsiveness": "反应",
     "face.spirit.gaze": "目光",
     "face.complexion": "面色",
     "face.complexion.category": "面色",
@@ -292,7 +291,6 @@ TONGUE_FACE_RESULT_FIELD_CN_MAPPING: dict[str, str] = {
     "lesions.morphology": "患处形态",
     "lesions.color": "患处颜色",
     "lesions.boundary": "患处边界",
-    "lesions.size": "患处大小",
     "lesions.extent": "患处范围",
     "lesions.exudation": "渗出",
     "lesions.scaling": "鳞屑",
