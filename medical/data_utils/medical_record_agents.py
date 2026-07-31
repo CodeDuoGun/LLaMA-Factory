@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import fcntl
 import hashlib
 import inspect
 import json
@@ -57,10 +58,16 @@ import httpx
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ValidationError
 
-from langchain.agents import create_agent
-from langchain.agents.structured_output import StructuredOutputError, ToolStrategy
+from langchain.agents.structured_output import StructuredOutputError
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from medical.data_utils.structured_agent import (
+    AgentModelConfig,
+    StructuredAgent,
+    StructuredOutputMode,
+    model_json_schema,
+    response_text,
+)
 from medical.utils.log import logger
 from dotenv import load_dotenv
 from medical.schema.clear_record_basemodel import (
@@ -109,6 +116,8 @@ IMAGE_CLASSIFICATION_BATCH_CONCURRENCY = 2
 CLASSIFICATION_IMAGE_MAX_EDGE = 512
 CLASSIFICATION_MODEL_NAME = "qwen3.7-flash"
 CLASSIFICATION_MODEL_MAX_TOKENS = 512
+DEFAULT_AGENT_TEMPERATURE = 0.0
+DEFAULT_AGENT_MAX_TOKENS = 3600
 IMAGE_DEDUP_DOWNLOAD_CONCURRENCY = 8
 IMAGE_DEDUP_DOWNLOAD_TIMEOUT = 10.0
 CURRENT_VISIT_HISTORY_SYSTEM_PROMPT = (
@@ -457,21 +466,27 @@ def write2filter_json(record: Mapping[str, Any], path: Path | None = None) -> bo
     identity = _filtered_record_identity(filtered_record)
 
     with FILTER_FILE_LOCK:
-        records: list[dict[str, Any]] = []
-        if target.is_file():
+        lock_path = target.with_name(f".{target.name}.lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
-                existing = json.loads(target.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"过滤文件不是合法 JSON: {target}") from exc
-            if not isinstance(existing, list) or not all(isinstance(item, dict) for item in existing):
-                raise ValueError(f"过滤文件必须是 JSON 对象数组: {target}")
-            records = existing
-        if any(_filtered_record_identity(item) == identity for item in records):
-            return False
-        records.append(filtered_record)
-        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(target)
+                records: list[dict[str, Any]] = []
+                if target.is_file():
+                    try:
+                        existing = json.loads(target.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"过滤文件不是合法 JSON: {target}") from exc
+                    if not isinstance(existing, list) or not all(isinstance(item, dict) for item in existing):
+                        raise ValueError(f"过滤文件必须是 JSON 对象数组: {target}")
+                    records = existing
+                if any(_filtered_record_identity(item) == identity for item in records):
+                    return False
+                records.append(filtered_record)
+                temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+                temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+                temporary.replace(target)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     return True
 
 
@@ -626,15 +641,8 @@ def _load_prompt(name: str) -> str:
     return (PROMPT_DIR / name).read_text(encoding="utf-8").strip()
 
 
-def _tool_response_format(schema: type[BaseModel]) -> ToolStrategy[Any]:
-    """统一通过工具调用生成并校验结构化响应."""
-    return ToolStrategy(schema=schema, handle_errors=True)
-
-
 def _model_json_schema(schema: type[BaseModel]) -> dict[str, Any]:
-    if hasattr(schema, "model_json_schema"):
-        return schema.model_json_schema()
-    return schema.schema()
+    return model_json_schema(schema)
 
 
 async def _invoke_structured_candidate(
@@ -642,6 +650,12 @@ async def _invoke_structured_candidate(
     messages: list[HumanMessage],
     schema: type[BaseModel],
 ) -> tuple[BaseModel, str]:
+    if isinstance(agent, StructuredAgent):
+        result = await agent.ainvoke(messages)
+        if not isinstance(result.output, schema):
+            return schema.model_validate(_model_dump(result.output)), result.trace
+        return result.output, result.trace
+
     last_error: StructuredOutputError | None = None
     for attempt in range(2):
         attempt_messages = list(messages)
@@ -824,18 +838,7 @@ async def _invoke_structured_agent(
 
 def _response_text(response: Any) -> str:
     """兼容 OpenAI 风格响应的字符串或内容块格式."""
-    content = getattr(response, "content", "")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        texts = []
-        for block in content:
-            if isinstance(block, str):
-                texts.append(block)
-            elif isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
-                texts.append(_text(block.get("text")))
-        return "\n".join(text for text in texts if text).strip()
-    return _text(content)
+    return response_text(response)
 
 
 async def _invoke_json_object_model(
@@ -850,33 +853,38 @@ async def _invoke_json_object_model(
     """调用仅支持 json_object 的 OpenAI 兼容模型，并在客户端完成模型校验."""
     human_messages = [message]
     for review_round in range(2):
-        last_error: json.JSONDecodeError | ValidationError | None = None
-        candidate = None
-        for attempt in range(2):
-            attempt_messages: list[Any] = [SystemMessage(content=system_prompt), *human_messages]
-            if attempt:
-                attempt_messages.append(
-                    HumanMessage(
-                        content=(
-                            f"上一次返回内容无法通过 {schema.__name__} 校验。"
-                            "请重新返回一个完整、可解析的 json 对象，所有要求字段均不得省略，"
-                            "不要输出 Markdown、注释或额外说明。"
+        if isinstance(model, StructuredAgent):
+            structured_result = await model.ainvoke(human_messages)
+            candidate = structured_result.output
+            raw_text = structured_result.trace
+        else:
+            last_error: json.JSONDecodeError | ValidationError | None = None
+            candidate = None
+            for attempt in range(2):
+                attempt_messages: list[Any] = [SystemMessage(content=system_prompt), *human_messages]
+                if attempt:
+                    attempt_messages.append(
+                        HumanMessage(
+                            content=(
+                                f"上一次返回内容无法通过 {schema.__name__} 校验。"
+                                "请重新返回一个完整、可解析的 json 对象，所有要求字段均不得省略，"
+                                "不要输出 Markdown、注释或额外说明。"
+                            )
                         )
                     )
-                )
-            response = await model.ainvoke(attempt_messages)
-            raw_text = _response_text(response)
-            if raw_text.startswith("```") and raw_text.endswith("```"):
-                raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.IGNORECASE).strip()
-            try:
-                candidate = schema.model_validate(json.loads(raw_text))
-                break
-            except (json.JSONDecodeError, ValidationError) as exc:
-                last_error = exc
-        if candidate is None:
-            if last_error is not None:
-                raise last_error
-            raise RuntimeError(f"模型未返回可解析的 {schema.__name__} json 对象")
+                response = await model.ainvoke(attempt_messages)
+                raw_text = _response_text(response)
+                if raw_text.startswith("```") and raw_text.endswith("```"):
+                    raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.IGNORECASE).strip()
+                try:
+                    candidate = schema.model_validate(json.loads(raw_text))
+                    break
+                except (json.JSONDecodeError, ValidationError) as exc:
+                    last_error = exc
+            if candidate is None:
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError(f"模型未返回可解析的 {schema.__name__} json 对象")
         if reviewer_agent is None:
             return candidate
         review = await _review_candidate(
@@ -1017,7 +1025,12 @@ async def _image_classification_message(
     images: list[str],
     input_dir: Path,
 ) -> list[tuple[HumanMessage, list[str]]]:
-    """Build at-most-eight-image messages after URL and exact-content deduplication."""
+    """Build at-most-eight-image messages after URL and exact-content deduplication.
+
+    HTTP URL:
+        ├─ 下载成功 → 去重 → 缩放 → Base64 传给分类模型
+        └─ 下载失败 → 原始 HTTP URL 直接传给分类模型
+    """
     url_unique_images = list(dict.fromkeys(image for image in (_text(image) for image in images) if image))
     remote_images = any(image.startswith(("http://", "https://")) for image in url_unique_images)
     client = (
@@ -1127,39 +1140,34 @@ class MedicalRecordAgents:
         self.extract_agent = self._build_extract_agent(text_model)
         self.reviewer_agent = None
         if enable_review:
-            self.reviewer_agent = create_agent(
-                model=reviewer_model or vlm_model,
-                tools=[],
+            self.reviewer_agent = StructuredAgent(
+                reviewer_model or vlm_model,
+                AgentReviewResult,
                 system_prompt=_load_prompt("agent_review_prompt.txt"),
-                response_format=_tool_response_format(AgentReviewResult),
                 name="medical_agent_reviewer",
             )
-        self.current_visit_history_agent = create_agent(
-            model=text_model,
-            tools=[],
+        self.current_visit_history_agent = StructuredAgent(
+            text_model,
+            CurrentVisitHistoryResult,
             system_prompt=CURRENT_VISIT_HISTORY_SYSTEM_PROMPT,
-            response_format=_tool_response_format(CurrentVisitHistoryResult),
             name="current_visit_history_agent",
         )
-        self.image_classifier_agent = create_agent(
-            model=image_classification_model or vlm_model,
-            tools=[],
+        self.image_classifier_agent = StructuredAgent(
+            image_classification_model or vlm_model,
+            ImageClassificationResult,
             system_prompt=_load_prompt("image_classification_prompt.txt"),
-            response_format=_tool_response_format(ImageClassificationResult),
             name="medical_image_classifier_agent",
         )
-        self.inspection_agent = create_agent(
-            model=vlm_model,
-            tools=[],
+        self.inspection_agent = StructuredAgent(
+            vlm_model,
+            InspectionResult,
             system_prompt=_load_prompt("inspection_report_analysis_prompt.txt"),
-            response_format=_tool_response_format(InspectionResult),
             name="inspection_report_agent",
         )
-        self.tongue_face_agent = create_agent(
-            model=vlm_model,
-            tools=[],
+        self.tongue_face_agent = StructuredAgent(
+            vlm_model,
+            TongueFaceResult,
             system_prompt=_load_prompt("tongue_face_analysis_prompt.txt"),
-            response_format=_tool_response_format(TongueFaceResult),
             name="tongue_face_agent",
         )
 
@@ -1167,25 +1175,29 @@ class MedicalRecordAgents:
     def _build_diagnosis_agent(model: ChatOpenAI) -> Any:
         # Baichuan accepts json_object, but rejects ToolStrategy's tool_choice and
         # ProviderStrategy's JSON Schema request body. Validate the JSON locally.
-        return model.bind(response_format={"type": "json_object"})
+        return StructuredAgent(
+            model,
+            DiagnosisResult,
+            system_prompt=_load_prompt("fill_diagnosis_prompt.txt"),
+            name="diagnosis_completion_agent",
+            output_mode=StructuredOutputMode.JSON_OBJECT,
+        )
 
     @staticmethod
     def _build_history_agent(model: ChatOpenAI) -> Any:
-        return create_agent(
-            model=model,
-            tools=[],
+        return StructuredAgent(
+            model,
+            HistoryCleaningResult,
             system_prompt=_load_prompt("clinical_record_cleaning_prompt.txt"),
-            response_format=_tool_response_format(HistoryCleaningResult),
             name="history_cleaning_agent",
         )
 
     @staticmethod
     def _build_extract_agent(model: ChatOpenAI) -> Any:
-        return create_agent(
-            model=model,
-            tools=[],
+        return StructuredAgent(
+            model,
+            ClinicalExtractionResult,
             system_prompt=_load_prompt("extract_prompt.txt"),
-            response_format=_tool_response_format(ClinicalExtractionResult),
             name="clinical_extraction_agent",
         )
 
@@ -1736,7 +1748,6 @@ class MedicalRecordAgents:
 
         # step3：本次复诊病史只依赖文本字段，可与整条视觉管线并发。
         async def run_current_visit_history() -> list[dict[str, str]]:
-            logger.debug("【本次复诊现病史内容抽取】】")
             try:
                 await self._run_stage(
                     "current_visit_history",
@@ -1869,6 +1880,75 @@ def count_patient_visits(path: Path, doctor_ids: set[str]) -> Counter[str]:
     return counts
 
 
+def count_planned_records(
+    path: Path,
+    doctor_ids: set[str],
+    limit: int,
+    processed_ids: set[str],
+    processed_order_sns: set[str],
+) -> int:
+    """Count records this run will actually submit to an Agent."""
+    attempted = 0
+    attempted_by_doctor: Counter[str] = Counter()
+    for index, record in enumerate(iter_records(path), 1):
+        if not _doctor_matches(record, doctor_ids):
+            continue
+        doctor_id = _text(record.get("doctor_id"))
+        if _selected_doctor_quota_reached(doctor_id, doctor_ids, attempted_by_doctor, limit):
+            if _all_selected_doctors_reached(doctor_ids, attempted_by_doctor, limit):
+                break
+            continue
+        identity = _record_identity(record, index)
+        order_sn = _text(record.get("order_sn"))
+        if identity in processed_ids or (order_sn and order_sn in processed_order_sns):
+            continue
+        if not doctor_ids and limit and attempted >= limit:
+            break
+        attempted += 1
+        if doctor_id:
+            attempted_by_doctor[doctor_id] += 1
+    return attempted
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "--"
+    total_seconds = max(0, round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes:d}m{seconds:02d}s"
+    return f"{seconds:d}s"
+
+
+def _progress_log_message(
+    *,
+    completed: int,
+    total: int,
+    succeeded: int,
+    failed: int,
+    filtered: int,
+    skipped_existing: int,
+    elapsed: float,
+    scope: str,
+) -> str:
+    ratio = min(1.0, completed / total) if total else 1.0
+    bar_width = 20
+    filled = min(bar_width, round(ratio * bar_width))
+    progress_bar = f"{'=' * filled}{'.' * (bar_width - filled)}"
+    records_per_minute = completed / elapsed * 60 if completed and elapsed > 0 else 0.0
+    eta = (total - completed) / (completed / elapsed) if completed and elapsed > 0 else None
+    return (
+        f"[PROGRESS] doctor={scope} [{progress_bar}] {ratio * 100:5.1f}% "
+        f"completed={completed}/{total} success={succeeded} failed={failed} "
+        f"filtered={filtered} skipped_existing={skipped_existing} "
+        f"speed={records_per_minute:.2f} records/min elapsed={_format_duration(elapsed)} "
+        f"eta={_format_duration(eta)}"
+    )
+
+
 def load_processed_record_keys(output_dir: Path) -> tuple[set[str], set[str]]:
     """Load identities and order numbers already written to result or filter files."""
     processed_ids: set[str] = set()
@@ -1947,34 +2027,28 @@ def build_model(
     *,
     base_url: str | None = None,
     api_key: str | None = None,
-    max_tokens: int | None = None,
+    temperature: float = DEFAULT_AGENT_TEMPERATURE,
+    thinking: bool | None = None,
+    max_tokens: int | None = DEFAULT_AGENT_MAX_TOKENS,
 ) -> ChatOpenAI:
     resolved_base_url = args.base_url if base_url is None else base_url
     resolved_api_key = args.api_key if api_key is None else api_key
-    kwargs: dict[str, Any] = {
-        "model": model_name,
-        "temperature": 0,
-        "max_retries": args.max_retries,
-        "timeout": args.timeout,
-    }
-    if resolved_base_url:
-        kwargs["base_url"] = resolved_base_url
-    if resolved_api_key:
-        kwargs["api_key"] = resolved_api_key
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
+    resolved_thinking = getattr(args, "thinking", False) if thinking is None else thinking
     logger.info(
         f"model_name {model_name}, base_url {resolved_base_url or '<default>'}, "
-        f"apikey {_mask_secret(resolved_api_key)}"
+        f"temperature {temperature}, thinking {resolved_thinking}, "
+        f"max_tokens {max_tokens or '<provider-default>'}, apikey {_mask_secret(resolved_api_key)}"
     )
-    normalized_base_url = _text(resolved_base_url).lower()
-    model_id = model_name.lower()
-    # 所有 Agent 都用于结构化抽取，统一关闭 thinking mode，避免响应中混入推理内容。
-    if "deepseek" in model_id or "deepseek" in normalized_base_url:
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-    else:
-        kwargs["extra_body"] = {"enable_thinking": False}
-    return ChatOpenAI(**kwargs)
+    return AgentModelConfig(
+        model=model_name,
+        base_url=resolved_base_url or "",
+        api_key=resolved_api_key or "",
+        temperature=temperature,
+        thinking=resolved_thinking,
+        max_tokens=max_tokens,
+        timeout=getattr(args, "timeout", 120.0),
+        max_retries=getattr(args, "max_retries", 2),
+    ).build()
 
 
 async def _process_record_batch(
@@ -2056,12 +2130,19 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     doctor_ids = set(args.doctor_id or [])
 
-    text_model = build_model(args.model, args, base_url=args.base_url, api_key=args.api_key)
+    text_model = build_model(
+        args.model,
+        args,
+        base_url=args.base_url,
+        api_key=args.api_key,
+    )
+
     diagnosis_model = build_model(
         args.diagnosis_model,
         args,
         base_url=args.diagnosis_base_url,
         api_key=args.diagnosis_api_key,
+        max_tokens=1000,
     )
     vlm_model = build_model(
         args.vlm_model or args.model,
@@ -2074,7 +2155,7 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         args,
         base_url=getattr(args, "image_classification_base_url", "") or args.base_url,
         api_key=getattr(args, "image_classification_api_key", "") or args.api_key,
-        max_tokens=CLASSIFICATION_MODEL_MAX_TOKENS,
+        max_tokens=6000,
     )
     enable_review = bool(getattr(args, "enable_review", False))
     reviewer_model = None
@@ -2102,9 +2183,19 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         processed_ids, processed_order_sns = set(), set()
     else:
         processed_ids, processed_order_sns = load_processed_record_keys(args.output_dir)
+    planned_total = count_planned_records(
+        args.input,
+        doctor_ids,
+        args.limit,
+        processed_ids,
+        processed_order_sns,
+    )
     succeeded = 0
     failed = 0
     skipped = 0
+    filtered = 0
+    skipped_existing = 0
+    completed = 0
     attempted = 0
     attempted_by_doctor: Counter[str] = Counter()
     output_files: dict[Path, TextIO] = {}
@@ -2112,12 +2203,21 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     previous_diagnoses_by_patient: dict[str, dict[str, str]] = {}
     batch_size = max(1, int(getattr(args, "batch_size", 8)))
     record_timeout = max(0.0, float(getattr(args, "record_timeout", 0.0)))
+    progress_every = max(1, int(getattr(args, "progress_every", 10)))
+    progress_scope = ",".join(sorted(doctor_ids)) or "all"
+    progress_started_at = time.monotonic()
+    last_progress_completed = 0
     pending_batch: list[dict[str, Any]] = []
+    if planned_total:
+        logger.info(
+            f"[PROGRESS START] doctor={progress_scope} target={planned_total} "
+            f"batch_size={batch_size} progress_every={progress_every}"
+        )
 
     with ExitStack() as stack:
 
         async def flush_batch() -> None:
-            nonlocal failed, skipped, succeeded
+            nonlocal completed, failed, filtered, last_progress_completed, skipped, succeeded
             if not pending_batch:
                 return
 
@@ -2153,6 +2253,7 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
 
                 if enriched.get("ai_processing_filtered") is True:
                     skipped += 1
+                    filtered += 1
                     processed_ids.add(identity)
                     if order_sn:
                         processed_order_sns.add(order_sn)
@@ -2183,7 +2284,26 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 if order_sn:
                     processed_order_sns.add(order_sn)
 
+            completed += len(outcomes)
             logger.info(f"[BATCH END] records={len(batch)} elapsed={time.monotonic() - batch_started_at:.1f}s")
+            if (
+                completed == len(outcomes)
+                or completed >= planned_total
+                or completed - last_progress_completed >= progress_every
+            ):
+                logger.info(
+                    _progress_log_message(
+                        completed=completed,
+                        total=planned_total,
+                        succeeded=succeeded,
+                        failed=failed,
+                        filtered=filtered,
+                        skipped_existing=skipped_existing,
+                        elapsed=time.monotonic() - progress_started_at,
+                        scope=progress_scope,
+                    )
+                )
+                last_progress_completed = completed
             if getattr(args, "interval", 0) > 0:
                 await asyncio.sleep(args.interval)
             if first_failure is not None and args.fail_fast:
@@ -2207,6 +2327,7 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 if patient_key and _has_any_diagnosis(skipped_diagnoses):
                     previous_diagnoses_by_patient[patient_key] = skipped_diagnoses
                 skipped += 1
+                skipped_existing += 1
                 logger.info(f"数据已经处理过，【SKIP】 {order_sn}")
                 continue
             if not doctor_ids and args.limit and attempted >= args.limit:
@@ -2234,6 +2355,19 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
             if len(pending_batch) >= batch_size:
                 await flush_batch()
         await flush_batch()
+        if planned_total and completed != last_progress_completed:
+            logger.info(
+                _progress_log_message(
+                    completed=completed,
+                    total=planned_total,
+                    succeeded=succeeded,
+                    failed=failed,
+                    filtered=filtered,
+                    skipped_existing=skipped_existing,
+                    elapsed=time.monotonic() - progress_started_at,
+                    scope=progress_scope,
+                )
+            )
     return succeeded, failed, skipped
 
 
@@ -2359,12 +2493,25 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="单条病历全部阶段的总超时秒数，0 表示不额外限制；单阶段仍受 --timeout 限制",
     )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=10,
+        help="每完成多少条病历输出一次后台进度日志，默认 10",
+    )
     parser.add_argument("--timeout", type=float, default=120.0, help="单次模型请求超时秒数")
     parser.add_argument("--max-retries", type=int, default=2, help="模型请求重试次数")
     parser.add_argument(
+        "--thinking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="开启或关闭 Agent 思考模式，默认关闭；也可使用 --no-thinking",
+    )
+    parser.add_argument(
         "--disable-thinking",
-        action="store_true",
-        help="兼容旧参数；所有 Agent 默认关闭 thinking mode",
+        dest="thinking",
+        action="store_false",
+        help="兼容旧参数；等同于 --no-thinking",
     )
     parser.add_argument("--reprocess", action="store_true", help="忽略已有成功记录并重新处理")
     parser.add_argument("--fail-fast", action="store_true", help="任一病历失败时立即退出")

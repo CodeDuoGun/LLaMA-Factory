@@ -266,6 +266,8 @@ def test_process_records_skips_existing_order_sn_and_logs_it(tmp_path, monkeypat
     assert reviewer_kwargs == {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "api_key": "test-dashscope-key",
+        "temperature": medical_record_agents.DEFAULT_AGENT_TEMPERATURE,
+        "max_tokens": medical_record_agents.DEFAULT_AGENT_MAX_TOKENS,
     }
     assert reviewer_model is not None
     assert created_agents["reviewer_model"] is reviewer_model
@@ -335,6 +337,49 @@ def test_process_records_limits_attempts_per_doctor(tmp_path, monkeypatch) -> No
 
     assert asyncio.run(medical_record_agents.process_records(args)) == (2, 0, 0)
     assert processed_order_sns == ["ORDER-43-1", "ORDER-52-1"]
+
+
+def test_count_planned_records_excludes_processed_and_applies_per_doctor_limit(tmp_path) -> None:
+    input_path = tmp_path / "records.json"
+    input_path.write_text(
+        json.dumps(
+            [
+                {"id": "43-1", "order_sn": "ORDER-43-1", "doctor_id": "43"},
+                {"id": "43-2", "order_sn": "ORDER-43-2", "doctor_id": "43"},
+                {"id": "43-3", "order_sn": "ORDER-43-3", "doctor_id": "43"},
+                {"id": "52-1", "order_sn": "ORDER-52-1", "doctor_id": "52"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    planned = medical_record_agents.count_planned_records(
+        input_path,
+        {"43"},
+        2,
+        set(),
+        {"ORDER-43-1"},
+    )
+
+    assert planned == 2
+
+
+def test_progress_log_message_contains_bar_counts_speed_and_eta() -> None:
+    message = medical_record_agents._progress_log_message(
+        completed=25,
+        total=100,
+        succeeded=20,
+        failed=3,
+        filtered=2,
+        skipped_existing=7,
+        elapsed=300,
+        scope="43",
+    )
+
+    assert "[PROGRESS] doctor=43 [=====...............]  25.0%" in message
+    assert "completed=25/100 success=20 failed=3 filtered=2 skipped_existing=7" in message
+    assert "speed=5.00 records/min" in message
+    assert "elapsed=5m00s eta=15m00s" in message
 
 
 def test_review_is_disabled_by_default(monkeypatch) -> None:
