@@ -14,12 +14,15 @@
 
 import argparse
 import asyncio
+import base64
 import json
 import sys
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import HumanMessage
+from PIL import Image
 
 from medical.data_utils import medical_record_agents
 from medical.schema.clear_record_basemodel import (
@@ -27,6 +30,7 @@ from medical.schema.clear_record_basemodel import (
     CurrentVisitHistoryResult,
     ImageClassification,
     ImageClassificationResult,
+    InspectionFinding,
     InspectionResult,
     TongueFaceResult,
 )
@@ -44,6 +48,45 @@ class FakeStructuredAgent:
             "structured_response": response,
             "messages": [SimpleNamespace(content=f"returned {type(response).__name__}", tool_calls=[])],
         }
+
+
+def test_normalize_medical_history_removes_frontend_tags() -> None:
+    record = {
+        "new_medical_history": (
+            "<p>（22,03,28）舌淡红润有齿痕苍老裂纹苔白浊带黄根厚。胃中有嘈杂，"
+            "脐上有不适。大便色暗，会返胃干呕，矢气难出，有肠鸣，有肩背疼。"
+            "（22,04,09）复诊一整体好转。偶有胃烧。7分饱则胃无胀了，大便有溏色暗无，"
+            "干呕很少，无肠鸣了，肩背疼好转，小便正常。舌淡润带白微红有齿痕大脾裂纹苔白微厚。"
+            "（22,04,30）复诊二食后好转，大便色青次数日一次，节状。偶溏。矢气多了。"
+            "偶有呃气。近2天晨起会恶心返胃。舌淡润白微红大有齿痕苔白厚。</p>"
+            "<p>辅助检查：220211内镜诊断：胃底息肉，慢性非萎缩性胃炎伴胃窦糜烂</p>"
+            "<p><br></p>"
+        )
+    }
+
+    medical_record_agents.MedicalRecordAgents.normalize_medical_history(record)
+
+    assert record["new_medical_history"] == (
+        "（22,03,28）舌淡红润有齿痕苍老裂纹苔白浊带黄根厚。胃中有嘈杂，"
+        "脐上有不适。大便色暗，会返胃干呕，矢气难出，有肠鸣，有肩背疼。"
+        "（22,04,09）复诊一整体好转。偶有胃烧。7分饱则胃无胀了，大便有溏色暗无，"
+        "干呕很少，无肠鸣了，肩背疼好转，小便正常。舌淡润带白微红有齿痕大脾裂纹苔白微厚。"
+        "（22,04,30）复诊二食后好转，大便色青次数日一次，节状。偶溏。矢气多了。"
+        "偶有呃气。近2天晨起会恶心返胃。舌淡润白微红大有齿痕苔白厚。\n"
+        "辅助检查：220211内镜诊断：胃底息肉，慢性非萎缩性胃炎伴胃窦糜烂"
+    )
+    assert "<" not in record["new_medical_history"]
+    assert ">" not in record["new_medical_history"]
+
+
+def test_normalize_medical_history_decodes_entities_and_removes_empty_markup() -> None:
+    record = {"new_medical_history": "<div>腹胀&nbsp;三天<br/>偶有反酸</div>"}
+    medical_record_agents.MedicalRecordAgents.normalize_medical_history(record)
+    assert record["new_medical_history"] == "腹胀 三天\n偶有反酸"
+
+    empty_record = {"new_medical_history": "<p><br></p>"}
+    medical_record_agents.MedicalRecordAgents.normalize_medical_history(empty_record)
+    assert empty_record["new_medical_history"] == ""
 
 
 def test_structured_agent_review_revises_failed_result() -> None:
@@ -175,6 +218,7 @@ def test_process_records_skips_existing_order_sn_and_logs_it(tmp_path, monkeypat
         def __init__(self, *args, **kwargs):
             created_agents["reviewer_model"] = kwargs.get("reviewer_model")
             created_agents["enable_review"] = kwargs.get("enable_review")
+            created_agents["image_classification_model"] = kwargs.get("image_classification_model")
 
         async def process(self, *args, **kwargs):
             raise AssertionError("已处理的 order_sn 不应再次进入处理流程")
@@ -226,6 +270,12 @@ def test_process_records_skips_existing_order_sn_and_logs_it(tmp_path, monkeypat
     assert reviewer_model is not None
     assert created_agents["reviewer_model"] is reviewer_model
     assert created_agents["enable_review"] is True
+    classifier_name, classifier_kwargs, classifier_model = next(
+        item for item in built_models if item[0] == medical_record_agents.CLASSIFICATION_MODEL_NAME
+    )
+    assert classifier_name == "qwen3.7-flash"
+    assert classifier_kwargs["max_tokens"] == 512
+    assert created_agents["image_classification_model"] is classifier_model
     assert messages == ["数据已经处理过，【SKIP】 ORDER-43"]
 
 
@@ -369,6 +419,244 @@ def test_record_images_collects_all_four_fields_and_deduplicates() -> None:
     ]
 
 
+def test_image_classification_message_deduplicates_urls_and_content(tmp_path) -> None:
+    first_image = tmp_path / "first.jpg"
+    duplicate_image = tmp_path / "duplicate.jpg"
+    other_image = tmp_path / "other.jpg"
+    Image.new("RGB", (1024, 256), "red").save(first_image, format="JPEG")
+    duplicate_image.write_bytes(first_image.read_bytes())
+    Image.new("RGB", (100, 100), "blue").save(other_image, format="JPEG")
+
+    batches = asyncio.run(
+        medical_record_agents._image_classification_message(
+            [
+                str(first_image),
+                "",
+                f" {first_image} ",
+                str(duplicate_image),
+                str(other_image),
+            ],
+            tmp_path,
+        )
+    )
+
+    assert len(batches) == 1
+    message, images = batches[0]
+    assert images == [
+        str(first_image),
+        str(other_image),
+    ]
+    image_blocks = [block for block in message.content if block.get("type") == "image_url"]
+    assert len(image_blocks) == 2
+    assert message.content[0]["text"].startswith("下面共有 2 张图片")
+    resized_data_url = image_blocks[0]["image_url"]["url"]
+    resized_image = Image.open(BytesIO(base64.b64decode(resized_data_url.split(",", 1)[1])))
+    assert resized_image.size == (512, 128)
+
+
+def test_image_classification_message_batches_at_most_eight_images(tmp_path) -> None:
+    images = []
+    for index in range(9):
+        path = tmp_path / f"{index}.jpg"
+        color = index * 25
+        Image.new("RGB", (16, 16), (color, color, color)).save(path, format="JPEG")
+        images.append(str(path))
+
+    batches = asyncio.run(medical_record_agents._image_classification_message(images, tmp_path))
+
+    assert [len(batch_images) for _, batch_images in batches] == [8, 1]
+
+
+def test_classify_images_merges_batched_results_with_original_images(tmp_path) -> None:
+    images = []
+    for index in range(9):
+        path = tmp_path / f"classify-{index}.jpg"
+        color = index * 25
+        Image.new("RGB", (32, 16), (color, color, color)).save(path, format="JPEG")
+        images.append(str(path))
+
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.input_dir = tmp_path
+    agents.reviewer_agent = None
+    agents.image_classifier_agent = FakeStructuredAgent(
+        [
+            ImageClassificationResult(
+                images=[
+                    ImageClassification(image_index=index, image_type="舌")
+                    for index in range(1, 9)
+                ]
+            ),
+            ImageClassificationResult(
+                images=[ImageClassification(image_index=1, image_type="检验检查报告类")]
+            ),
+        ]
+    )
+
+    grouped = asyncio.run(agents.classify_images({"tongue_face_img": images}))
+
+    assert grouped["舌"] == images[:8]
+    assert grouped["检验检查报告类"] == images[8:]
+
+
+def test_process_record_batch_isolates_errors_and_timeouts() -> None:
+    class FakeAgents:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+
+        async def process(self, record, **kwargs):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                if record["id"] == "error":
+                    await asyncio.sleep(0)
+                    raise ValueError("broken")
+                if record["id"] == "timeout":
+                    await asyncio.sleep(0.1)
+                else:
+                    await asyncio.sleep(0.01)
+                return dict(record)
+            finally:
+                self.active -= 1
+
+    def batch_item(record_id):
+        return {
+            "record": {"id": record_id, "doctor_id": "43"},
+            "record_id": record_id,
+            "identity": f"43:{record_id}",
+            "order_sn": "",
+            "patient_key": f"43:patient-{record_id}",
+            "extract_current_history": False,
+            "use_rag": False,
+        }
+
+    agents = FakeAgents()
+    outcomes = asyncio.run(
+        medical_record_agents._process_record_batch(
+            agents,
+            [batch_item("ok"), batch_item("error"), batch_item("timeout")],
+            {},
+            record_timeout=0.03,
+        )
+    )
+
+    assert agents.max_active == 3
+    assert outcomes[0][2] is None
+    assert isinstance(outcomes[1][2], ValueError)
+    assert isinstance(outcomes[2][2], TimeoutError)
+    assert outcomes[1][1]["ai_processing_errors"][0]["stage"] == "record"
+    assert "病历处理超过 0.03 秒" in outcomes[2][1]["ai_processing_errors"][0]["error"]
+
+
+def test_process_record_batch_keeps_same_patient_visits_sequential() -> None:
+    seen_previous_diagnoses = []
+
+    class FakeAgents:
+        async def process(self, record, **kwargs):
+            seen_previous_diagnoses.append(record.get("__previous_diagnoses"))
+            await asyncio.sleep(0)
+            enriched = dict(record)
+            enriched["ai_diagnosis_illness"] = record["diagnosis_illness"]
+            return enriched
+
+    def batch_item(record_id, diagnosis):
+        return {
+            "record": {
+                "id": record_id,
+                "doctor_id": "43",
+                "diagnosis_illness": diagnosis,
+            },
+            "record_id": record_id,
+            "identity": f"43:{record_id}",
+            "order_sn": "",
+            "patient_key": "43:patient-1",
+            "extract_current_history": False,
+            "use_rag": False,
+        }
+
+    outcomes = asyncio.run(
+        medical_record_agents._process_record_batch(
+            FakeAgents(),
+            [batch_item("visit-1", "诊断一"), batch_item("visit-2", "诊断二")],
+            {},
+            record_timeout=0,
+        )
+    )
+
+    assert [outcome[2] for outcome in outcomes] == [None, None]
+    assert seen_previous_diagnoses == [
+        None,
+        {
+            "diagnosis_illness": "诊断一",
+            "diagnosis_disease": "",
+            "diagnosis_sickness": "",
+        },
+    ]
+
+
+def test_run_stage_logs_doctor_name(monkeypatch) -> None:
+    messages = []
+    monkeypatch.setattr(
+        medical_record_agents,
+        "logger",
+        SimpleNamespace(info=messages.append),
+    )
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.stage_timeout = 0
+
+    asyncio.run(agents._run_stage("image_classification", "ORDER-1", "张医生", lambda: None))
+
+    assert messages[0] == (
+        "[STAGE START] record=ORDER-1 doctor_name=张医生 stage=image_classification"
+    )
+    assert messages[1].startswith(
+        "[STAGE END] record=ORDER-1 doctor_name=张医生 stage=image_classification elapsed="
+    )
+
+
+def test_process_runs_current_history_and_image_pipeline_concurrently() -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.stage_timeout = 0
+    history_started = asyncio.Event()
+    image_started = asyncio.Event()
+
+    agents.normalize_diagnoses = lambda record: None
+
+    async def classify(record):
+        await asyncio.wait_for(history_started.wait(), timeout=0.2)
+        image_started.set()
+        return {category: [] for category in medical_record_agents.IMAGE_CATEGORIES}
+
+    async def extract_current_history(record, enabled):
+        history_started.set()
+        await asyncio.wait_for(image_started.wait(), timeout=0.2)
+
+    agents.classify_images = classify
+    agents.extract_current_visit_history = extract_current_history
+    agents.analyze_inspection_images = lambda record, images=None: None
+    agents.analyze_tongue_face_images = lambda record, images=None: None
+    agents.clean_histories = lambda record: None
+    agents.complete_diagnoses = lambda record: None
+    agents.extract_clinical_fields = lambda record, use_rag: None
+
+    asyncio.run(
+        asyncio.wait_for(
+            agents.process(
+                {
+                    "order_sn": "ORDER-1",
+                    "doctor_name": "张医生",
+                    "new_medical_history": "复诊病史",
+                },
+                extract_current_history=True,
+            ),
+            timeout=1,
+        )
+    )
+
+    assert history_started.is_set()
+    assert image_started.is_set()
+
+
 @pytest.mark.parametrize(
     ("report_date", "visit_time", "expected"),
     [
@@ -482,28 +770,48 @@ class FakeVlmModel:
         return SimpleNamespace(content=f"OCR batch with {self.image_counts[-1]} images")
 
 
-def test_analyze_inspection_images_ocr_batches_when_more_than_five_images(tmp_path) -> None:
+def test_analyze_inspection_images_merges_structured_batches_without_ocr_summary_call(tmp_path) -> None:
     agents = object.__new__(medical_record_agents.MedicalRecordAgents)
     fake_vlm = FakeVlmModel()
     agents.input_dir = tmp_path
     agents.vlm_model = fake_vlm
     agents.reviewer_agent = None
-    agents.inspection_agent = FakeStructuredAgent([InspectionResult(history_evidence_summary="OCR 汇总")])
+    agents.inspection_agent = FakeStructuredAgent(
+        [
+            InspectionResult(
+                reports=[InspectionFinding(report_name="报告一", is_valid_report=True)],
+                history_evidence_summary="证据一",
+            ),
+            InspectionResult(
+                reports=[InspectionFinding(report_name="报告二", is_valid_report=True)],
+                history_evidence_summary="证据二",
+            ),
+        ]
+    )
 
     record = {"see_doc_time": "2026-07-30"}
-    images = [f"https://example.com/report-{index}.jpg" for index in range(6)]
+    images = [
+        f"https://example.com/report-{index}.jpg"
+        for index in range(medical_record_agents.MAX_VLM_IMAGES_PER_REQUEST + 1)
+    ]
 
     asyncio.run(agents.analyze_inspection_images(record, images=images))
 
-    assert fake_vlm.image_counts == [5, 1]
-    final_message = agents.inspection_agent.calls[0]["messages"][0]
-    assert isinstance(final_message.content, str)
-    assert "OCR batch with 5 images" in final_message.content
-    assert "OCR batch with 1 images" in final_message.content
-    assert record["ai_inspection_report_img"]["现病史检查证据摘要"] == "OCR 汇总"
+    assert fake_vlm.image_counts == []
+    assert len(agents.inspection_agent.calls) == 2
+    batch_image_counts = [
+        sum(1 for block in call["messages"][0].content if block.get("type") == "image_url")
+        for call in agents.inspection_agent.calls
+    ]
+    assert batch_image_counts == [medical_record_agents.MAX_VLM_IMAGES_PER_REQUEST, 1]
+    assert [report["report_name"] for report in record["ai_inspection_report_img"]["reports"]] == [
+        "报告一",
+        "报告二",
+    ]
+    assert record["ai_inspection_report_img"]["现病史检查证据摘要"] == "证据一\n证据二"
 
 
-def test_analyze_tongue_face_images_ocr_batches_when_more_than_five_images(tmp_path) -> None:
+def test_analyze_tongue_face_images_ocr_batches_when_over_request_limit(tmp_path) -> None:
     agents = object.__new__(medical_record_agents.MedicalRecordAgents)
     fake_vlm = FakeVlmModel()
     agents.input_dir = tmp_path
@@ -512,16 +820,50 @@ def test_analyze_tongue_face_images_ocr_batches_when_more_than_five_images(tmp_p
     agents.tongue_face_agent = FakeStructuredAgent([TongueFaceResult()])
 
     record = {"order_sn": "ORDER-1"}
-    images = [f"https://example.com/tongue-face-{index}.jpg" for index in range(6)]
+    images = [
+        f"https://example.com/tongue-face-{index}.jpg"
+        for index in range(medical_record_agents.MAX_VLM_IMAGES_PER_REQUEST + 1)
+    ]
 
     asyncio.run(agents.analyze_tongue_face_images(record, images=images))
 
-    assert fake_vlm.image_counts == [5, 1]
+    assert fake_vlm.image_counts == [medical_record_agents.MAX_VLM_IMAGES_PER_REQUEST, 1]
     final_message = agents.tongue_face_agent.calls[0]["messages"][0]
     assert isinstance(final_message.content, str)
-    assert "OCR batch with 5 images" in final_message.content
+    assert (
+        f"OCR batch with {medical_record_agents.MAX_VLM_IMAGES_PER_REQUEST} images"
+        in final_message.content
+    )
     assert "OCR batch with 1 images" in final_message.content
     assert "ai_tongue_face_img" in record
+
+
+def test_ocr_image_batches_run_concurrently_and_keep_batch_order(tmp_path) -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.input_dir = tmp_path
+    agents.reviewer_agent = None
+    agents.ocr_batch_semaphore = asyncio.Semaphore(2)
+    active_calls = 0
+    max_active_calls = 0
+
+    class ConcurrentVlm:
+        async def ainvoke(self, messages):
+            nonlocal active_calls, max_active_calls
+            prompt = messages[0].content[0]["text"]
+            active_calls += 1
+            max_active_calls = max(max_active_calls, active_calls)
+            await asyncio.sleep(0.01)
+            active_calls -= 1
+            return SimpleNamespace(content=prompt.split("原始图片序号 ", 1)[1].split(" 到", 1)[0])
+
+    agents.vlm_model = ConcurrentVlm()
+    image_count = medical_record_agents.MAX_VLM_IMAGES_PER_REQUEST * 3
+    images = [f"https://example.com/image-{index}.jpg" for index in range(image_count)]
+
+    result = asyncio.run(agents._ocr_image_batches(images, "OCR", agent_name="benchmark"))
+
+    assert max_active_calls == 2
+    assert result.index("OCR 批次 1") < result.index("OCR 批次 2") < result.index("OCR 批次 3")
 
 
 def test_process_classifies_once_and_filters_other_images() -> None:

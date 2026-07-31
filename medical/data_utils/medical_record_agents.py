@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import mimetypes
@@ -45,9 +46,15 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack
 from datetime import date
+from html.parser import HTMLParser
+from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from typing import Any, TextIO
+from urllib.parse import unquote_to_bytes
+
+import httpx
+from PIL import Image, ImageOps
 from pydantic import BaseModel, ValidationError
 
 from langchain.agents import create_agent
@@ -95,7 +102,15 @@ HISTORY_FIELDS = (
 IMAGE_FIELDS = ("tongue_face_img", "admin_face_img", "admin_report_img", "inspection_report_img")
 IMAGE_CATEGORIES = ("舌", "面", "患处", "检验检查报告类", "其他类")
 TONGUE_FACE_IMAGE_CATEGORIES = ("舌", "面", "患处")
-MAX_VLM_IMAGES_PER_REQUEST = 5
+MAX_VLM_IMAGES_PER_REQUEST = 8
+OCR_BATCH_CONCURRENCY = 3
+MAX_CLASSIFICATION_IMAGES_PER_REQUEST = 8
+IMAGE_CLASSIFICATION_BATCH_CONCURRENCY = 2
+CLASSIFICATION_IMAGE_MAX_EDGE = 512
+CLASSIFICATION_MODEL_NAME = "qwen3.7-flash"
+CLASSIFICATION_MODEL_MAX_TOKENS = 512
+IMAGE_DEDUP_DOWNLOAD_CONCURRENCY = 8
+IMAGE_DEDUP_DOWNLOAD_TIMEOUT = 10.0
 CURRENT_VISIT_HISTORY_SYSTEM_PROMPT = (
     "你是临床病历现病史整理助手。输入可能包含同一患者按日期累积的多次就诊记录。"
     "必须以本次就诊时间为锚点，仅提取与本次复诊对应的现病史，不得混入既往就诊段落。"
@@ -178,6 +193,74 @@ def _clean_generated_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _clean_generated_value(item) for key, item in value.items()}
     return value
+
+
+class _MedicalHistoryHTMLParser(HTMLParser):
+    """提取前端富文本中的纯文本，并保留块级标签的段落边界."""
+
+    BLOCK_TAGS = {
+        "address",
+        "article",
+        "blockquote",
+        "br",
+        "div",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "li",
+        "ol",
+        "p",
+        "section",
+        "table",
+        "td",
+        "th",
+        "tr",
+        "ul",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def _append_break(self) -> None:
+        if self.parts and self.parts[-1] != "\n":
+            self.parts.append("\n")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in self.BLOCK_TAGS:
+            self._append_break()
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() in self.BLOCK_TAGS:
+            self._append_break()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self.BLOCK_TAGS:
+            self._append_break()
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _normalize_medical_history(value: Any) -> str:
+    """删除现病史中的前端 HTML 标签，解码实体并规整段落空白."""
+    text = _text(value)
+    if not text:
+        return ""
+    parser = _MedicalHistoryHTMLParser()
+    parser.feed(text)
+    parser.close()
+    lines = []
+    for line in "".join(parser.parts).replace("\xa0", " ").splitlines():
+        normalized = re.sub(r"[\t\f\v ]+", " ", line).strip()
+        if normalized:
+            lines.append(normalized)
+    return "\n".join(lines)
 
 
 def _replace_inspection_report_symbols(value: Any) -> Any:
@@ -875,21 +958,125 @@ def _chunked(values: list[str], size: int) -> Iterator[list[str]]:
         yield values[start : start + size]
 
 
-def _image_classification_message(images: list[str], input_dir: Path) -> HumanMessage:
-    content: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": (f"下面共有 {len(images)} 张图片。请严格按图片序号逐张分类，每张图片返回且仅返回一个分类结果。"),
-        }
-    ]
-    for index, image in enumerate(images, 1):
-        content.extend(
-            [
-                {"type": "text", "text": f"图片 {index}："},
-                {"type": "image_url", "image_url": {"url": _to_image_url(image, input_dir)}},
-            ]
+async def _read_image_content(
+    image: str,
+    input_dir: Path,
+    client: httpx.AsyncClient | None,
+    semaphore: asyncio.Semaphore,
+) -> bytes | None:
+    """Read image bytes for exact-content deduplication and classification resizing."""
+    try:
+        if image.startswith(("http://", "https://")):
+            if client is None:
+                return None
+            async with semaphore, client.stream("GET", image) as response:
+                response.raise_for_status()
+                chunks = []
+                async for chunk in response.aiter_bytes():
+                    if chunk:
+                        chunks.append(chunk)
+                return b"".join(chunks) or None
+
+        if image.startswith("data:"):
+            header, separator, payload = image.partition(",")
+            if not separator:
+                return None
+            return base64.b64decode(payload) if ";base64" in header.lower() else unquote_to_bytes(payload)
+        else:
+            path = Path(image).expanduser()
+            if not path.is_absolute():
+                path = input_dir / path
+            if not path.is_file():
+                return None
+            return await asyncio.to_thread(path.read_bytes)
+    except Exception as exc:
+        logger.warning(f"图片内容去重读取失败，保留原图片: {type(exc).__name__}")
+        return None
+
+
+def _classification_image_data_url(content: bytes) -> str | None:
+    """Resize a classification-only copy while preserving the original downstream image."""
+    try:
+        with Image.open(BytesIO(content)) as source:
+            image = ImageOps.exif_transpose(source)
+            image.thumbnail(
+                (CLASSIFICATION_IMAGE_MAX_EDGE, CLASSIFICATION_IMAGE_MAX_EDGE),
+                Image.Resampling.LANCZOS,
+            )
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            output = BytesIO()
+            image.save(output, format="JPEG", quality=85, optimize=True)
+        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+    except (OSError, ValueError):
+        return None
+
+
+async def _image_classification_message(
+    images: list[str],
+    input_dir: Path,
+) -> list[tuple[HumanMessage, list[str]]]:
+    """Build at-most-eight-image messages after URL and exact-content deduplication."""
+    url_unique_images = list(dict.fromkeys(image for image in (_text(image) for image in images) if image))
+    remote_images = any(image.startswith(("http://", "https://")) for image in url_unique_images)
+    client = (
+        httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=IMAGE_DEDUP_DOWNLOAD_TIMEOUT,
+            limits=httpx.Limits(max_connections=IMAGE_DEDUP_DOWNLOAD_CONCURRENCY),
         )
-    return HumanMessage(content=content)
+        if remote_images
+        else None
+    )
+    try:
+        semaphore = asyncio.Semaphore(IMAGE_DEDUP_DOWNLOAD_CONCURRENCY)
+        image_contents = await asyncio.gather(
+            *(_read_image_content(image, input_dir, client, semaphore) for image in url_unique_images)
+        )
+    finally:
+        if client is not None:
+            await client.aclose()
+
+    unique_images: list[str] = []
+    classification_urls: list[str] = []
+    seen_digests = set()
+    for image, image_content in zip(url_unique_images, image_contents, strict=True):
+        if image_content:
+            digest = hashlib.sha256(image_content).hexdigest()
+            if digest in seen_digests:
+                continue
+            seen_digests.add(digest)
+        unique_images.append(image)
+        resized_url = (
+            await asyncio.to_thread(_classification_image_data_url, image_content)
+            if image_content
+            else None
+        )
+        classification_urls.append(resized_url or _to_image_url(image, input_dir))
+
+    batches = []
+    for start in range(0, len(unique_images), MAX_CLASSIFICATION_IMAGES_PER_REQUEST):
+        batch_images = unique_images[start : start + MAX_CLASSIFICATION_IMAGES_PER_REQUEST]
+        batch_urls = classification_urls[start : start + MAX_CLASSIFICATION_IMAGES_PER_REQUEST]
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    f"下面共有 {len(batch_images)} 张图片。"
+                    "请严格按图片序号逐张分类，每张图片返回且仅返回一个分类结果。"
+                ),
+            }
+        ]
+        for index, image_url in enumerate(batch_urls, 1):
+            content.extend(
+                [
+                    {"type": "text", "text": f"图片 {index}："},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]
+            )
+        batches.append((HumanMessage(content=content), batch_images))
+    return batches
 
 
 def _group_classified_images(
@@ -924,6 +1111,7 @@ class MedicalRecordAgents:
         vlm_model: ChatOpenAI,
         input_dir: Path,
         diagnosis_model: ChatOpenAI | None = None,
+        image_classification_model: ChatOpenAI | None = None,
         reviewer_model: ChatOpenAI | None = None,
         enable_review: bool = False,
         filter_path: Path | None = None,
@@ -933,6 +1121,7 @@ class MedicalRecordAgents:
         self.filter_path = filter_path or (DEFAULT_OUTPUT_DIR / FILTER_FILE_NAME)
         self.stage_timeout = stage_timeout
         self.vlm_model = vlm_model
+        self.ocr_batch_semaphore = asyncio.Semaphore(OCR_BATCH_CONCURRENCY)
         self.diagnosis_agent = self._build_diagnosis_agent(diagnosis_model or text_model)
         self.history_agent = self._build_history_agent(text_model)
         self.extract_agent = self._build_extract_agent(text_model)
@@ -953,7 +1142,7 @@ class MedicalRecordAgents:
             name="current_visit_history_agent",
         )
         self.image_classifier_agent = create_agent(
-            model=vlm_model,
+            model=image_classification_model or vlm_model,
             tools=[],
             system_prompt=_load_prompt("image_classification_prompt.txt"),
             response_format=_tool_response_format(ImageClassificationResult),
@@ -999,6 +1188,10 @@ class MedicalRecordAgents:
             response_format=_tool_response_format(ClinicalExtractionResult),
             name="clinical_extraction_agent",
         )
+
+    @staticmethod
+    def normalize_medical_history(record: dict[str, Any]) -> None:
+        record["new_medical_history"] = _normalize_medical_history(record.get("new_medical_history"))
 
     @staticmethod
     def normalize_diagnoses(record: dict[str, Any]) -> None:
@@ -1140,9 +1333,14 @@ class MedicalRecordAgents:
         return ''
 
     async def _ocr_image_batches(self, images: list[str], prompt: str, *, agent_name: str) -> str:
-        """Run OCR/visible-fact transcription with at most five images per VLM request."""
-        sections = []
-        for batch_index, batch_images in enumerate(_chunked(images, MAX_VLM_IMAGES_PER_REQUEST), 1):
+        """Run OCR batches concurrently and return their text in original image order."""
+        batches = list(_chunked(images, MAX_VLM_IMAGES_PER_REQUEST))
+        semaphore = getattr(self, "ocr_batch_semaphore", None)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(OCR_BATCH_CONCURRENCY)
+            self.ocr_batch_semaphore = semaphore
+
+        async def run_batch(batch_index: int, batch_images: list[str]) -> str:
             start_index = (batch_index - 1) * MAX_VLM_IMAGES_PER_REQUEST + 1
             numbered_prompt = (
                 f"{prompt}\n"
@@ -1150,29 +1348,119 @@ class MedicalRecordAgents:
                 f"{start_index + len(batch_images) - 1}。"
                 "请逐张输出可识别文字或可见客观事实；无法识别的图片也要保留图片序号并说明无法识别。"
             )
-            response = await self.vlm_model.ainvoke(
-                [_multimodal_message(numbered_prompt, batch_images, self.input_dir)]
+            started = time.perf_counter()
+            logger.info(
+                f"[OCR BATCH START] agent={agent_name} batch={batch_index}/{len(batches)} "
+                f"images={len(batch_images)}"
+            )
+            try:
+                async with semaphore:
+                    response = await self.vlm_model.ainvoke(
+                        [_multimodal_message(numbered_prompt, batch_images, self.input_dir)]
+                    )
+            except Exception as exc:
+                elapsed = time.perf_counter() - started
+                logger.error(
+                    f"[OCR BATCH ERROR] agent={agent_name} batch={batch_index}/{len(batches)} "
+                    f"elapsed={elapsed:.1f}s error={type(exc).__name__}: {exc}"
+                )
+                raise RuntimeError(
+                    f"{agent_name} OCR 批次 {batch_index}/{len(batches)} 失败: {type(exc).__name__}: {exc}"
+                ) from exc
+            elapsed = time.perf_counter() - started
+            logger.info(
+                f"[OCR BATCH END] agent={agent_name} batch={batch_index}/{len(batches)} "
+                f"images={len(batch_images)} elapsed={elapsed:.1f}s"
             )
             text = _response_text(response)
-            sections.append(f"【{agent_name} OCR 批次 {batch_index}】\n{text}")
-        return "\n\n".join(sections)
+            return f"【{agent_name} OCR 批次 {batch_index}】\n{text}"
 
-    async def _extract_inspection_from_ocr(self, visit_time: str, ocr_text: str) -> InspectionResult:
-        prompt = (
-            f"本次就诊时间（see_doc_time）：{visit_time or '未记录'}\n"
-            "以下内容是多张检查报告图片按批次 OCR 后得到的文本。请只依据 OCR 文本，"
-            "逐张分类并提取有效检查报告中可用于核对或补充本次现病史的客观事实。"
-            "如能识别报告日期，请给出报告日期相对本次就诊时间的相对时间。\n"
-            f"{ocr_text}"
+        results = await asyncio.gather(
+            *(run_batch(batch_index, batch_images) for batch_index, batch_images in enumerate(batches, 1)),
+            return_exceptions=True,
         )
-        return await _invoke_structured_agent(
-            self.inspection_agent,
-            HumanMessage(content=prompt),
-            InspectionResult,
-            reviewer_agent=self.reviewer_agent,
-            agent_name="inspection_report_agent",
-            system_prompt=_load_prompt("inspection_report_analysis_prompt.txt"),
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise RuntimeError(
+                f"{agent_name} OCR 共 {len(errors)}/{len(batches)} 个批次失败: "
+                + "; ".join(str(error) for error in errors)
+            ) from errors[0]
+        return "\n\n".join(result for result in results if isinstance(result, str))
+
+    async def _analyze_inspection_batches(self, images: list[str], visit_time: str) -> InspectionResult:
+        """Extract one structured result per image batch and merge without a second model call."""
+        batches = list(_chunked(images, MAX_VLM_IMAGES_PER_REQUEST))
+        semaphore = getattr(self, "ocr_batch_semaphore", None)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(OCR_BATCH_CONCURRENCY)
+            self.ocr_batch_semaphore = semaphore
+        system_prompt = _load_prompt("inspection_report_analysis_prompt.txt")
+
+        async def run_batch(batch_index: int, batch_images: list[str]) -> InspectionResult:
+            start_index = (batch_index - 1) * MAX_VLM_IMAGES_PER_REQUEST + 1
+            prompt = (
+                f"本次就诊时间（see_doc_time）：{visit_time or '未记录'}\n"
+                f"本批共 {len(batch_images)} 张图片，对应原始图片序号 {start_index} 到 "
+                f"{start_index + len(batch_images) - 1}。请逐张分类并返回结构化结果。\n"
+                "为控制耗时和上下文，每张有效报告只保留：报告名称、报告日期、指标名称、"
+                "指标结果、单位、异常标记和报告原有结论。content 仅用简短的“指标：结果 单位”"
+                "格式记录，不得全文转写、不得重复参考范围、患者信息、医院信息和无关页眉页脚。"
+                "abnormal_indicators 只保留报告明确标记的异常指标；conclusion 只保留报告原有结论。"
+                "非检查报告或无法识别时只返回图片类别和 is_valid_report=false，其余字段留空。"
+            )
+            started = time.perf_counter()
+            logger.info(
+                f"[INSPECTION BATCH START] batch={batch_index}/{len(batches)} images={len(batch_images)}"
+            )
+            try:
+                async with semaphore:
+                    result = await _invoke_structured_agent(
+                        self.inspection_agent,
+                        _multimodal_message(prompt, batch_images, self.input_dir),
+                        InspectionResult,
+                        reviewer_agent=self.reviewer_agent,
+                        agent_name="inspection_report_agent",
+                        system_prompt=system_prompt,
+                    )
+            except Exception as exc:
+                elapsed = time.perf_counter() - started
+                logger.error(
+                    f"[INSPECTION BATCH ERROR] batch={batch_index}/{len(batches)} "
+                    f"elapsed={elapsed:.1f}s error={type(exc).__name__}: {exc}"
+                )
+                raise RuntimeError(
+                    f"inspection_report 批次 {batch_index}/{len(batches)} 失败: {type(exc).__name__}: {exc}"
+                ) from exc
+            elapsed = time.perf_counter() - started
+            logger.info(
+                f"[INSPECTION BATCH END] batch={batch_index}/{len(batches)} "
+                f"images={len(batch_images)} elapsed={elapsed:.1f}s"
+            )
+            return result
+
+        results = await asyncio.gather(
+            *(run_batch(batch_index, batch_images) for batch_index, batch_images in enumerate(batches, 1)),
+            return_exceptions=True,
         )
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise RuntimeError(
+                f"inspection_report 共 {len(errors)}/{len(batches)} 个批次失败: "
+                + "; ".join(str(error) for error in errors)
+            ) from errors[0]
+
+        reports = []
+        summaries = []
+        seen_summaries = set()
+        for result in results:
+            if not isinstance(result, InspectionResult):
+                continue
+            reports.extend(result.reports)
+            summary = _clean_generated_text(result.history_evidence_summary)
+            if summary and summary not in seen_summaries:
+                seen_summaries.add(summary)
+                summaries.append(summary)
+        return InspectionResult(reports=reports, history_evidence_summary="\n".join(summaries))
 
     async def _extract_tongue_face_from_ocr(self, ocr_text: str) -> TongueFaceResult:
         prompt = (
@@ -1195,15 +1483,34 @@ class MedicalRecordAgents:
         images = _record_images(record)
         if not images:
             return {category: [] for category in IMAGE_CATEGORIES}
-        result = await _invoke_structured_agent(
-            self.image_classifier_agent,
-            _image_classification_message(images, self.input_dir),
-            ImageClassificationResult,
-            reviewer_agent=self.reviewer_agent,
-            agent_name="medical_image_classifier_agent",
-            system_prompt=_load_prompt("image_classification_prompt.txt"),
+        batches = await _image_classification_message(images, self.input_dir)
+        if not batches:
+            return {category: [] for category in IMAGE_CATEGORIES}
+
+        async def classify_batch(
+            message: HumanMessage,
+            batch_images: list[str],
+        ) -> dict[str, list[str]]:
+            async with classification_semaphore:
+                result = await _invoke_structured_agent(
+                    self.image_classifier_agent,
+                    message,
+                    ImageClassificationResult,
+                    reviewer_agent=self.reviewer_agent,
+                    agent_name="medical_image_classifier_agent",
+                    system_prompt=_load_prompt("image_classification_prompt.txt"),
+                )
+            return _group_classified_images(result, batch_images)
+
+        classification_semaphore = asyncio.Semaphore(IMAGE_CLASSIFICATION_BATCH_CONCURRENCY)
+        batch_results = await asyncio.gather(
+            *(classify_batch(message, batch_images) for message, batch_images in batches)
         )
-        return _group_classified_images(result, images)
+        grouped = {category: [] for category in IMAGE_CATEGORIES}
+        for batch_result in batch_results:
+            for category in IMAGE_CATEGORIES:
+                grouped[category].extend(batch_result[category])
+        return grouped
 
     async def analyze_inspection_images(self, record: dict[str, Any], images: list[str] | None = None) -> None:
         if images is None:
@@ -1214,32 +1521,11 @@ class MedicalRecordAgents:
             )
             return
         visit_time = _visit_time(record)
-        prompt = (
-            f"本次就诊时间（see_doc_time）：{visit_time or '未记录'}\n"
-            "逐张分类并解析图片，提取有效检查报告中可用于核对或补充本次现病史的客观事实。"
-            "如能识别报告日期，请给出报告日期相对本次就诊时间的相对时间。"
+        logger.info(
+            f"[INSPECTION] images={len(images)} batch_size={MAX_VLM_IMAGES_PER_REQUEST} "
+            f"concurrency={OCR_BATCH_CONCURRENCY}"
         )
-        if len(images) > MAX_VLM_IMAGES_PER_REQUEST:
-            logger.info(f"[INSPECTION] images={len(images)} exceeds {MAX_VLM_IMAGES_PER_REQUEST}, using OCR batches")
-            ocr_text = await self._ocr_image_batches(
-                images,
-                (
-                    "你是医学检查报告图片 OCR 助手。只转写图片中清晰可见的文字、数字、单位、"
-                    "参考范围、异常标记、报告日期、报告名称、检查所见和诊断意见。"
-                    "不得根据医学常识补全模糊或缺失内容。"
-                ),
-                agent_name="inspection_report",
-            )
-            result = await self._extract_inspection_from_ocr(visit_time, ocr_text)
-        else:
-            result = await _invoke_structured_agent(
-                self.inspection_agent,
-                _multimodal_message(prompt, images, self.input_dir),
-                InspectionResult,
-                reviewer_agent=self.reviewer_agent,
-                agent_name="inspection_report_agent",
-                system_prompt=_load_prompt("inspection_report_analysis_prompt.txt"),
-            )
+        result = await self._analyze_inspection_batches(images, visit_time)
         for report in result.reports:
             relative_time = _relative_report_time(report.report_date, visit_time)
             if relative_time:
@@ -1332,9 +1618,15 @@ class MedicalRecordAgents:
         for field, value in values.items():
             record[f"ai_{field}"] = _clean_generated_value(value)
 
-    async def _run_stage(self, stage_name: str, record_id: str, stage: Callable[[], Any]) -> None:
+    async def _run_stage(
+        self,
+        stage_name: str,
+        record_id: str,
+        doctor_name: str,
+        stage: Callable[[], Any],
+    ) -> None:
         started_at = time.monotonic()
-        logger.info(f"[STAGE START] record={record_id} stage={stage_name}")
+        logger.info(f"[STAGE START] record={record_id} doctor_name={doctor_name} stage={stage_name}")
         try:
             result = stage()
             if inspect.isawaitable(result):
@@ -1344,10 +1636,14 @@ class MedicalRecordAgents:
                     await result
         except Exception:
             logger.info(
-                f"[STAGE FAILED] record={record_id} stage={stage_name} elapsed={time.monotonic() - started_at:.1f}s"
+                f"[STAGE FAILED] record={record_id} doctor_name={doctor_name} "
+                f"stage={stage_name} elapsed={time.monotonic() - started_at:.1f}s"
             )
             raise
-        logger.info(f"[STAGE END] record={record_id} stage={stage_name} elapsed={time.monotonic() - started_at:.1f}s")
+        logger.info(
+            f"[STAGE END] record={record_id} doctor_name={doctor_name} "
+            f"stage={stage_name} elapsed={time.monotonic() - started_at:.1f}s"
+        )
 
     async def process(
         self,
@@ -1357,88 +1653,130 @@ class MedicalRecordAgents:
         use_rag: bool = False,
     ) -> dict[str, Any]:
         output = dict(record)
+        # 前端保存的是富文本 HTML。先转成纯文本再参与空值过滤和后续 Agent 调用，
+        # 避免标签污染提示词，也避免只有 <p><br></p> 的空病史绕过过滤。
+        self.normalize_medical_history(output)
         record_id = (
             _text(record.get("order_sn"))
             or _text(record.get("id"))
             or _text(record.get("record_id"))
             or "<unknown>"
         )
+        doctor_name = _text(record.get("doctor_name")) or "<unknown>"
         output["__original_diagnoses"] = _diagnosis_payload(output)
         errors = []
 
         # 主诉、现病史和西医诊断全部缺失时，不调用任何 Agent
-        if _should_filter_record(record):
-            write2filter_json(record, self.filter_path)
+        if _should_filter_record(output):
+            write2filter_json(output, self.filter_path)
             output["ai_processing_filtered"] = True
             output["ai_processing_complete"] = False
             output["ai_filter_reason"] = (
                 "patient_appeal、new_medical_history、diagnosis_illness 均为空"
             )
-            logger.info(f"[STAGE FILTER] record={record_id}")
+            logger.info(f"[STAGE FILTER] record={record_id} doctor_name={doctor_name}")
             return output
 
         # step1：先做不依赖诊断类型的基础归一化，不额外存储 ai_normalized_*。
         try:
-            await self._run_stage("diagnosis_normalization", record_id, lambda: self.normalize_diagnoses(output))
+            await self._run_stage(
+                "diagnosis_normalization",
+                record_id,
+                doctor_name,
+                lambda: self.normalize_diagnoses(output),
+            )
         except Exception as exc:
             errors.append({"stage": "diagnosis_normalization", "error": f"{type(exc).__name__}: {exc}"})
-        # step2：先汇总四个图片字段逐张分类；其他类图片不会进入后续解析。
+        # step2：图片分类与视觉解析管线。
+        async def run_image_pipeline() -> list[dict[str, str]]:
+            pipeline_errors = []
+            try:
+                classified_images: dict[str, list[str]] = {}
+
+                async def classify_image_stage() -> None:
+                    nonlocal classified_images
+                    classified_images = await self.classify_images(output)
+
+                await self._run_stage("image_classification", record_id, doctor_name, classify_image_stage)
+            except Exception as exc:
+                pipeline_errors.append(
+                    {"stage": "image_classification", "error": f"{type(exc).__name__}: {exc}"}
+                )
+                classified_images = {category: [] for category in IMAGE_CATEGORIES}
+
+            # 报告类与舌/面/患处类图片互不依赖，并行解析。
+            tongue_face_images = [
+                image for category in TONGUE_FACE_IMAGE_CATEGORIES for image in classified_images[category]
+            ]
+            image_stages = {
+                "inspection_vlm": (
+                    self.analyze_inspection_images,
+                    classified_images["检验检查报告类"],
+                ),
+                "tongue_face_vlm": (self.analyze_tongue_face_images, tongue_face_images),
+            }
+            tasks = {
+                name: asyncio.create_task(
+                    self._run_stage(
+                        name,
+                        record_id,
+                        doctor_name,
+                        lambda stage=stage, images=images: stage(output, images),
+                    )
+                )
+                for name, (stage, images) in image_stages.items()
+            }
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+            for stage_name, result in zip(tasks, results, strict=True):
+                if isinstance(result, Exception):
+                    pipeline_errors.append(
+                        {"stage": stage_name, "error": f"{type(result).__name__}: {result}"}
+                    )
+            return pipeline_errors
+
+        # step3：本次复诊病史只依赖文本字段，可与整条视觉管线并发。
+        async def run_current_visit_history() -> list[dict[str, str]]:
+            logger.debug("【本次复诊现病史内容抽取】】")
+            try:
+                await self._run_stage(
+                    "current_visit_history",
+                    record_id,
+                    doctor_name,
+                    lambda: self.extract_current_visit_history(output, extract_current_history),
+                )
+            except Exception as exc:
+                return [{"stage": "current_visit_history", "error": f"{type(exc).__name__}: {exc}"}]
+            return []
+
+        pipeline_results = await asyncio.gather(
+            run_image_pipeline(),
+            run_current_visit_history(),
+        )
+        for pipeline_errors in pipeline_results:
+            errors.extend(pipeline_errors)
+
+        # step4：等待图片和本次病史均完成后，校验主诉/现病史一致性并清洗五史。
         try:
-            classified_images: dict[str, list[str]] = {}
-
-            async def classify_image_stage() -> None:
-                nonlocal classified_images
-                classified_images = await self.classify_images(output)
-
-            await self._run_stage("image_classification", record_id, classify_image_stage)
-        except Exception as exc:
-            errors.append({"stage": "image_classification", "error": f"{type(exc).__name__}: {exc}"})
-            classified_images = {category: [] for category in IMAGE_CATEGORIES}
-
-        # step3：报告类与舌/面/患处类图片互不依赖，并行解析。
-        tongue_face_images = [
-            image for category in TONGUE_FACE_IMAGE_CATEGORIES for image in classified_images[category]
-        ]
-        image_stages = {
-            "inspection_vlm": (
-                self.analyze_inspection_images,
-                classified_images["检验检查报告类"],
-            ),
-            "tongue_face_vlm": (self.analyze_tongue_face_images, tongue_face_images),
-        }
-        tasks = {
-            name: asyncio.create_task(
-                self._run_stage(name, record_id, lambda stage=stage, images=images: stage(output, images))
-            )
-            for name, (stage, images) in image_stages.items()
-        }
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        for stage_name, result in zip(tasks, results, strict=True):
-            if isinstance(result, Exception):
-                errors.append({"stage": stage_name, "error": f"{type(result).__name__}: {result}"})
-        logger.debug("【本次复诊现病史内容抽取】】")
-        # step4：从累积现病史中抽取本次复诊内容。
-        try:
-            await self._run_stage(
-                "current_visit_history",
-                record_id,
-                lambda: self.extract_current_visit_history(output, extract_current_history),
-            )
-        except Exception as exc:
-            errors.append({"stage": "current_visit_history", "error": f"{type(exc).__name__}: {exc}"})
-
-        # step5：结合图片结果校验主诉/现病史一致性，并清洗五史。
-        try:
-            await self._run_stage("clinical_cleaning", record_id, lambda: self.clean_histories(output))
+            await self._run_stage("clinical_cleaning", record_id, doctor_name, lambda: self.clean_histories(output))
         except Exception as exc:
             errors.append({"stage": "clinical_cleaning", "error": f"{type(exc).__name__}: {exc}"})
-        # step6：用最新病历补全诊断，再提取知识库字段。
+        # step5：用最新病历补全诊断，再提取知识库字段。
         try:
-            await self._run_stage("diagnosis_completion", record_id, lambda: self.complete_diagnoses(output))
+            await self._run_stage(
+                "diagnosis_completion",
+                record_id,
+                doctor_name,
+                lambda: self.complete_diagnoses(output),
+            )
         except Exception as exc:
             errors.append({"stage": "diagnosis_completion", "error": f"{type(exc).__name__}: {exc}"})
         try:
-            await self._run_stage("clinical_extraction", record_id, lambda: self.extract_clinical_fields(output, use_rag))
+            await self._run_stage(
+                "clinical_extraction",
+                record_id,
+                doctor_name,
+                lambda: self.extract_clinical_fields(output, use_rag),
+            )
         except Exception as exc:
             errors.append({"stage": "clinical_extraction", "error": f"{type(exc).__name__}: {exc}"})
         if errors:
@@ -1609,6 +1947,7 @@ def build_model(
     *,
     base_url: str | None = None,
     api_key: str | None = None,
+    max_tokens: int | None = None,
 ) -> ChatOpenAI:
     resolved_base_url = args.base_url if base_url is None else base_url
     resolved_api_key = args.api_key if api_key is None else api_key
@@ -1622,6 +1961,8 @@ def build_model(
         kwargs["base_url"] = resolved_base_url
     if resolved_api_key:
         kwargs["api_key"] = resolved_api_key
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     logger.info(
         f"model_name {model_name}, base_url {resolved_base_url or '<default>'}, "
         f"apikey {_mask_secret(resolved_api_key)}"
@@ -1634,6 +1975,81 @@ def build_model(
     else:
         kwargs["extra_body"] = {"enable_thinking": False}
     return ChatOpenAI(**kwargs)
+
+
+async def _process_record_batch(
+    agents: MedicalRecordAgents,
+    batch: list[dict[str, Any]],
+    previous_diagnoses_by_patient: dict[str, dict[str, str]],
+    record_timeout: float,
+) -> list[tuple[dict[str, Any], dict[str, Any], Exception | None]]:
+    """Process different patients concurrently while preserving each patient's visit order."""
+    grouped_items: dict[str, list[dict[str, Any]]] = {}
+    for item in batch:
+        patient_key = item["patient_key"]
+        group_key = patient_key or f"__record__:{item['identity']}"
+        grouped_items.setdefault(group_key, []).append(item)
+
+    async def process_patient_visits(
+        items: list[dict[str, Any]],
+    ) -> list[tuple[dict[str, Any], dict[str, Any], Exception | None]]:
+        outcomes = []
+        for item in items:
+            working_record = dict(item["record"])
+            patient_key = item["patient_key"]
+            if patient_key and patient_key in previous_diagnoses_by_patient:
+                working_record["__previous_diagnoses"] = previous_diagnoses_by_patient[patient_key]
+
+            try:
+                process_call = agents.process(
+                    working_record,
+                    extract_current_history=item["extract_current_history"],
+                    use_rag=item["use_rag"],
+                )
+                if record_timeout > 0:
+                    enriched = await asyncio.wait_for(process_call, timeout=record_timeout)
+                else:
+                    enriched = await process_call
+                error = None
+            except TimeoutError:
+                error = TimeoutError(f"病历处理超过 {record_timeout:g} 秒")
+                enriched = dict(working_record)
+            except Exception as exc:  # 单条病历失败不能取消同批其他病历
+                error = exc
+                enriched = dict(working_record)
+
+            if error is not None:
+                enriched.pop("__previous_diagnoses", None)
+                enriched.pop("__original_diagnoses", None)
+                enriched["ai_processing_errors"] = [{"stage": "record", "error": f"{type(error).__name__}: {error}"}]
+                enriched["ai_processing_complete"] = False
+                enriched["ai_record_identity"] = item["identity"]
+
+            outcomes.append((item, enriched, error))
+            if patient_key and enriched.get("ai_processing_filtered") is not True:
+                enriched_diagnoses = _diagnosis_payload(enriched, prefer_ai=True)
+                if _has_any_diagnosis(enriched_diagnoses):
+                    previous_diagnoses_by_patient[patient_key] = enriched_diagnoses
+        return outcomes
+
+    grouped_outcomes = await asyncio.gather(
+        *(process_patient_visits(items) for items in grouped_items.values()),
+        return_exceptions=True,
+    )
+    outcomes_by_item: dict[int, tuple[dict[str, Any], dict[str, Any], Exception | None]] = {}
+    for items, group_outcome in zip(grouped_items.values(), grouped_outcomes, strict=True):
+        if isinstance(group_outcome, BaseException):
+            for item in items:
+                error = RuntimeError(f"批处理任务异常: {type(group_outcome).__name__}: {group_outcome}")
+                enriched = dict(item["record"])
+                enriched["ai_processing_errors"] = [{"stage": "record", "error": f"{type(error).__name__}: {error}"}]
+                enriched["ai_processing_complete"] = False
+                enriched["ai_record_identity"] = item["identity"]
+                outcomes_by_item[id(item)] = (item, enriched, error)
+            continue
+        for outcome in group_outcome:
+            outcomes_by_item[id(outcome[0])] = outcome
+    return [outcomes_by_item[id(item)] for item in batch]
 
 
 async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
@@ -1653,6 +2069,13 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         base_url=args.vlm_base_url or args.base_url,
         api_key=args.vlm_api_key or args.api_key,
     )
+    image_classification_model = build_model(
+        getattr(args, "image_classification_model", CLASSIFICATION_MODEL_NAME),
+        args,
+        base_url=getattr(args, "image_classification_base_url", "") or args.base_url,
+        api_key=getattr(args, "image_classification_api_key", "") or args.api_key,
+        max_tokens=CLASSIFICATION_MODEL_MAX_TOKENS,
+    )
     enable_review = bool(getattr(args, "enable_review", False))
     reviewer_model = None
     if enable_review:
@@ -1668,10 +2091,11 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         vlm_model,
         input_dir,
         diagnosis_model=diagnosis_model,
+        image_classification_model=image_classification_model,
         reviewer_model=reviewer_model,
         enable_review=enable_review,
         filter_path=args.output_dir / FILTER_FILE_NAME,
-        stage_timeout=args.timeout,
+        stage_timeout=getattr(args, "timeout", 120.0),
     )
     patient_visit_counts = count_patient_visits(args.input, doctor_ids)
     if args.reprocess:
@@ -1686,8 +2110,85 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     output_files: dict[Path, TextIO] = {}
     failure_files: dict[Path, TextIO] = {}
     previous_diagnoses_by_patient: dict[str, dict[str, str]] = {}
+    batch_size = max(1, int(getattr(args, "batch_size", 8)))
+    record_timeout = max(0.0, float(getattr(args, "record_timeout", 0.0)))
+    pending_batch: list[dict[str, Any]] = []
 
     with ExitStack() as stack:
+
+        async def flush_batch() -> None:
+            nonlocal failed, skipped, succeeded
+            if not pending_batch:
+                return
+
+            batch = list(pending_batch)
+            pending_batch.clear()
+            logger.info(f"[BATCH START] records={len(batch)} concurrency={len(batch)}")
+            batch_started_at = time.monotonic()
+            outcomes = await _process_record_batch(
+                agents,
+                batch,
+                previous_diagnoses_by_patient,
+                record_timeout,
+            )
+            first_failure: RuntimeError | None = None
+            for item, enriched, process_error in outcomes:
+                identity = item["identity"]
+                order_sn = item["order_sn"]
+                record_id = item["record_id"]
+                enriched["ai_record_identity"] = identity
+                enriched.pop("__previous_diagnoses", None)
+                enriched.pop("__original_diagnoses", None)
+
+                if process_error is not None:
+                    failure_path = _doctor_failure_path(args.output_dir, enriched)
+                    if failure_path not in failure_files:
+                        failure_path.parent.mkdir(parents=True, exist_ok=True)
+                        failure_files[failure_path] = stack.enter_context(failure_path.open("a", encoding="utf-8"))
+                    _write_jsonl(failure_files[failure_path], enriched)
+                    failed += 1
+                    logger.error(f"[ERROR] record={record_id}: {type(process_error).__name__}: {process_error}")
+                    first_failure = first_failure or RuntimeError(f"病历 {record_id} 处理失败")
+                    continue
+
+                if enriched.get("ai_processing_filtered") is True:
+                    skipped += 1
+                    processed_ids.add(identity)
+                    if order_sn:
+                        processed_order_sns.add(order_sn)
+                    logger.info(f"数据关键字段均为空，【FILTER】 {order_sn or record_id}")
+                    continue
+
+                if enriched.get("ai_processing_errors"):
+                    failed += 1
+                    enriched["ai_processing_complete"] = False
+                    failure_path = _doctor_failure_path(args.output_dir, enriched)
+                    if failure_path not in failure_files:
+                        failure_path.parent.mkdir(parents=True, exist_ok=True)
+                        failure_files[failure_path] = stack.enter_context(failure_path.open("a", encoding="utf-8"))
+                    _write_jsonl(failure_files[failure_path], enriched)
+                    logger.error(f"[ERROR] record={record_id}: {_json_for_prompt(enriched['ai_processing_errors'])}")
+                    first_failure = first_failure or RuntimeError(f"病历 {record_id} 存在处理失败阶段")
+                    continue
+
+                succeeded += 1
+                enriched["ai_processing_complete"] = True
+                enriched["ai_processing_version"] = "2026-07-28"
+                output_path = _doctor_output_path(args.output_dir, enriched)
+                if output_path not in output_files:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_files[output_path] = stack.enter_context(output_path.open("a", encoding="utf-8"))
+                _write_jsonl(output_files[output_path], enriched)
+                processed_ids.add(identity)
+                if order_sn:
+                    processed_order_sns.add(order_sn)
+
+            logger.info(f"[BATCH END] records={len(batch)} elapsed={time.monotonic() - batch_started_at:.1f}s")
+            if getattr(args, "interval", 0) > 0:
+                await asyncio.sleep(args.interval)
+            if first_failure is not None and args.fail_fast:
+                raise first_failure
+
         for index, record in enumerate(iter_records(args.input), 1):
             if not _doctor_matches(record, doctor_ids):
                 continue
@@ -1700,6 +2201,8 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
             order_sn = _text(record.get("order_sn"))
             patient_key = _patient_key(record)
             if identity in processed_ids or (order_sn and order_sn in processed_order_sns):
+                # Preserve input ordering for the previous-diagnosis dependency.
+                await flush_batch()
                 skipped_diagnoses = _diagnosis_payload(record, prefer_ai=True)
                 if patient_key and _has_any_diagnosis(skipped_diagnoses):
                     previous_diagnoses_by_patient[patient_key] = skipped_diagnoses
@@ -1717,72 +2220,20 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 and bool(patient_key)
                 and patient_visit_counts[patient_key] > 1
             )
-            working_record = dict(record)
-            if patient_key and patient_key in previous_diagnoses_by_patient:
-                working_record["__previous_diagnoses"] = previous_diagnoses_by_patient[patient_key]
-            try:
-                enriched = await agents.process(
-                    working_record,
-                    extract_current_history=extract_current_history,
-                    use_rag=args.use_rag,
-                )
-            except Exception as exc:  # 单条失败不能中断其他医生/病历
-                enriched = dict(working_record)
-                enriched.pop("__previous_diagnoses", None)
-                enriched.pop("__original_diagnoses", None)
-                enriched["ai_processing_errors"] = [
-                    {"stage": "record", "error": f"{type(exc).__name__}: {exc}"}
-                ]
-                enriched["ai_processing_complete"] = False
-                enriched["ai_record_identity"] = identity
-                failure_path = _doctor_failure_path(args.output_dir, enriched)
-                if failure_path not in failure_files:
-                    failure_path.parent.mkdir(parents=True, exist_ok=True)
-                    failure_files[failure_path] = stack.enter_context(failure_path.open("a", encoding="utf-8"))
-                _write_jsonl(failure_files[failure_path], enriched)
-                failed += 1
-                logger.error(f"[ERROR] record={record_id}: {type(exc).__name__}: {exc}")
-                if args.fail_fast:
-                    raise
-            else:
-                enriched["ai_record_identity"] = identity
-                enriched.pop("__previous_diagnoses", None)
-                enriched.pop("__original_diagnoses", None)
-                if enriched.get("ai_processing_filtered") is True:
-                    skipped += 1
-                    processed_ids.add(identity)
-                    if order_sn:
-                        processed_order_sns.add(order_sn)
-                    logger.info(f"数据关键字段均为空，【FILTER】 {order_sn or record_id}")
-                    continue
-                if enriched.get("ai_processing_errors"):
-                    failed += 1
-                    enriched["ai_processing_complete"] = False
-                    failure_path = _doctor_failure_path(args.output_dir, enriched)
-                    if failure_path not in failure_files:
-                        failure_path.parent.mkdir(parents=True, exist_ok=True)
-                        failure_files[failure_path] = stack.enter_context(failure_path.open("a", encoding="utf-8"))
-                    _write_jsonl(failure_files[failure_path], enriched)
-                    logger.error(f"[ERROR] record={record_id}: {_json_for_prompt(enriched['ai_processing_errors'])}")
-                    if args.fail_fast:
-                        raise RuntimeError(f"病历 {record_id} 存在处理失败阶段")
-                else:
-                    succeeded += 1
-                    enriched["ai_processing_complete"] = True
-                    enriched["ai_processing_version"] = "2026-07-28"
-                    output_path = _doctor_output_path(args.output_dir, enriched)
-                    if output_path not in output_files:
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        output_files[output_path] = stack.enter_context(output_path.open("a", encoding="utf-8"))
-                    _write_jsonl(output_files[output_path], enriched)
-                    processed_ids.add(identity)
-                    if order_sn:
-                        processed_order_sns.add(order_sn)
-            enriched_diagnoses = _diagnosis_payload(enriched, prefer_ai=True)
-            if patient_key and _has_any_diagnosis(enriched_diagnoses):
-                previous_diagnoses_by_patient[patient_key] = enriched_diagnoses
-            if args.interval > 0:
-                await asyncio.sleep(args.interval)
+            pending_batch.append(
+                {
+                    "record": record,
+                    "record_id": record_id,
+                    "identity": identity,
+                    "order_sn": order_sn,
+                    "patient_key": patient_key,
+                    "extract_current_history": extract_current_history,
+                    "use_rag": args.use_rag,
+                }
+            )
+            if len(pending_batch) >= batch_size:
+                await flush_batch()
+        await flush_batch()
     return succeeded, failed, skipped
 
 
@@ -1827,6 +2278,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--vlm-model", default=_env("MEDICAL_AGENT_VLM_MODEL"), help="视觉模型，默认同文本模型")
     parser.add_argument(
+        "--image-classification-model",
+        default=_env("MEDICAL_AGENT_IMAGE_CLASSIFICATION_MODEL", CLASSIFICATION_MODEL_NAME),
+        help=f"图片分类模型，默认 {CLASSIFICATION_MODEL_NAME}",
+    )
+    parser.add_argument(
         "--base-url",
         "--text-base-url",
         dest="base_url",
@@ -1849,6 +2305,16 @@ def parse_args() -> argparse.Namespace:
         "--vlm-api-key",
         default=_env("MEDICAL_AGENT_VLM_API_KEY"),
         help="视觉模型 API Key；默认使用文本模型 API Key",
+    )
+    parser.add_argument(
+        "--image-classification-base-url",
+        default=_env_any(("MEDICAL_AGENT_IMAGE_CLASSIFICATION_BASE_URL", "DASHSCOPE_BASE_URL"), DASHSCOPE_COMPATIBLE_BASE_URL),
+        help="图片分类模型接口地址；默认使用 DashScope OpenAI 兼容接口",
+    )
+    parser.add_argument(
+        "--image-classification-api-key",
+        default=_env_any(("MEDICAL_AGENT_IMAGE_CLASSIFICATION_API_KEY", "DASHSCOPE_API_KEY")),
+        help="图片分类模型 API Key；默认使用 DASHSCOPE_API_KEY",
     )
     parser.add_argument(
         "--reviewer-model",
@@ -1881,6 +2347,18 @@ def parse_args() -> argparse.Namespace:
         help="处理条数限制；指定 doctor_id 时表示每个医生最多处理多少条，默认所有医生时表示总条数",
     )
     parser.add_argument("--interval", type=float, default=0.0, help="每条病历后的等待秒数")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="每批最多并发处理的病历数；同一患者在批内仍按就诊顺序串行，默认 8",
+    )
+    parser.add_argument(
+        "--record-timeout",
+        type=float,
+        default=0.0,
+        help="单条病历全部阶段的总超时秒数，0 表示不额外限制；单阶段仍受 --timeout 限制",
+    )
     parser.add_argument("--timeout", type=float, default=120.0, help="单次模型请求超时秒数")
     parser.add_argument("--max-retries", type=int, default=2, help="模型请求重试次数")
     parser.add_argument(
