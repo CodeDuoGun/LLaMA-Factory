@@ -28,6 +28,7 @@ from medical.data_utils import medical_record_agents
 from medical.schema.clear_record_basemodel import (
     AgentReviewResult,
     CurrentVisitHistoryResult,
+    HistoryCleaningResult,
     ImageClassification,
     ImageClassificationResult,
     InspectionFinding,
@@ -362,6 +363,119 @@ def test_count_planned_records_excludes_processed_and_applies_per_doctor_limit(t
     )
 
     assert planned == 2
+
+
+def test_select_reprocess_records_includes_failures_and_missing_histories(tmp_path) -> None:
+    doctor_dir = tmp_path / "doctor_43_朱子奇"
+    doctor_dir.mkdir()
+    (doctor_dir / medical_record_agents.FAILURE_FILE_NAME).write_text(
+        json.dumps(
+            {
+                "id": "failed",
+                "order_sn": "FAILED-1",
+                "doctor_id": "43",
+                "doctor_name": "朱子奇",
+                "ai_processing_errors": [{"stage": "record", "error": "boom"}],
+                "ai_processing_complete": False,
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (doctor_dir / medical_record_agents.DOCTOR_RECORD_FILE_NAME).write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "id": "missing",
+                        "order_sn": "MISSING-1",
+                        "doctor_id": "43",
+                        "doctor_name": "朱子奇",
+                        "doc_ass_stu_appeal": "",
+                        "ai_patient_appeal": "",
+                        "new_medical_history": "现病史",
+                        "ai_new_medical_history": "AI 现病史",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "id": "complete",
+                        "order_sn": "COMPLETE-1",
+                        "doctor_id": "43",
+                        "doctor_name": "朱子奇",
+                        "doc_ass_stu_appeal": "主诉",
+                        "ai_patient_appeal": "AI 主诉",
+                        "new_medical_history": "现病史",
+                        "ai_new_medical_history": "AI 现病史",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    selected = medical_record_agents.select_reprocess_records(
+        tmp_path,
+        {"43"},
+        include_failures=True,
+        include_missing_histories=True,
+    )
+
+    assert [record["order_sn"] for record in selected] == ["FAILED-1", "MISSING-1"]
+    assert "ai_processing_errors" not in selected[0]
+    assert "ai_processing_complete" not in selected[0]
+
+
+def test_replace_jsonl_records_by_order_sn_replaces_existing_and_appends_new(tmp_path) -> None:
+    path = tmp_path / medical_record_agents.DOCTOR_RECORD_FILE_NAME
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"order_sn": "A", "value": "old-a"}, ensure_ascii=False),
+                json.dumps({"order_sn": "B", "value": "old-b"}, ensure_ascii=False),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    medical_record_agents._replace_jsonl_records_by_order_sn(
+        path,
+        [
+            {"order_sn": "B", "value": "new-b"},
+            {"order_sn": "C", "value": "new-c"},
+        ],
+    )
+
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert records == [
+        {"order_sn": "A", "value": "old-a"},
+        {"order_sn": "B", "value": "new-b"},
+        {"order_sn": "C", "value": "new-c"},
+    ]
+
+
+def test_remove_jsonl_records_by_order_sn_removes_successful_failures(tmp_path) -> None:
+    path = tmp_path / medical_record_agents.FAILURE_FILE_NAME
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"order_sn": "FAILED-1"}, ensure_ascii=False),
+                json.dumps({"order_sn": "FAILED-2"}, ensure_ascii=False),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    medical_record_agents._remove_jsonl_records_by_order_sn(path, {"FAILED-1"})
+
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert records == [{"order_sn": "FAILED-2"}]
 
 
 def test_progress_log_message_contains_bar_counts_speed_and_eta() -> None:
@@ -773,6 +887,91 @@ def test_format_tongue_face_result_text_uses_natural_language_sections() -> None
     assert medical_record_agents.format_tongue_face_result_text(result) == (
         "舌象：舌质颜色：淡红；舌体形态：胖、齿痕。\n患处：患处部位：面颊；患处颜色：红。"
     )
+
+
+def test_clean_histories_fills_missing_complaint_and_history_from_context() -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.reviewer_agent = None
+    agents.history_agent = FakeStructuredAgent(
+        [
+            HistoryCleaningResult(
+                patient_appeal="",
+                new_medical_history="",
+                old_medical_history="胃炎病史多年",
+            )
+        ]
+    )
+    record = {
+        "order_sn": "ORDER-1",
+        "doc_ass_stu_appeal": "",
+        "patient_appeal": "胃脘胀痛伴反酸1周",
+        "new_medical_history": "",
+        "old_medical_history": "胃炎病史多年",
+        "allergic_history": "",
+        "personal_history": "",
+        "special_history": "",
+        "family_history": "",
+        "ai_inspection_report_img": {
+            "reports": [
+                {
+                    "是否有效检查报告": True,
+                    "report_name": "胃镜",
+                    "报告日期": "2021-06-01",
+                    "解析结果": "胃窦黏膜充血",
+                    "报告结论": "慢性胃炎",
+                }
+            ],
+            "现病史检查证据摘要": "胃镜提示慢性胃炎",
+        },
+        "ai_tongue_face_img": {
+            "tongue": {
+                "legal": "是",
+                "tongue_body": {"color": "淡红"},
+            }
+        },
+    }
+
+    asyncio.run(agents.clean_histories(record))
+    prompt_content = agents.history_agent.calls[0]["messages"][0].content
+
+    assert "医生撰写主诉 doc_ass_stu_appeal：未记录" in prompt_content
+    assert "患者主诉 patient_appeal：胃脘胀痛伴反酸1周" in prompt_content
+    assert "原始本次现病史 new_medical_history：未记录" in prompt_content
+    assert record["ai_patient_appeal"] == "胃脘胀痛伴反酸1周"
+    assert record["ai_new_medical_history"]
+    assert "胃脘胀痛伴反酸1周" in record["ai_new_medical_history"]
+    assert "胃炎病史多年" in record["ai_new_medical_history"]
+    assert "胃镜提示慢性胃炎" in record["ai_new_medical_history"]
+
+
+def test_clean_histories_keeps_model_corrected_non_empty_complaint_and_history() -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.reviewer_agent = None
+    agents.history_agent = FakeStructuredAgent(
+        [
+            HistoryCleaningResult(
+                patient_appeal="反复胃脘胀痛1年余，加重1周",
+                new_medical_history="患者反复胃脘胀痛1年余，近1周加重，伴反酸。饮食未涉及，睡眠未涉及，二便未涉及。舌象未涉及。脉象未涉及。",
+            )
+        ]
+    )
+    record = {
+        "doc_ass_stu_appeal": "胃病",
+        "patient_appeal": "胃痛反酸，一年多，最近一周重",
+        "new_medical_history": "胃脘胀痛反复，近期加重。",
+        "old_medical_history": "",
+        "allergic_history": "",
+        "personal_history": "",
+        "special_history": "",
+        "family_history": "",
+        "ai_inspection_report_img": {},
+        "ai_tongue_face_img": {},
+    }
+
+    asyncio.run(agents.clean_histories(record))
+
+    assert record["ai_patient_appeal"] == "反复胃脘胀痛1年余，加重1周"
+    assert record["ai_new_medical_history"].startswith("患者反复胃脘胀痛1年余")
 
 
 def test_group_classified_images_routes_categories_and_keeps_other_separate() -> None:

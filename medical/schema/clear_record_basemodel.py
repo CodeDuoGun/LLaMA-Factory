@@ -39,8 +39,8 @@ class DiagnosisResult(BaseModel):
 class HistoryCleaningResult(BaseModel):
     """主诉、现病史一致性校验及五史清洗结果."""
 
-    patient_appeal: str = Field(default="", description="清洗后的主诉")
-    new_medical_history: str = Field(default="", description="经一致性校验和清洗后的本次现病史")
+    patient_appeal: str = Field(default="", description="清洗或补全后的主诉，最终必须有内容")
+    new_medical_history: str = Field(default="", description="经一致性校验、清洗或补全后的本次现病史，最终必须有内容")
     complaint_history_consistent: bool | None = Field(default=None, description="主诉与本次现病史是否一致")
     consistency_issues: list[str] = Field(default_factory=list, description="不一致点；无不一致时为空")
     old_medical_history: str = Field(default="", description="有效既往史")

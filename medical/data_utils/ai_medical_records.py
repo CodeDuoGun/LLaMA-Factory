@@ -16,19 +16,20 @@
 
 import json
 from collections.abc import Iterable, Iterator, Mapping
-from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import JSON, BigInteger, Boolean, Column, DateTime, Index, MetaData, String, Table, Text, func
-from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-
-from medical.data_utils.db_manager import DBManager
+from sqlalchemy import JSON, BigInteger, Boolean, Column, DateTime, Index, MetaData, String, Table, Text, UniqueConstraint, func, insert
 
 
-DEFAULT_TABLE_NAME = "ai_medical_records"
+if TYPE_CHECKING:
+    from medical.data_utils.db_manager import DBManager
+
+
+DEFAULT_TABLE_NAME = "ai_cleaned_medical_records"
 DEFAULT_BATCH_SIZE = 100
+DEFAULT_AI_OPERATOR = "AI"
+DEFAULT_HUMAN_OPERATOR = "HUMAN"
 
 AI_TEXT_FIELDS = (
     "ai_new_medical_history",
@@ -66,55 +67,63 @@ AI_FIELDS = AI_TEXT_FIELDS + AI_JSON_FIELDS + AI_BOOLEAN_FIELDS + AI_STRING_FIEL
 
 
 def build_ai_medical_records_table(metadata: MetaData | None = None, *, table_name: str = DEFAULT_TABLE_NAME) -> Table:
-    """构建 AI 清洗病历表定义."""
+    """构建 AI 清洗病历表定义，一条 JSONL 记录对应一行数据."""
     metadata = metadata or MetaData()
     table = Table(
         table_name,
         metadata,
         Column("medical_record_id", BigInteger, primary_key=True, comment="病历 ID，对应源数据 id"),
         Column("patient_id", BigInteger, nullable=False, comment="患者 ID，对应源数据 patient_id"),
-        Column("inquiry_id", String(64), nullable=False, comment="问诊单 ID，对应源数据 order_sn"),
+        Column("order_sn", String(64), nullable=False, comment="咨询单 ID，对应源数据 order_sn"),
         *(Column(name, Text) for name in AI_TEXT_FIELDS),
         *(Column(name, JSON) for name in AI_JSON_FIELDS),
         *(Column(name, Boolean) for name in AI_BOOLEAN_FIELDS),
         *(Column(name, String(32)) for name in AI_STRING_FIELDS),
-        Column("ai_data", JSON, nullable=False, comment="完整 ai_* 字段，兼容后续新增字段"),
+        Column("record_data", JSON, nullable=False, comment="除 ps 和 ai_* 字段外的原始病历记录"),
+        Column("operator", String(16), nullable=False, comment="数据操作来源：AI 或 HUMAN"),
         Column("created_at", DateTime, nullable=False, server_default=func.now()),
         Column("updated_at", DateTime, nullable=False, server_default=func.now(), onupdate=func.now()),
-        comment="AI 清洗后的病历内容",
+        UniqueConstraint("order_sn", name=f"uq_{table_name}_order_sn"),
+        comment="AI 清洗后的病历记录，不包含处方 ps",
     )
     Index(f"ix_{table_name}_patient_id", table.c.patient_id)
-    Index(f"ix_{table_name}_inquiry_id", table.c.inquiry_id)
-    Index(f"ix_{table_name}_ai_record_identity", table.c.ai_record_identity)
+    Index(f"ix_{table_name}_order_sn", table.c.order_sn)
     return table
 
 
-def record_to_row(record: Mapping[str, Any]) -> dict[str, Any]:
-    """把一条 JSONL 病历转换为数据库行."""
+def _extract_record_ids(record: Mapping[str, Any]) -> tuple[int, int, str]:
     medical_record_id = record.get("medical_record_id") or record.get("record_id") or record.get("id")
     patient_id = record.get("patient_id")
-    inquiry_id = record.get("inquiry_id") or record.get("order_sn")
+    order_sn = record.get("order_sn") or record.get("inquiry_id")
     missing = [
         name
         for name, value in (
             ("medical_record_id/id", medical_record_id),
             ("patient_id", patient_id),
-            ("inquiry_id/order_sn", inquiry_id),
+            ("order_sn/inquiry_id", order_sn),
         )
         if value in (None, "")
     ]
     if missing:
         raise ValueError(f"病历缺少必填字段: {', '.join(missing)}")
+    return int(medical_record_id), int(patient_id), str(order_sn)
 
-    ai_data = {key: value for key, value in record.items() if key.startswith("ai_")}
-    row = {
-        "medical_record_id": int(medical_record_id),
-        "patient_id": int(patient_id),
-        "inquiry_id": str(inquiry_id),
-        "ai_data": ai_data,
+
+def record_to_row(record: Mapping[str, Any]) -> dict[str, Any]:
+    """把一条 JSONL 病历转换为一条数据库行，排除 ps 字段."""
+    medical_record_id, patient_id, order_sn = _extract_record_ids(record)
+    return {
+        "medical_record_id": medical_record_id,
+        "patient_id": patient_id,
+        "order_sn": order_sn,
+        "record_data": {
+            field_name: field_value
+            for field_name, field_value in record.items()
+            if field_name != "ps" and field_name not in AI_FIELDS
+        },
+        "operator": DEFAULT_AI_OPERATOR,
+        **{field_name: record.get(field_name) for field_name in AI_FIELDS},
     }
-    row.update({name: record.get(name) for name in AI_FIELDS})
-    return row
 
 
 def iter_jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
@@ -149,7 +158,7 @@ def _batched(rows: Iterable[dict[str, Any]], batch_size: int) -> Iterator[list[d
 class AIMedicalRecordRepository:
     """AI 清洗病历的批量写入及索引检索服务."""
 
-    def __init__(self, manager: DBManager, *, table_name: str = DEFAULT_TABLE_NAME) -> None:
+    def __init__(self, manager: "DBManager", *, table_name: str = DEFAULT_TABLE_NAME) -> None:
         self.manager = manager
         self.table = build_ai_medical_records_table(table_name=table_name)
 
@@ -157,19 +166,27 @@ class AIMedicalRecordRepository:
         """不存在时创建数据表."""
         self.manager.create_table(self.table, checkfirst=True)
 
-    def batch_upsert(self, records: Iterable[Mapping[str, Any]], *, batch_size: int = DEFAULT_BATCH_SIZE) -> int:
-        """分批新增或更新病历，返回处理条数."""
+    def batch_insert_missing(self, records: Iterable[Mapping[str, Any]], *, batch_size: int = DEFAULT_BATCH_SIZE) -> int:
+        """分批新增病历；order_sn 已存在的数据会跳过，返回新增病历数."""
         total = 0
-        rows = (record_to_row(record) for record in records)
-        for batch in _batched(rows, batch_size):
-            self._upsert_batch(batch)
-            total += len(batch)
+        for batch in _batched((record_to_row(record) for record in records), batch_size):
+            rows = self._exclude_existing_rows(batch)
+            if not rows:
+                continue
+            with self.manager.connection(transactional=True) as connection:
+                connection.execute(insert(self.table), rows)
+            total += len(rows)
         return total
 
     def import_jsonl(self, path: str | Path, *, batch_size: int = DEFAULT_BATCH_SIZE) -> int:
-        """创建表并批量导入 JSONL."""
+        """创建表并批量导入 JSONL，已存在 order_sn 的记录会跳过."""
         self.create_table()
-        return self.batch_upsert(iter_jsonl(path), batch_size=batch_size)
+        return self.batch_insert_missing(iter_jsonl(path), batch_size=batch_size)
+
+    def clear(self) -> int:
+        """清空数据表，返回删除行数."""
+        self.create_table()
+        return self.manager.delete(self.table.name, filters=None, allow_all=True)
 
     def get_by_patient_id(self, patient_id: int, *, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         """按患者 ID 查询病历列表."""
@@ -181,43 +198,58 @@ class AIMedicalRecordRepository:
             order_by=["medical_record_id"],
         )
 
-    def get_by_inquiry_id(self, inquiry_id: str) -> list[dict[str, Any]]:
-        """按问诊单 ID 查询病历列表."""
-        return self.manager.select(
-            self.table.name,
-            filters={"inquiry_id": inquiry_id},
-            order_by=["medical_record_id"],
-        )
+    def get_by_order_sn(self, order_sn: str) -> dict[str, Any] | None:
+        """按咨询单 ID 查询单条病历."""
+        return self.manager.select_one(self.table.name, filters={"order_sn": order_sn})
+
+    def get_by_inquiry_id(self, inquiry_id: str) -> dict[str, Any] | None:
+        """按咨询单 ID 查询单条病历，兼容旧方法名."""
+        return self.get_by_order_sn(inquiry_id)
 
     def get_by_medical_record_id(self, medical_record_id: int) -> dict[str, Any] | None:
         """按病历 ID 查询单条病历."""
         return self.manager.select_one(self.table.name, filters={"medical_record_id": medical_record_id})
 
-    def _upsert_batch(self, rows: list[dict[str, Any]]) -> None:
-        dialect = self.manager.engine.dialect.name
-        if dialect == "mysql":
-            statement = mysql_insert(self.table).values(rows)
-            update_values = {
-                column.name: getattr(statement.inserted, column.name)
-                for column in self.table.columns
-                if column.name not in {"medical_record_id", "created_at"}
-            }
-            update_values["updated_at"] = func.now()
-            statement = statement.on_duplicate_key_update(**update_values)
-        elif dialect == "sqlite":
-            statement = sqlite_insert(self.table).values(rows)
-            update_values = {
-                column.name: getattr(statement.excluded, column.name)
-                for column in self.table.columns
-                if column.name not in {"medical_record_id", "created_at"}
-            }
-            update_values["updated_at"] = datetime.now()
-            statement = statement.on_conflict_do_update(
-                index_elements=[self.table.c.medical_record_id],
-                set_=update_values,
-            )
-        else:
-            raise NotImplementedError(f"暂不支持 {dialect} 数据库的批量 upsert")
+    def update_field_by_order_sn(self, order_sn: str, field_name: str, field_value: Any) -> bool:
+        """更新单个字段，并把整条记录来源标记为 HUMAN.
 
-        with self.manager.connection(transactional=True) as connection:
-            connection.execute(statement)
+        AI_FIELDS 中的字段更新独立列；其他业务字段更新 record_data。
+        """
+        row = self.get_by_order_sn(order_sn)
+        if row is None:
+            return False
+        if field_name in {"medical_record_id", "order_sn", "record_data", "operator", "created_at", "updated_at"}:
+            raise ValueError(f"不支持通过 update_field_by_order_sn 修改字段: {field_name}")
+
+        data: dict[str, Any] = {"operator": DEFAULT_HUMAN_OPERATOR}
+        if field_name in AI_FIELDS:
+            data[field_name] = field_value
+        elif field_name == "patient_id":
+            data["patient_id"] = int(field_value)
+            record_data = dict(row.get("record_data") or {})
+            record_data[field_name] = field_value
+            data["record_data"] = record_data
+        else:
+            record_data = dict(row.get("record_data") or {})
+            record_data[field_name] = field_value
+            data["record_data"] = record_data
+
+        return self.manager.update(self.table.name, data, filters={"order_sn": order_sn}) > 0
+
+    def _exclude_existing_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        unique_rows: list[dict[str, Any]] = []
+        seen_order_sn: set[str] = set()
+        for row in rows:
+            order_sn = row["order_sn"]
+            if order_sn in seen_order_sn:
+                continue
+            seen_order_sn.add(order_sn)
+            unique_rows.append(row)
+
+        existing_rows = self.manager.select(
+            self.table.name,
+            filters={"order_sn": list(seen_order_sn)},
+            columns=["order_sn"],
+        )
+        existing_order_sn = {row["order_sn"] for row in existing_rows}
+        return [row for row in unique_rows if row["order_sn"] not in existing_order_sn]

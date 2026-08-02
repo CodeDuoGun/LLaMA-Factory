@@ -289,7 +289,7 @@ def _json_for_prompt(value: Any) -> str:
 
 
 def _chief_complaint(record: dict[str, Any]) -> str:
-    return _text(record.get("doc_ass_stu_appeal"))
+    return _text(record.get("patient_appeal") or record.get("doc_ass_stu_appeal"))
 
 def _chief_patient_complaint(record: dict[str, Any]) -> str:
     return _text(record.get("doc_ass_stu_appeal"))
@@ -306,6 +306,67 @@ def _latest_chief_complaint(record: dict[str, Any]) -> str:
 
 def _latest_present_history(record: dict[str, Any]) -> str:
     return _text(record.get("ai_new_medical_history")) or _present_history(record)
+
+
+def _has_effective_history_text(value: Any) -> bool:
+    text = _text(value)
+    return bool(text and text not in INVALID_HISTORY_TEXT and text not in {"未记录", "不详", "未知"})
+
+
+def _fallback_history_excerpt(value: Any, *, limit: int = 120) -> str:
+    text = re.sub(r"\s+", " ", _text(value)).strip("；;，,。 ")
+    if not text:
+        return ""
+    return text if len(text) <= limit else f"{text[:limit]}……"
+
+
+def _fallback_patient_appeal(record: dict[str, Any], present_history: str) -> str:
+    """在模型返回空主诉时，用已有资料生成最小有效主诉."""
+    for value in (
+        record.get("doc_ass_stu_appeal"),
+        record.get("patient_appeal"),
+        present_history,
+        record.get("diagnosis_illness"),
+        record.get("diagnosis_disease"),
+        record.get("diagnosis_sickness"),
+    ):
+        if _has_effective_history_text(value):
+            return _fallback_history_excerpt(value, limit=40)
+    return "本次就诊主要问题待结合资料明确"
+
+
+def _fallback_present_history(
+    record: dict[str, Any],
+    histories: Mapping[str, str],
+    inspection_description: str,
+    tongue_face_description: str,
+) -> str:
+    """在模型返回空现病史时，基于输入证据保守补全."""
+    original_history = _present_history(record)
+    if _has_effective_history_text(original_history):
+        return _replace_inspection_report_symbols(_fallback_history_excerpt(original_history, limit=500))
+
+    parts = []
+    chief = _text(record.get("doc_ass_stu_appeal")) or _text(record.get("patient_appeal"))
+    if chief:
+        parts.append(f"本次就诊主要问题为{_fallback_history_excerpt(chief, limit=80)}。")
+    for label, field in (
+        ("既往史", "old_medical_history"),
+        ("过敏史", "allergic_history"),
+        ("个人史", "personal_history"),
+        ("特殊时期", "special_history"),
+        ("家族史", "family_history"),
+    ):
+        value = histories.get(field, "")
+        if _has_effective_history_text(value):
+            parts.append(f"{label}：{_fallback_history_excerpt(value, limit=120)}。")
+    if inspection_description and inspection_description != "未见有效检查报告信息。":
+        parts.append(f"本次检查资料：{_replace_inspection_report_symbols(inspection_description)}")
+    if tongue_face_description and tongue_face_description != "未见有效舌面患处信息。":
+        parts.append(tongue_face_description)
+    if not parts:
+        parts.append("现有资料未提供明确现病史细节。")
+    return _replace_inspection_report_symbols("".join(parts))
 
 
 def _diagnosis_present_history(record: dict[str, Any]) -> str:
@@ -1312,8 +1373,9 @@ class MedicalRecordAgents:
             self.history_agent,
             HumanMessage(
                 content=(
-                    f"患者主诉（doc_ass_stu_appeal）：{_chief_complaint(record)}\n"
-                    f"本次现病史：{_latest_present_history(record)}\n"
+                    f"医生撰写主诉 doc_ass_stu_appeal：{_text(record.get('doc_ass_stu_appeal')) or '未记录'}\n"
+                    f"患者主诉 patient_appeal：{_text(record.get('patient_appeal')) or '未记录'}\n"
+                    f"原始本次现病史 new_medical_history：{_present_history(record) or '未记录'}\n"
                     f"原始五史：{_json_for_prompt(histories)}\n"
                     f"检查报告图片分析：\n{inspection_description}\n"
                     f"舌面患处图片分析：\n{tongue_face_description}"
@@ -1329,6 +1391,15 @@ class MedicalRecordAgents:
         record["ai_new_medical_history"] = _replace_inspection_report_symbols(
             _clean_generated_text(values.get("new_medical_history"))
         )
+        if not _has_effective_history_text(record["ai_patient_appeal"]):
+            record["ai_patient_appeal"] = _fallback_patient_appeal(record, record["ai_new_medical_history"])
+        if not _has_effective_history_text(record["ai_new_medical_history"]):
+            record["ai_new_medical_history"] = _fallback_present_history(
+                record,
+                histories,
+                inspection_description,
+                tongue_face_description,
+            )
         record["ai_complaint_history_consistent"] = values.get("complaint_history_consistent")
         record["ai_complaint_history_issues"] = values.get("consistency_issues") or []
         for field in HISTORY_FIELDS:
@@ -1910,6 +1981,157 @@ def count_planned_records(
     return attempted
 
 
+def _is_missing_history_reprocess_candidate(record: Mapping[str, Any]) -> bool:
+    missing_complaint = (
+        not _has_effective_history_text(record.get("doc_ass_stu_appeal"))
+        and not _has_effective_history_text(record.get("ai_patient_appeal"))
+    )
+    missing_present_history = (
+        not _has_effective_history_text(record.get("new_medical_history"))
+        and not _has_effective_history_text(record.get("ai_new_medical_history"))
+    )
+    return missing_complaint or missing_present_history
+
+
+def _prepare_reprocess_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    prepared = dict(record)
+    for field in (
+        "ai_processing_errors",
+        "ai_processing_complete",
+        "ai_processing_filtered",
+        "ai_filter_reason",
+        "ai_record_identity",
+        "ai_processing_version",
+    ):
+        prepared.pop(field, None)
+    return prepared
+
+
+def _iter_jsonl_records(path: Path) -> Iterator[dict[str, Any]]:
+    if not path.is_file():
+        return
+    with path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                logger.warning(f"忽略无法解析的 JSONL 行: {path}:{line_number}: {error}")
+                continue
+            if not isinstance(record, dict):
+                logger.warning(f"忽略非 JSON 对象行: {path}:{line_number}")
+                continue
+            yield record
+
+
+def _candidate_key(record: Mapping[str, Any], fallback: int) -> str:
+    return _text(record.get("order_sn")) or _record_identity(dict(record), fallback)
+
+
+def select_reprocess_records(
+    output_dir: Path,
+    doctor_ids: set[str],
+    *,
+    include_failures: bool,
+    include_missing_histories: bool,
+    limit: int = 0,
+) -> list[dict[str, Any]]:
+    """选择历史失败记录，以及成功文件中主诉/现病史仍缺失的记录."""
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    attempted_by_doctor: Counter[str] = Counter()
+
+    def maybe_add(record: Mapping[str, Any], index: int) -> None:
+        record_dict = dict(record)
+        if not _doctor_matches(record_dict, doctor_ids):
+            return
+        doctor_id = _text(record.get("doctor_id"))
+        if _selected_doctor_quota_reached(doctor_id, doctor_ids, attempted_by_doctor, limit):
+            return
+        if not doctor_ids and limit and len(selected) >= limit:
+            return
+        key = _candidate_key(record, index)
+        if key in seen:
+            return
+        seen.add(key)
+        if doctor_id:
+            attempted_by_doctor[doctor_id] += 1
+        selected.append(_prepare_reprocess_record(record))
+
+    index = 0
+    if include_failures:
+        for path in sorted(output_dir.rglob(FAILURE_FILE_NAME)):
+            for record in _iter_jsonl_records(path):
+                index += 1
+                maybe_add(record, index)
+
+    if include_missing_histories:
+        for path in sorted(output_dir.rglob(DOCTOR_RECORD_FILE_NAME)):
+            for record in _iter_jsonl_records(path):
+                index += 1
+                if _is_missing_history_reprocess_candidate(record):
+                    maybe_add(record, index)
+
+    return selected
+
+
+def count_patient_visits_in_records(records: Iterable[Mapping[str, Any]], doctor_ids: set[str]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for record in records:
+        record_dict = dict(record)
+        if not _doctor_matches(record_dict, doctor_ids):
+            continue
+        patient_key = _patient_key(record_dict)
+        if patient_key:
+            counts[patient_key] += 1
+    return counts
+
+
+def _replace_jsonl_records_by_order_sn(path: Path, replacements: list[dict[str, Any]]) -> None:
+    if not replacements:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    replacement_by_key = {
+        _text(record.get("order_sn")) or _record_identity(record): record
+        for record in replacements
+    }
+    written_keys: set[str] = set()
+    merged: list[dict[str, Any]] = []
+    if path.is_file():
+        for index, record in enumerate(_iter_jsonl_records(path), 1):
+            key = _text(record.get("order_sn")) or _record_identity(record, index)
+            if key in replacement_by_key:
+                merged.append(replacement_by_key[key])
+                written_keys.add(key)
+            else:
+                merged.append(record)
+    for key, record in replacement_by_key.items():
+        if key not in written_keys:
+            merged.append(record)
+
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        for record in merged:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    temporary.replace(path)
+
+
+def _remove_jsonl_records_by_order_sn(path: Path, order_sns: set[str]) -> None:
+    if not order_sns or not path.is_file():
+        return
+    kept = [
+        record
+        for record in _iter_jsonl_records(path)
+        if _text(record.get("order_sn")) not in order_sns
+    ]
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        for record in kept:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    temporary.replace(path)
+
+
 def _format_duration(seconds: float | None) -> str:
     if seconds is None:
         return "--"
@@ -2129,6 +2351,20 @@ async def _process_record_batch(
 async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     doctor_ids = set(args.doctor_id or [])
+    reprocess_selected = bool(
+        getattr(args, "reprocess_failures", False) or getattr(args, "reprocess_missing_histories", False)
+    )
+    source_records = (
+        select_reprocess_records(
+            args.output_dir,
+            doctor_ids,
+            include_failures=bool(getattr(args, "reprocess_failures", False)),
+            include_missing_histories=bool(getattr(args, "reprocess_missing_histories", False)),
+            limit=args.limit,
+        )
+        if reprocess_selected
+        else None
+    )
 
     text_model = build_model(
         args.model,
@@ -2178,17 +2414,25 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         filter_path=args.output_dir / FILTER_FILE_NAME,
         stage_timeout=getattr(args, "timeout", 120.0),
     )
-    patient_visit_counts = count_patient_visits(args.input, doctor_ids)
-    if args.reprocess:
+    patient_visit_counts = (
+        count_patient_visits_in_records(source_records, doctor_ids)
+        if source_records is not None
+        else count_patient_visits(args.input, doctor_ids)
+    )
+    if args.reprocess or reprocess_selected:
         processed_ids, processed_order_sns = set(), set()
     else:
         processed_ids, processed_order_sns = load_processed_record_keys(args.output_dir)
-    planned_total = count_planned_records(
-        args.input,
-        doctor_ids,
-        args.limit,
-        processed_ids,
-        processed_order_sns,
+    planned_total = (
+        len(source_records)
+        if source_records is not None
+        else count_planned_records(
+            args.input,
+            doctor_ids,
+            args.limit,
+            processed_ids,
+            processed_order_sns,
+        )
     )
     succeeded = 0
     failed = 0
@@ -2200,6 +2444,8 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     attempted_by_doctor: Counter[str] = Counter()
     output_files: dict[Path, TextIO] = {}
     failure_files: dict[Path, TextIO] = {}
+    replacement_records: dict[Path, list[dict[str, Any]]] = {}
+    successful_reprocess_order_sns: dict[Path, set[str]] = {}
     previous_diagnoses_by_patient: dict[str, dict[str, str]] = {}
     batch_size = max(1, int(getattr(args, "batch_size", 8)))
     record_timeout = max(0.0, float(getattr(args, "record_timeout", 0.0)))
@@ -2276,10 +2522,16 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 enriched["ai_processing_complete"] = True
                 enriched["ai_processing_version"] = "2026-07-28"
                 output_path = _doctor_output_path(args.output_dir, enriched)
-                if output_path not in output_files:
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    output_files[output_path] = stack.enter_context(output_path.open("a", encoding="utf-8"))
-                _write_jsonl(output_files[output_path], enriched)
+                if reprocess_selected:
+                    replacement_records.setdefault(output_path, []).append(enriched)
+                    if order_sn:
+                        failure_path = _doctor_failure_path(args.output_dir, enriched)
+                        successful_reprocess_order_sns.setdefault(failure_path, set()).add(order_sn)
+                else:
+                    if output_path not in output_files:
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        output_files[output_path] = stack.enter_context(output_path.open("a", encoding="utf-8"))
+                    _write_jsonl(output_files[output_path], enriched)
                 processed_ids.add(identity)
                 if order_sn:
                     processed_order_sns.add(order_sn)
@@ -2309,7 +2561,8 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
             if first_failure is not None and args.fail_fast:
                 raise first_failure
 
-        for index, record in enumerate(iter_records(args.input), 1):
+        records_iterable = source_records if source_records is not None else iter_records(args.input)
+        for index, record in enumerate(records_iterable, 1):
             if not _doctor_matches(record, doctor_ids):
                 continue
             doctor_id = _text(record.get("doctor_id"))
@@ -2355,6 +2608,10 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
             if len(pending_batch) >= batch_size:
                 await flush_batch()
         await flush_batch()
+        for path, records in replacement_records.items():
+            _replace_jsonl_records_by_order_sn(path, records)
+        for path, order_sns in successful_reprocess_order_sns.items():
+            _remove_jsonl_records_by_order_sn(path, order_sns)
         if planned_total and completed != last_progress_completed:
             logger.info(
                 _progress_log_message(
@@ -2514,6 +2771,19 @@ def parse_args() -> argparse.Namespace:
         help="兼容旧参数；等同于 --no-thinking",
     )
     parser.add_argument("--reprocess", action="store_true", help="忽略已有成功记录并重新处理")
+    parser.add_argument(
+        "--reprocess-failures",
+        action="store_true",
+        help="重新处理输出目录中的失败 JSONL 记录",
+    )
+    parser.add_argument(
+        "--reprocess-missing-histories",
+        action="store_true",
+        help=(
+            "重新处理成功结果中 doc_ass_stu_appeal/ai_patient_appeal 或 "
+            "new_medical_history/ai_new_medical_history 同时为空的记录"
+        ),
+    )
     parser.add_argument("--fail-fast", action="store_true", help="任一病历失败时立即退出")
     parser.add_argument("--use-rag", type=bool, default=False, help="是否使用病因提取中医知识库")
     return parser.parse_args()

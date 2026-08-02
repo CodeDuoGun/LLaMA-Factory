@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from medical.data_utils.ai_medical_records import AIMedicalRecordRepository
+from medical.data_utils.ai_medical_records import DEFAULT_TABLE_NAME, AIMedicalRecordRepository
 from medical.data_utils.db_manager import db_manager
 
 
@@ -30,11 +30,15 @@ DEFAULT_INPUT = PROJECT_ROOT / "medical/processed_data/doctor_43_朱子奇/medic
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数."""
     parser = argparse.ArgumentParser(description="AI 清洗病历批量写入和检索")
+    parser.add_argument("--table-name", default=DEFAULT_TABLE_NAME, help="AI 清洗后病历表名")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    import_parser = subparsers.add_parser("import", help="创建表并批量写入 JSONL")
+    import_parser = subparsers.add_parser("import", help="创建表并批量写入 JSONL，已存在 order_sn 会跳过")
     import_parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     import_parser.add_argument("--batch-size", type=int, default=100)
+
+    clear_parser = subparsers.add_parser("clear", help="清空数据表")
+    clear_parser.add_argument("--yes", action="store_true", help="确认清空整张表")
 
     patient_parser = subparsers.add_parser("patient", help="按患者 ID 查询")
     patient_parser.add_argument("patient_id", type=int)
@@ -56,11 +60,19 @@ def _print_json(value: Any) -> None:
 def main() -> None:
     """运行导入或查询命令."""
     args = build_parser().parse_args()
-    repository = AIMedicalRecordRepository(db_manager)
+    repository = AIMedicalRecordRepository(
+        db_manager,
+        table_name=args.table_name,
+    )
 
     if args.command == "import":
         count = repository.import_jsonl(args.input, batch_size=args.batch_size)
-        print(f"已写入或更新 {count} 条 AI 清洗病历")
+        print(f"已新增 {count} 条 AI 清洗病历；已存在 order_sn 的记录已跳过；数据表: {repository.table.name}")
+    elif args.command == "clear":
+        if not args.yes:
+            raise SystemExit("清空整张表需要显式添加 --yes")
+        count = repository.clear()
+        print(f"已清空数据表 {repository.table.name}，删除 {count} 行")
     elif args.command == "patient":
         _print_json(repository.get_by_patient_id(args.patient_id, limit=args.limit, offset=args.offset))
     elif args.command == "inquiry":

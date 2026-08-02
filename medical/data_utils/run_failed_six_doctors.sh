@@ -19,11 +19,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 INPUT_DIR="${REPO_ROOT}/medical/data/202301_online"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/medical/processed_data}"
-LOG_DIR="${LOG_DIR:-${OUTPUT_DIR}/logs/six_doctors}"
-LIMIT_PER_DOCTOR="${LIMIT_PER_DOCTOR:-4000}"
+LOG_DIR="${LOG_DIR:-${OUTPUT_DIR}/logs/failed_six_doctors}"
+LIMIT_PER_DOCTOR="${LIMIT_PER_DOCTOR:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 RECORD_TIMEOUT="${RECORD_TIMEOUT:-0}"
-PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
+PROGRESS_EVERY="${PROGRESS_EVERY:-5}"
 CONDA_BIN="${CONDA_BIN:-$(command -v conda)}"
 CONDA_ENV="${CONDA_ENV:-${CONDA_DEFAULT_ENV:-llama_factory}}"
 AGENT_SCRIPT="${REPO_ROOT}/medical/data_utils/medical_record_agents.py"
@@ -73,15 +73,17 @@ for doctor in "${DOCTORS[@]}"; do
       --batch-size "${BATCH_SIZE}" \
       --record-timeout "${RECORD_TIMEOUT}" \
       --progress-every "${PROGRESS_EVERY}" \
+      --reprocess-failures \
+      --reprocess-missing-histories \
       > "${log_path}" 2>&1 &
 
   pid=$!
   printf "%s\t%s\t%s\t%s\n" "${pid}" "${doctor_id}" "${doctor_name}" "${log_path}" >> "${PID_FILE}"
-  echo "[STARTED] pid=${pid} doctor=${doctor_id}/${doctor_name} limit=${LIMIT_PER_DOCTOR} log=${log_path}"
+  echo "[STARTED] pid=${pid} doctor=${doctor_id}/${doctor_name} reprocess_failed_and_missing log=${log_path}"
 done
 
 echo
-echo "6 个进程已启动。PID 文件: ${PID_FILE}"
+echo "6 个失败/缺失重处理进程已启动。PID 文件: ${PID_FILE}"
 echo "查看进程: awk '{print \$1}' '${PID_FILE}' | xargs ps -p"
 echo "查看日志: tail -f '${LOG_DIR}'/*.log"
 echo "查看进度: tail -f '${LOG_DIR}'/*.log | grep --line-buffered '\\[PROGRESS\\]'"
