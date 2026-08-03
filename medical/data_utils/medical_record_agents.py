@@ -38,6 +38,7 @@ import fcntl
 import hashlib
 import inspect
 import json
+import math
 import mimetypes
 import os
 import re
@@ -696,6 +697,68 @@ def format_inspection_result_text(result: InspectionResult | Mapping[str, Any] |
     if summary:
         descriptions.append(f"现病史检查证据摘要：{summary}。")
     return "\n".join(descriptions) or "未见有效检查报告信息。"
+
+
+def _format_prescription_dose(item: Mapping[str, Any]) -> str:
+    """按处方分析口径计算并格式化单味药剂量."""
+    try:
+        dose = float(item["spec_number"]) * float(item["drug_num"])
+    except (KeyError, TypeError, ValueError):
+        return ""
+    if not math.isfinite(dose):
+        return ""
+    dose_text = str(int(dose)) if dose.is_integer() else f"{dose:g}"
+    return f"{dose_text}{_text(item.get('unit_name')) or 'g'}"
+
+
+def format_prescription_text(prescriptions: Any) -> str:
+    """将 ``ps`` 字段转换为包含处方类型、药物剂量及用法医嘱的详情文本."""
+    if not isinstance(prescriptions, list):
+        return "未见有效处方信息。"
+
+    descriptions = []
+    for prescription in prescriptions:
+        if not isinstance(prescription, Mapping):
+            continue
+
+        drugs = []
+        prescription_items = prescription.get("prescription_items")
+        drug_list = prescription_items.get("drugList") if isinstance(prescription_items, Mapping) else []
+        for item in drug_list or []:
+            if not isinstance(item, Mapping):
+                continue
+            name = _text(item.get("show_name") or item.get("drug_name") or item.get("sub_drug_name"))
+            drug_id = _text(item.get("drug_id"))
+            if not name and not drug_id:
+                continue
+            dose = _format_prescription_dose(item)
+            decoction = _text(item.get("decoction_name"))
+            drug_text = name or f"药品ID {drug_id}"
+            if dose:
+                drug_text += dose
+            if decoction:
+                drug_text += f"（{decoction}）"
+            drugs.append(drug_text)
+
+        details = []
+        for label, value in (
+            ("用法", prescription.get("usage_type")),
+            ("加工类型", prescription.get("drug_process_name")),
+        ):
+            if text := _text(value):
+                details.append(f"{label}：{text}")
+        if drugs:
+            details.append(f"药物（{len(drugs)}味）：{'、'.join(drugs)}")
+        for label, value in (
+            ("用法用量", prescription.get("usage_desc")),
+            ("医嘱", prescription.get("doctor_advice")),
+        ):
+            if text := _text(value):
+                details.append(f"{label}：{text}")
+        if details:
+            descriptions.append(f"处方{len(descriptions) + 1}：" + "；".join(details) + "。")
+
+    return "\n".join(descriptions) or "未见有效处方信息。"
 
 
 def _load_prompt(name: str) -> str:
@@ -1677,6 +1740,7 @@ class MedicalRecordAgents:
         illness_knowledge = self.build_illness_knowledge(diagnoses) if use_rag else "无"
         inspection_description = format_inspection_result_text(record.get("ai_inspection_report_img"))
         tongue_face_description = format_tongue_face_result_text(record.get("ai_tongue_face_img"))
+        prescription_description = format_prescription_text(record.get("ps"))
         system_prompt = _load_prompt("extract_prompt.txt")
         result = await _invoke_structured_agent(
             self.extract_agent,
@@ -1688,6 +1752,7 @@ class MedicalRecordAgents:
                     f"诊断上下文：{_json_for_prompt(diagnoses)}\n"
                     f"检查报告图片分析：\n{inspection_description}\n"
                     f"舌面患处图片分析：\n{tongue_face_description}\n"
+                    f"处方详情：\n{prescription_description}\n"
                     f"疾病的知识库信息 {illness_knowledge}\n"
                     f"严格根据知识库知识，提取患者在中医层面的病因、病机、病期、病位、病程、临床症状。若知识库无知识，根据患者病史信息完成上述内容提取。必须返回合法的 JSON 对象，不要输出 Markdown，不要输出额外解释"
                 )

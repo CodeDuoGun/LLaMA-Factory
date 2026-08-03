@@ -889,6 +889,61 @@ def test_format_tongue_face_result_text_uses_natural_language_sections() -> None
     )
 
 
+def test_format_prescription_text_describes_multiple_prescriptions() -> None:
+    prescriptions = [
+        {
+            "usage_type": "内服",
+            "drug_process_name": "颗粒",
+            "usage_desc": "共7剂，每日1剂，每剂分2次",
+            "doctor_advice": "饭后半小时服",
+            "prescription_items": {
+                "drugList": [
+                    {
+                        "drug_id": 371,
+                        "show_name": "北沙参",
+                        "spec_number": "1",
+                        "drug_num": "6",
+                        "unit_name": "g",
+                    },
+                    {
+                        "drug_id": 463,
+                        "drug_name": "薄荷",
+                        "spec_number": "0.5",
+                        "drug_num": "6",
+                        "unit_name": "g",
+                        "decoction_name": "后下",
+                    },
+                ]
+            },
+        },
+        {
+            "usage_type": "外用",
+            "drug_process_name": "饮片",
+            "prescription_items": {
+                "drugList": [
+                    {
+                        "drug_id": 216,
+                        "show_name": "苦参",
+                        "spec_number": "无效",
+                        "drug_num": "10",
+                    }
+                ]
+            },
+        },
+    ]
+
+    assert medical_record_agents.format_prescription_text(prescriptions) == (
+        "处方1：用法：内服；加工类型：颗粒；药物（2味）：北沙参6g、薄荷3g（后下）；"
+        "用法用量：共7剂，每日1剂，每剂分2次；医嘱：饭后半小时服。\n"
+        "处方2：用法：外用；加工类型：饮片；药物（1味）：苦参。"
+    )
+
+
+def test_format_prescription_text_handles_empty_or_invalid_ps() -> None:
+    assert medical_record_agents.format_prescription_text(None) == "未见有效处方信息。"
+    assert medical_record_agents.format_prescription_text([None, {}]) == "未见有效处方信息。"
+
+
 def test_clean_histories_fills_missing_complaint_and_history_from_context() -> None:
     agents = object.__new__(medical_record_agents.MedicalRecordAgents)
     agents.reviewer_agent = None
