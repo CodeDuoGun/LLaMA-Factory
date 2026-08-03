@@ -1029,6 +1029,14 @@ def test_clean_histories_keeps_model_corrected_non_empty_complaint_and_history()
     assert record["ai_new_medical_history"].startswith("患者反复胃脘胀痛1年余")
 
 
+def test_history_cleaning_prompt_prefers_relative_report_time() -> None:
+    prompt = medical_record_agents._load_prompt("clinical_record_cleaning_prompt.txt")
+
+    assert "必须优先使用相对时间作为现病史中的时间状语" in prompt
+    assert "半月前血常规检查，见轻度贫血" in prompt
+    assert "若未提供相对时间，必须使用报告日期" in prompt
+
+
 def test_group_classified_images_routes_categories_and_keeps_other_separate() -> None:
     images = ["tongue.jpg", "face.jpg", "lesion.jpg", "report.jpg", "landscape.jpg"]
     result = ImageClassificationResult(
