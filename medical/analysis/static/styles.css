@@ -367,6 +367,15 @@ tbody tr:hover { background: rgb(29 107 80 / 5%); }
 .ai-readable-section strong { color: var(--green); font-size: 11px; }
 .ai-readable-section p, .inspection-readable-preview p { margin: 0; color: var(--ink); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .inspection-readable-preview p + p { border-top: 1px dashed rgb(29 107 80 / 18%); padding-top: 8px; }
+.annotation-json-preview { gap: 10px; }
+.annotation-json-card { display: grid; gap: 8px; border-top: 1px dashed rgb(29 107 80 / 18%); padding-top: 10px; }
+.annotation-json-card:first-child { border-top: 0; padding-top: 0; }
+.annotation-json-card > strong { color: var(--green); font-size: 11px; }
+.annotation-key-grid-card { gap: 10px; }
+.annotation-key-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 10px; }
+.annotation-json-value-editor { display: grid; grid-template-columns: 78px minmax(0, 1fr); align-items: center; gap: 7px; border: 1px solid rgb(29 107 80 / 12%); border-radius: 9px; padding: 7px; background: rgb(255 253 247 / 60%); }
+.annotation-json-value-editor span { color: var(--muted); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
+.annotation-json-value-editor textarea { min-height: 34px; max-height: 150px; padding: 7px 9px; font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; }
 .structured-json-editor { border-radius: 9px; }
 .structured-json-editor summary { width: max-content; color: var(--muted); cursor: pointer; font-size: 10px; user-select: none; }
 .structured-json-editor summary:hover { color: var(--green); }
@@ -377,6 +386,7 @@ tbody tr:hover { background: rgb(29 107 80 / 5%); }
 .annotation-ai textarea:hover { border-color: rgb(29 107 80 / 48%); }
 .annotation-ai textarea:focus-visible { outline: 0; border-color: var(--green); box-shadow: 0 0 0 3px rgb(29 107 80 / 13%); background: white; }
 .annotation-ai textarea::placeholder { color: #98a19c; font-family: Inter, "PingFang SC", sans-serif; }
+.annotation-ai .annotation-json-value-editor textarea { font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; }
 .annotation-save-bar { position: sticky; bottom: 0; display: flex; justify-content: flex-end; align-items: center; gap: 14px; border-top: 1px solid var(--line); padding: 14px 20px; background: rgb(255 253 247 / 94%); backdrop-filter: blur(10px); }
 .annotation-save-message { color: var(--muted); font-size: 11px; }
 .annotation-save-message.is-error { color: var(--red); }
@@ -416,6 +426,7 @@ footer { border-top: 1px solid var(--line); padding: 22px 0 34px; color: var(--m
   .header-context { width: 100%; justify-content: space-between; align-items: end; }
   .annotation-field-row, .annotation-legend { grid-template-columns: 1fr; }
   .annotation-ai { border-top: 1px dashed var(--line); border-left: 0; }
+  .annotation-key-grid { grid-template-columns: 1fr; }
   .annotation-image-gallery { grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); }
   .image-preview-dialog { width: 96vw; }
   .image-preview-stage { padding-inline: 50px; }

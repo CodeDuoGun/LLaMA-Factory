@@ -830,6 +830,7 @@ def test_process_runs_current_history_and_image_pipeline_concurrently() -> None:
     agents.clean_histories = lambda record: None
     agents.complete_diagnoses = lambda record: None
     agents.extract_clinical_fields = lambda record, use_rag: None
+    agents.infer_treatment_principle = lambda record: None
 
     asyncio.run(
         asyncio.wait_for(
@@ -847,6 +848,26 @@ def test_process_runs_current_history_and_image_pipeline_concurrently() -> None:
 
     assert history_started.is_set()
     assert image_started.is_set()
+
+
+def test_process_runs_treatment_principle_after_clinical_extraction() -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.stage_timeout = 0
+    calls = []
+
+    agents.normalize_diagnoses = lambda record: None
+    agents.classify_images = lambda record: {category: [] for category in medical_record_agents.IMAGE_CATEGORIES}
+    agents.analyze_inspection_images = lambda record, images=None: None
+    agents.analyze_tongue_face_images = lambda record, images=None: None
+    agents.extract_current_visit_history = lambda record, enabled: None
+    agents.clean_histories = lambda record: None
+    agents.complete_diagnoses = lambda record: None
+    agents.extract_clinical_fields = lambda record, use_rag: calls.append("clinical_extraction")
+    agents.infer_treatment_principle = lambda record: calls.append("treatment_principle")
+
+    asyncio.run(agents.process({"new_medical_history": "腹胀"}))
+
+    assert calls == ["clinical_extraction", "treatment_principle"]
 
 
 @pytest.mark.parametrize(
@@ -1262,6 +1283,7 @@ def test_process_classifies_once_and_filters_other_images() -> None:
     agents.clean_histories = lambda record: None
     agents.complete_diagnoses = lambda record: None
     agents.extract_clinical_fields = lambda record, use_rag: None
+    agents.infer_treatment_principle = lambda record: None
 
     asyncio.run(agents.process({}, extract_current_history=False))
 

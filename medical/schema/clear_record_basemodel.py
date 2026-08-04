@@ -307,3 +307,9 @@ class ClinicalExtractionResult(BaseModel):
     disease_stage: str = Field(default="", description="病期")
     disease_course: str = Field(default="", description="病程及演变")
     key_symptoms: list[str] = Field(default_factory=list, description="关键症状和体征")
+
+
+class TreatmentPrincipleResult(BaseModel):
+    """基于病史和处方反推的治则治法."""
+
+    treatment_principle: str = Field(default="", description="治则治法")

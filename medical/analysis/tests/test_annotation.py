@@ -254,6 +254,10 @@ def test_annotation_frontend_has_patient_workflow_and_save_endpoint() -> None:
     assert "annotationOriginalContent" in script
     assert "record.original_sources" in script
     assert "annotationAiPreview" in script
+    assert "annotation-json-value-editor" in script
+    assert "syncAnnotationJsonPreviewValue" in script
+    assert "annotation-key-grid" in script
+    assert "data-annotation-json-path" in script
     assert "openAnnotationImagePreview" in script
     assert "stepAnnotationImagePreview" in script
     assert "doc_ass_stu_appeal" in script

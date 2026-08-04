@@ -83,6 +83,7 @@ from medical.schema.clear_record_basemodel import (
     HistoryCleaningResult,
     ImageClassificationResult,
     InspectionResult,
+    TreatmentPrincipleResult,
     TongueFaceResult,
 )
 
@@ -133,6 +134,12 @@ CURRENT_VISIT_HISTORY_SYSTEM_PROMPT = (
     "与本次相关的检查；纠正明确错别字，删除乱码、重复符号和无意义文本。"
     "检查报告中的异常方向符号必须转换为中文文本描述，例如 ↑、⬆️ 写作“升高”，↓、⬇️ 写作“下降”。"
     "不得新增原文没有的症状、诊断、时间或检查结果；无法确定本次段落时返回空字符串。"
+)
+TREATMENT_PRINCIPLE_SYSTEM_PROMPT = (
+    "你是中医病历治则治法反推助手。必须只根据输入的最新主诉、本次现病史、清洗后五史、"
+    "诊断上下文、结构化病机字段和处方详情，反推一条简洁的治则治法。"
+    "治则治法应与病史、诊断、病机和处方用药方向一致，不得新增方剂名、药名、检查建议或调理建议。"
+    "资料不足时返回空字符串。必须返回合法 JSON 对象。"
 )
 INVALID_HISTORY_TEXT = (
     "",
@@ -1126,6 +1133,7 @@ class MedicalRecordAgents:
         self.diagnosis_agent = self._build_diagnosis_agent(diagnosis_model or text_model)
         self.history_agent = self._build_history_agent(text_model)
         self.extract_agent = self._build_extract_agent(text_model)
+        self.treatment_principle_agent = self._build_treatment_principle_agent(text_model)
         self.reviewer_agent = None
         if enable_review:
             self.reviewer_agent = StructuredAgent(
@@ -1187,6 +1195,15 @@ class MedicalRecordAgents:
             ClinicalExtractionResult,
             system_prompt=_load_prompt("extract_prompt.txt"),
             name="clinical_extraction_agent",
+        )
+
+    @staticmethod
+    def _build_treatment_principle_agent(model: ChatOpenAI) -> Any:
+        return StructuredAgent(
+            model,
+            TreatmentPrincipleResult,
+            system_prompt=TREATMENT_PRINCIPLE_SYSTEM_PROMPT,
+            name="treatment_principle_agent",
         )
 
     @staticmethod
@@ -1627,6 +1644,45 @@ class MedicalRecordAgents:
         for field, value in values.items():
             record[f"ai_{field}"] = _clean_generated_value(value)
 
+    async def infer_treatment_principle(self, record: dict[str, Any]) -> None:
+        diagnoses = {
+            field: _text(record.get(f"ai_{field}")) or _text(record.get(field))
+            for field in DIAGNOSIS_FIELDS
+        }
+        histories = {
+            field: _text(record.get(f"ai_{field}")) if f"ai_{field}" in record else _text(record.get(field))
+            for field in HISTORY_FIELDS
+        }
+        clinical_fields = {
+            field: record.get(f"ai_{field}")
+            for field in (
+                "etiology",
+                "pathogenesis",
+                "disease_location",
+                "disease_stage",
+                "disease_course",
+                "key_symptoms",
+            )
+        }
+        result = await _invoke_structured_agent(
+            self.treatment_principle_agent,
+            HumanMessage(
+                content=(
+                    f"最新主诉：{_latest_chief_complaint(record)}\n"
+                    f"本次现病史：{_latest_present_history(record)}\n"
+                    f"清洗后五史：{_json_for_prompt(histories)}\n"
+                    f"诊断上下文：{_json_for_prompt(diagnoses)}\n"
+                    f"结构化病机字段：{_json_for_prompt(clinical_fields)}\n"
+                    f"处方详情：\n{format_prescription_text(record.get('ps'))}"
+                )
+            ),
+            TreatmentPrincipleResult,
+            reviewer_agent=self.reviewer_agent,
+            agent_name="treatment_principle_agent",
+            system_prompt=TREATMENT_PRINCIPLE_SYSTEM_PROMPT,
+        )
+        record["ai_treatment_principle"] = _clean_generated_text(result.treatment_principle)
+
     async def _run_stage(
         self,
         stage_name: str,
@@ -1664,6 +1720,7 @@ class MedicalRecordAgents:
         output = dict(record)
         # 前端保存的是富文本 HTML。先转成纯文本再参与空值过滤和后续 Agent 调用，
         # 避免标签污染提示词，也避免只有 <p><br></p> 的空病史绕过过滤。
+        # 1. 规则清洗现病史字段内容
         self.normalize_medical_history(output)
         record_id = (
             _text(record.get("order_sn"))
@@ -1675,7 +1732,7 @@ class MedicalRecordAgents:
         output["__original_diagnoses"] = _diagnosis_payload(output)
         errors = []
 
-        # 主诉、现病史和西医诊断全部缺失时，不调用任何 Agent
+        # 2. 主诉、现病史和西医诊断全部缺失时，不调用任何 Agent，过滤
         if _should_filter_record(output):
             write2filter_json(output, self.filter_path)
             output["ai_processing_filtered"] = True
@@ -1686,7 +1743,7 @@ class MedicalRecordAgents:
             logger.info(f"[STAGE FILTER] record={record_id} doctor_name={doctor_name}")
             return output
 
-        # step1：先做不依赖诊断类型的基础归一化，不额外存储 ai_normalized_*。
+        # 3. 先做不依赖诊断类型的基础归一化，不额外存储 ai_normalized_*。
         try:
             await self._run_stage(
                 "diagnosis_normalization",
@@ -1696,7 +1753,7 @@ class MedicalRecordAgents:
             )
         except Exception as exc:
             errors.append({"stage": "diagnosis_normalization", "error": f"{type(exc).__name__}: {exc}"})
-        # step2：图片分类与视觉解析管线。
+        # 4：图片分类与视觉解析管线。
         async def run_image_pipeline() -> list[dict[str, str]]:
             pipeline_errors = []
             try:
@@ -1743,7 +1800,7 @@ class MedicalRecordAgents:
                     )
             return pipeline_errors
 
-        # step3：本次复诊病史只依赖文本字段，可与整条视觉管线并发。
+        # 5：本次复诊病史只依赖文本字段，可与整条视觉管线并发。
         async def run_current_visit_history() -> list[dict[str, str]]:
             try:
                 await self._run_stage(
@@ -1763,12 +1820,12 @@ class MedicalRecordAgents:
         for pipeline_errors in pipeline_results:
             errors.extend(pipeline_errors)
 
-        # step4：等待图片和本次病史均完成后，校验主诉/现病史一致性并清洗五史。
+        # 6：等待图片和本次病史均完成后，校验主诉/现病史一致性并清洗五史。
         try:
             await self._run_stage("clinical_cleaning", record_id, doctor_name, lambda: self.clean_histories(output))
         except Exception as exc:
             errors.append({"stage": "clinical_cleaning", "error": f"{type(exc).__name__}: {exc}"})
-        # step5：用最新病历补全诊断，再提取知识库字段。
+        # 7：用最新病历补全诊断，再提取知识库字段。
         try:
             await self._run_stage(
                 "diagnosis_completion",
@@ -1785,8 +1842,20 @@ class MedicalRecordAgents:
                 doctor_name,
                 lambda: self.extract_clinical_fields(output, use_rag),
             )
+        
         except Exception as exc:
             errors.append({"stage": "clinical_extraction", "error": f"{type(exc).__name__}: {exc}"})
+
+        try:
+            await self._run_stage(
+                "treatment_principle",
+                record_id,
+                doctor_name,
+                lambda: self.infer_treatment_principle(output),
+            )
+        except Exception as exc:
+            errors.append({"stage": "treatment_principle", "error": f"{type(exc).__name__}: {exc}"})
+
         if errors:
             output["ai_processing_errors"] = errors
         else:

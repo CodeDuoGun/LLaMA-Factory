@@ -647,17 +647,139 @@ function annotationOriginalContent(record, field) {
   return `<pre>${escapeHtml(originalValue)}</pre>`;
 }
 
+const tongueFaceEditableSections = {
+  tongue: {
+    label: "舌象",
+    fields: [
+      ["舌面方向", ["tongue", "side"]],
+      ["舌质颜色", ["tongue", "tongue_body", "color"]],
+      ["舌体形态", ["tongue", "tongue_body", "shape"]],
+      ["舌态", ["tongue", "tongue_body", "posture"]],
+      ["津液", ["tongue", "tongue_body", "fluid"]],
+      ["舌面特征", ["tongue", "tongue_body", "surface"]],
+      ["苔色", ["tongue", "tongue_coat", "color"]],
+      ["苔厚薄", ["tongue", "tongue_coat", "thickness"]],
+      ["苔润燥", ["tongue", "tongue_coat", "moisture"]],
+      ["苔质", ["tongue", "tongue_coat", "texture"]],
+      ["舌苔完整度", ["tongue", "tongue_coat", "integrity"]],
+      ["苔根", ["tongue", "tongue_coat", "root"]],
+      ["舌苔分布", ["tongue", "tongue_coat", "distribution"]],
+      ["舌下络脉颜色", ["tongue", "sublingual_veins", "color"]],
+      ["舌下络脉形态", ["tongue", "sublingual_veins", "morphology"]],
+    ],
+  },
+  face: {
+    label: "面象",
+    fields: [
+      ["神态", ["face", "spirit", "level"]],
+      ["表情", ["face", "spirit", "expression"]],
+      ["目光", ["face", "spirit", "gaze"]],
+      ["面色", ["face", "complexion", "category"]],
+      ["面色表现", ["face", "complexion", "detail"]],
+      ["面色分布", ["face", "complexion", "distribution"]],
+      ["面色明暗", ["face", "complexion", "brightness"]],
+      ["面部光泽", ["face", "luster"]],
+      ["面部形态", ["face", "morphology"]],
+      ["眼部", ["face", "local_features", "eyes"]],
+      ["鼻部", ["face", "local_features", "nose"]],
+      ["口唇", ["face", "local_features", "lips"]],
+      ["牙龈", ["face", "local_features", "gums"]],
+      ["面部皮肤", ["face", "local_features", "skin"]],
+    ],
+  },
+  lesions: {
+    label: "患处",
+    fields: [
+      ["患处部位", ["lesions", "location"]],
+      ["患处形态", ["lesions", "morphology"]],
+      ["患处颜色", ["lesions", "color"]],
+      ["患处边界", ["lesions", "boundary"]],
+      ["患处范围", ["lesions", "extent"]],
+      ["渗出", ["lesions", "exudation"]],
+      ["鳞屑", ["lesions", "scaling"]],
+      ["糜烂溃疡结痂", ["lesions", "ulceration"]],
+    ],
+  },
+};
+
+function annotationJsonPathAttribute(path) {
+  return escapeHtml(JSON.stringify(path));
+}
+
+function annotationPathValue(data, path) {
+  return path.reduce((node, key) => node == null ? undefined : node[key], data);
+}
+
+function annotationEditableValue(value) {
+  if (Array.isArray(value)) return value.join("、");
+  if (value == null) return "";
+  return String(value);
+}
+
+function annotationEditableRows(value) {
+  const lines = annotationEditableValue(value).split("\n");
+  const rows = lines.reduce((count, line) => count + Math.max(1, Math.ceil(line.length / 68)), 0);
+  return Math.min(5, Math.max(1, rows));
+}
+
+function annotationEditableControl(label, path, value) {
+  return `<label class="annotation-json-value-editor">
+    <span>${escapeHtml(label)}</span>
+    <textarea data-annotation-json-path="${annotationJsonPathAttribute(path)}" data-annotation-json-array="${Array.isArray(value) ? "true" : "false"}" rows="${annotationEditableRows(value)}">${escapeHtml(annotationEditableValue(value))}</textarea>
+  </label>`;
+}
+
+function annotationTongueFaceSection(section, value) {
+  const controls = section.fields.map(([label, path]) => {
+    const currentValue = annotationPathValue(value, path);
+    if (currentValue == null || currentValue === "" || (Array.isArray(currentValue) && !currentValue.length)) return "";
+    return annotationEditableControl(label, path, currentValue);
+  }).filter(Boolean).join("");
+  if (!controls) return "";
+  return `<section class="annotation-json-card annotation-key-grid-card">
+    <strong>${escapeHtml(section.label)}</strong>
+    <div class="annotation-key-grid">${controls}</div>
+  </section>`;
+}
+
+function annotationInspectionEditablePreview(value) {
+  if (!value || typeof value !== "object") return "";
+  const reports = Array.isArray(value.reports) ? value.reports : [];
+  let validIndex = 0;
+  const cards = reports.map((report, reportIndex) => {
+    if (!report || typeof report !== "object") return "";
+    const isValid = report.is_valid_report ?? report["是否有效检查报告"];
+    if (isValid !== true) return "";
+    validIndex += 1;
+    const reportTimeKey = ["report_time", "报告时间", "report_date", "报告日期", "relative_to_visit_time", "相对就诊时间"].find((key) => key in report) || "report_date";
+    const reportNameKey = "report_name" in report ? "report_name" : "报告名称";
+    const abnormalKey = "abnormal_indicators" in report ? "abnormal_indicators" : "异常指标";
+    return `<section class="annotation-json-card">
+      <strong>有效检查报告 ${validIndex}</strong>
+      ${annotationEditableControl("报告时间", ["reports", reportIndex, reportTimeKey], report[reportTimeKey])}
+      ${annotationEditableControl("报告名称", ["reports", reportIndex, reportNameKey], report[reportNameKey])}
+      ${annotationEditableControl("报告异常指标", ["reports", reportIndex, abnormalKey], report[abnormalKey])}
+    </section>`;
+  }).filter(Boolean);
+  return cards.length ? `<div class="ai-readable-preview annotation-json-preview">${cards.join("")}</div>` : "";
+}
+
+function annotationTongueFaceEditablePreview(value) {
+  if (!value || typeof value !== "object") return "";
+  const sections = Object.entries(tongueFaceEditableSections)
+    .map(([, section]) => annotationTongueFaceSection(section, value))
+    .filter(Boolean);
+  return sections.length ? `<div class="ai-readable-preview annotation-json-preview">${sections.join("")}</div>` : "";
+}
+
 function annotationAiPreview(record, field, hasAiValue) {
   if (!hasAiValue) return "";
-  const display = record.ai_display?.[field.name];
-  if (field.name === "ai_tongue_face_img" && display && typeof display === "object") {
-    const labels = {tongue: "舌象", face: "面象", lesions: "患处"};
-    const sections = Object.entries(labels).filter(([name]) => display[name]).map(([name, label]) => `
-      <div class="ai-readable-section"><strong>${label}</strong><p>${escapeHtml(display[name])}</p></div>`).join("");
-    return sections ? `<div class="ai-readable-preview">${sections}</div>` : "";
+  const value = record.ai?.[field.name];
+  if (field.name === "ai_tongue_face_img") {
+    return annotationTongueFaceEditablePreview(value);
   }
-  if (field.name === "ai_inspection_report_img" && typeof display === "string" && display.trim()) {
-    return `<div class="ai-readable-preview inspection-readable-preview">${display.split("\n").filter(Boolean).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}</div>`;
+  if (field.name === "ai_inspection_report_img") {
+    return annotationInspectionEditablePreview(value);
   }
   return "";
 }
@@ -737,9 +859,41 @@ async function openAnnotationPatient(patientKey, preservePatientList = false) {
       record.querySelector(".annotation-save-message").textContent = "有未保存修改";
     });
   });
+  $("#annotation-records").querySelectorAll("[data-annotation-json-path]").forEach((input) => {
+    input.addEventListener("input", () => syncAnnotationJsonPreviewValue(input));
+  });
   $("#annotation-records").querySelectorAll("[data-preview-src]").forEach((button) => {
     button.addEventListener("click", () => openAnnotationImagePreview(button));
   });
+}
+
+function setAnnotationJsonPath(data, path, value) {
+  let node = data;
+  path.slice(0, -1).forEach((key) => {
+    node = node[key];
+  });
+  node[path[path.length - 1]] = value;
+}
+
+function syncAnnotationJsonPreviewValue(input) {
+  const container = input.closest(".annotation-ai");
+  const jsonTextarea = container.querySelector("[data-annotation-field]");
+  const message = input.closest(".annotation-record").querySelector(".annotation-save-message");
+  let data;
+  try {
+    data = jsonTextarea.value.trim() ? JSON.parse(jsonTextarea.value) : {};
+  } catch (_) {
+    message.textContent = "结构化 JSON 不是合法 JSON，暂不能联动";
+    message.className = "annotation-save-message is-error";
+    return;
+  }
+  const path = JSON.parse(input.dataset.annotationJsonPath);
+  const value = input.dataset.annotationJsonArray === "true"
+    ? input.value.split(/[、,\n]/).map((item) => item.trim()).filter(Boolean)
+    : input.value.trim();
+  setAnnotationJsonPath(data, path, value);
+  jsonTextarea.value = JSON.stringify(data, null, 2);
+  jsonTextarea.dispatchEvent(new Event("input", {bubbles: true}));
 }
 
 function openAnnotationImagePreview(button) {
