@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""批量写入及检索 AI 清洗病历的命令行脚本."""
+"""批量写入及检索 AI 病例标注记录的命令行脚本."""
 
 import argparse
 import json
@@ -29,11 +29,14 @@ DEFAULT_INPUT = PROJECT_ROOT / "medical/processed_data/doctor_43_朱子奇/medic
 
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数."""
-    parser = argparse.ArgumentParser(description="AI 清洗病历批量写入和检索")
-    parser.add_argument("--table-name", default=DEFAULT_TABLE_NAME, help="AI 清洗后病历表名")
+    parser = argparse.ArgumentParser(description="AI 病例标注记录批量写入和检索")
+    parser.add_argument("--table-name", default=DEFAULT_TABLE_NAME, help="AI 病例标注记录表名")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    import_parser = subparsers.add_parser("import", help="创建表并批量写入 JSONL，已存在 order_sn 会跳过")
+    import_parser = subparsers.add_parser(
+        "import",
+        help="创建表并批量写入 JSONL，已存在 order_sn + AI 版本会跳过",
+    )
     import_parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     import_parser.add_argument("--batch-size", type=int, default=100)
 
@@ -48,8 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     inquiry_parser = subparsers.add_parser("inquiry", help="按问诊单 ID 查询")
     inquiry_parser.add_argument("inquiry_id")
 
-    record_parser = subparsers.add_parser("record", help="按病历 ID 查询")
-    record_parser.add_argument("medical_record_id", type=int)
+    record_parser = subparsers.add_parser("record", help="按来源病历 ID 查询")
+    record_parser.add_argument("source_record_id", type=int)
     return parser
 
 
@@ -67,7 +70,10 @@ def main() -> None:
 
     if args.command == "import":
         count = repository.import_jsonl(args.input, batch_size=args.batch_size)
-        print(f"已新增 {count} 条 AI 清洗病历；已存在 order_sn 的记录已跳过；数据表: {repository.table.name}")
+        print(
+            f"已新增 {count} 条 AI 病例标注记录；"
+            f"已存在 order_sn + AI 版本的记录已跳过；数据表: {repository.table.name}"
+        )
     elif args.command == "clear":
         if not args.yes:
             raise SystemExit("清空整张表需要显式添加 --yes")
@@ -78,7 +84,7 @@ def main() -> None:
     elif args.command == "inquiry":
         _print_json(repository.get_by_inquiry_id(args.inquiry_id))
     else:
-        _print_json(repository.get_by_medical_record_id(args.medical_record_id))
+        _print_json(repository.get_by_medical_record_id(args.source_record_id))
 
 
 if __name__ == "__main__":

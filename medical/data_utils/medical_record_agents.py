@@ -74,6 +74,7 @@ from medical.data_utils.medical_record_formatters import (
     format_inspection_result_text,
     format_tongue_face_result_text,
 )
+from medical.data_utils.ai_medical_records import AI_FIELDS, DEFAULT_AI_OPERATOR, record_to_row
 from dotenv import load_dotenv
 from medical.schema.clear_record_basemodel import (
     AgentReviewResult,
@@ -99,6 +100,9 @@ from medical.data_utils.normalize_ai_diagnosis_labels import normalize_ai_diagno
 
 DEFAULT_INPUT = Path("medical/data/202301_online")
 DEFAULT_OUTPUT_DIR = Path("medical/processed_data")
+MYSQL_DATABASE_URL = _env("MEDICAL_AGENT_MYSQL_DATABASE_URL") or _env("DATABASE_URL")
+MYSQL_RECORD_TABLE = "mlops_annotation_medical_record"
+MYSQL_ID_COLUMN = "id"
 DOCTOR_RECORD_FILE_NAME = "medical_records_ai.jsonl"
 FAILURE_FILE_NAME = "medical_record_agent_failures.jsonl"
 FILTER_FILE_NAME = "filter.json"
@@ -1845,7 +1849,7 @@ class MedicalRecordAgents:
         
         except Exception as exc:
             errors.append({"stage": "clinical_extraction", "error": f"{type(exc).__name__}: {exc}"})
-
+        # TODO 治则治法，加入开关。开启病机
         try:
             await self._run_stage(
                 "treatment_principle",
@@ -2083,6 +2087,36 @@ def count_patient_visits_in_records(records: Iterable[Mapping[str, Any]], doctor
     return counts
 
 
+def count_planned_records_in_records(
+    records: Iterable[Mapping[str, Any]],
+    doctor_ids: set[str],
+    limit: int,
+    processed_ids: set[str],
+    processed_order_sns: set[str],
+) -> int:
+    attempted = 0
+    attempted_by_doctor: Counter[str] = Counter()
+    for index, record in enumerate(records, 1):
+        record_dict = dict(record)
+        if not _doctor_matches(record_dict, doctor_ids):
+            continue
+        doctor_id = _text(record_dict.get("doctor_id"))
+        if _selected_doctor_quota_reached(doctor_id, doctor_ids, attempted_by_doctor, limit):
+            if _all_selected_doctors_reached(doctor_ids, attempted_by_doctor, limit):
+                break
+            continue
+        identity = _record_identity(record_dict, index)
+        order_sn = _text(record_dict.get("order_sn"))
+        if identity in processed_ids or (order_sn and order_sn in processed_order_sns):
+            continue
+        if not doctor_ids and limit and attempted >= limit:
+            break
+        attempted += 1
+        if doctor_id:
+            attempted_by_doctor[doctor_id] += 1
+    return attempted
+
+
 def _replace_jsonl_records_by_order_sn(path: Path, replacements: list[dict[str, Any]]) -> None:
     if not replacements:
         return
@@ -2238,6 +2272,106 @@ def _write_jsonl(file: TextIO, record: dict[str, Any]) -> None:
     file.flush()
 
 
+def _mysql_row_to_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert a database row into the flat record shape consumed by agents."""
+    record_data = row.get("record_data")
+    record = dict(record_data) if isinstance(record_data, Mapping) else {}
+    for key, value in row.items():
+        if key != "record_data" and value is not None:
+            record[key] = value
+    if "id" not in record and row.get("medical_record_id") is not None:
+        record["id"] = row["medical_record_id"]
+    return record
+
+
+def _mysql_table_columns(manager: Any, table_name: str) -> set[str]:
+    return set(manager.refresh_table(table_name).c.keys())
+
+
+def _mysql_result_row(record: Mapping[str, Any], columns: set[str], id_column: str) -> dict[str, Any]:
+    """Build an output row compatible with either raw tables or ai_cleaned tables."""
+    if "record_data" in columns:
+        try:
+            row = record_to_row(record)
+        except ValueError:
+            row = {
+                "record_data": {key: value for key, value in record.items() if key != "ps" and key not in AI_FIELDS},
+                "operator": DEFAULT_AI_OPERATOR,
+                **{field_name: record.get(field_name) for field_name in AI_FIELDS},
+            }
+        row["operator"] = row.get("operator") or DEFAULT_AI_OPERATOR
+    else:
+        row = dict(record)
+    if id_column in columns and id_column not in row and record.get("id") is not None:
+        row[id_column] = record.get("id")
+    return {key: value for key, value in row.items() if key in columns}
+
+
+def _mysql_record_key(record: Mapping[str, Any], id_column: str) -> Any:
+    return record.get(id_column) or record.get("medical_record_id") or record.get("id")
+
+
+def _load_mysql_records(args: argparse.Namespace) -> list[dict[str, Any]]:
+    from medical.data_utils.db_manager import DBManager
+
+    manager = DBManager(MYSQL_DATABASE_URL or None)
+    try:
+        rows = manager.select(MYSQL_RECORD_TABLE)
+        return [_mysql_row_to_record(row) for row in rows]
+    finally:
+        manager.close()
+
+
+def _load_mysql_processed_record_keys(args: argparse.Namespace) -> tuple[set[str], set[str]]:
+    from medical.data_utils.db_manager import DBManager
+
+    manager = DBManager(MYSQL_DATABASE_URL or None)
+    try:
+        columns = _mysql_table_columns(manager, MYSQL_RECORD_TABLE)
+        id_column = MYSQL_ID_COLUMN if MYSQL_ID_COLUMN in columns else "medical_record_id"
+        selected = [name for name in ("ai_record_identity", "order_sn", id_column) if name in columns]
+        if not selected:
+            return set(), set()
+        filters = {"ai_processing_complete": True} if "ai_processing_complete" in columns else None
+        rows = manager.select(MYSQL_RECORD_TABLE, filters=filters, columns=selected)
+    finally:
+        manager.close()
+
+    processed_ids: set[str] = set()
+    processed_order_sns: set[str] = set()
+    for row in rows:
+        identity = _text(row.get("ai_record_identity"))
+        if not identity and row.get(id_column) is not None:
+            identity = str(row[id_column])
+        if identity:
+            processed_ids.add(identity)
+        order_sn = _text(row.get("order_sn"))
+        if order_sn:
+            processed_order_sns.add(order_sn)
+    return processed_ids, processed_order_sns
+
+
+def _save_mysql_record(args: argparse.Namespace, record: Mapping[str, Any]) -> None:
+    from medical.data_utils.db_manager import DBManager
+
+    manager = DBManager(MYSQL_DATABASE_URL or None)
+    try:
+        columns = _mysql_table_columns(manager, MYSQL_RECORD_TABLE)
+        id_column = MYSQL_ID_COLUMN if MYSQL_ID_COLUMN in columns else "medical_record_id"
+        row = _mysql_result_row(record, columns, id_column)
+        key = _mysql_record_key(record, id_column)
+        if key is None:
+            raise ValueError(f"无法写入 MySQL：记录缺少主键字段 {id_column}/id/medical_record_id")
+        filters = {id_column: key} if id_column in columns else None
+        if filters and manager.count(MYSQL_RECORD_TABLE, filters=filters):
+            row.pop(id_column, None)
+            manager.update(MYSQL_RECORD_TABLE, row, filters=filters)
+        else:
+            manager.insert(MYSQL_RECORD_TABLE, row)
+    finally:
+        manager.close()
+
+
 def build_model(
     model_name: str,
     args: argparse.Namespace,
@@ -2343,7 +2477,220 @@ async def _process_record_batch(
     return [outcomes_by_item[id(item)] for item in batch]
 
 
+async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int]:
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "reprocess_failures", False) or getattr(args, "reprocess_missing_histories", False):
+        raise ValueError("mysql 数据源暂不支持 --reprocess-failures 或 --reprocess-missing-histories")
+
+    doctor_ids = set(args.doctor_id or [])
+    source_records = _load_mysql_records(args)
+    patient_visit_counts = count_patient_visits_in_records(source_records, doctor_ids)
+    processed_ids, processed_order_sns = (set(), set()) if args.reprocess else _load_mysql_processed_record_keys(args)
+
+    text_model = build_model(args.model, args, base_url=args.base_url, api_key=args.api_key)
+    diagnosis_model = build_model(
+        args.diagnosis_model,
+        args,
+        base_url=args.diagnosis_base_url,
+        api_key=args.diagnosis_api_key,
+        max_tokens=1000,
+    )
+    vlm_model = build_model(
+        args.vlm_model or args.model,
+        args,
+        base_url=args.vlm_base_url or args.base_url,
+        api_key=args.vlm_api_key or args.api_key,
+    )
+    image_classification_model = build_model(
+        getattr(args, "image_classification_model", CLASSIFICATION_MODEL_NAME),
+        args,
+        base_url=getattr(args, "image_classification_base_url", "") or args.base_url,
+        api_key=getattr(args, "image_classification_api_key", "") or args.api_key,
+        max_tokens=6000,
+    )
+    enable_review = bool(getattr(args, "enable_review", False))
+    reviewer_model = None
+    if enable_review:
+        reviewer_model = build_model(
+            getattr(args, "reviewer_model", "") or os.getenv("KIMI_K3", "kimi/kimi-k3"),
+            args,
+            base_url=getattr(args, "reviewer_base_url", ""),
+            api_key=getattr(args, "reviewer_api_key", ""),
+        )
+    agents = MedicalRecordAgents(
+        text_model,
+        vlm_model,
+        args.output_dir,
+        diagnosis_model=diagnosis_model,
+        image_classification_model=image_classification_model,
+        reviewer_model=reviewer_model,
+        enable_review=enable_review,
+        filter_path=args.output_dir / FILTER_FILE_NAME,
+        stage_timeout=getattr(args, "timeout", 120.0),
+    )
+
+    planned_total = count_planned_records_in_records(
+        source_records,
+        doctor_ids,
+        args.limit,
+        processed_ids,
+        processed_order_sns,
+    )
+    succeeded = 0
+    failed = 0
+    skipped = 0
+    filtered = 0
+    skipped_existing = 0
+    completed = 0
+    attempted = 0
+    attempted_by_doctor: Counter[str] = Counter()
+    previous_diagnoses_by_patient: dict[str, dict[str, str]] = {}
+    pending_batch: list[dict[str, Any]] = []
+    batch_size = max(1, int(getattr(args, "batch_size", 8)))
+    record_timeout = max(0.0, float(getattr(args, "record_timeout", 0.0)))
+    progress_every = max(1, int(getattr(args, "progress_every", 10)))
+    progress_scope = ",".join(sorted(doctor_ids)) or "all"
+    progress_started_at = time.monotonic()
+    last_progress_completed = 0
+    if planned_total:
+        logger.info(
+            f"[PROGRESS START] data_source=mysql doctor={progress_scope} target={planned_total} "
+            f"batch_size={batch_size} progress_every={progress_every}"
+        )
+
+    async def flush_batch() -> None:
+        nonlocal completed, failed, filtered, last_progress_completed, skipped, succeeded
+        if not pending_batch:
+            return
+        batch = list(pending_batch)
+        pending_batch.clear()
+        logger.info(f"[BATCH START] records={len(batch)} concurrency={len(batch)}")
+        batch_started_at = time.monotonic()
+        outcomes = await _process_record_batch(agents, batch, previous_diagnoses_by_patient, record_timeout)
+        first_failure: RuntimeError | None = None
+        for item, enriched, process_error in outcomes:
+            identity = item["identity"]
+            order_sn = item["order_sn"]
+            record_id = item["record_id"]
+            enriched["ai_record_identity"] = identity
+            enriched.pop("__previous_diagnoses", None)
+            enriched.pop("__original_diagnoses", None)
+
+            if process_error is not None:
+                failed += 1
+                logger.error(f"[ERROR] record={record_id}: {type(process_error).__name__}: {process_error}")
+                first_failure = first_failure or RuntimeError(f"病历 {record_id} 处理失败")
+            elif enriched.get("ai_processing_filtered") is True:
+                skipped += 1
+                filtered += 1
+                processed_ids.add(identity)
+                if order_sn:
+                    processed_order_sns.add(order_sn)
+                logger.info(f"数据关键字段均为空，【FILTER】 {order_sn or record_id}")
+            elif enriched.get("ai_processing_errors"):
+                failed += 1
+                enriched["ai_processing_complete"] = False
+                logger.error(f"[ERROR] record={record_id}: {_json_for_prompt(enriched['ai_processing_errors'])}")
+                first_failure = first_failure or RuntimeError(f"病历 {record_id} 存在处理失败阶段")
+            else:
+                succeeded += 1
+                enriched["ai_processing_complete"] = True
+                enriched["ai_processing_version"] = "2026-07-28"
+                processed_ids.add(identity)
+                if order_sn:
+                    processed_order_sns.add(order_sn)
+            _save_mysql_record(args, enriched)
+
+        completed += len(outcomes)
+        logger.info(f"[BATCH END] records={len(batch)} elapsed={time.monotonic() - batch_started_at:.1f}s")
+        if (
+            completed == len(outcomes)
+            or completed >= planned_total
+            or completed - last_progress_completed >= progress_every
+        ):
+            logger.info(
+                _progress_log_message(
+                    completed=completed,
+                    total=planned_total,
+                    succeeded=succeeded,
+                    failed=failed,
+                    filtered=filtered,
+                    skipped_existing=skipped_existing,
+                    elapsed=time.monotonic() - progress_started_at,
+                    scope=progress_scope,
+                )
+            )
+            last_progress_completed = completed
+        if getattr(args, "interval", 0) > 0:
+            await asyncio.sleep(args.interval)
+        if first_failure is not None and args.fail_fast:
+            raise first_failure
+
+    for index, record in enumerate(source_records, 1):
+        if not _doctor_matches(record, doctor_ids):
+            continue
+        doctor_id = _text(record.get("doctor_id"))
+        if _selected_doctor_quota_reached(doctor_id, doctor_ids, attempted_by_doctor, args.limit):
+            if _all_selected_doctors_reached(doctor_ids, attempted_by_doctor, args.limit):
+                break
+            continue
+        identity = _record_identity(record, index)
+        order_sn = _text(record.get("order_sn"))
+        patient_key = _patient_key(record)
+        if identity in processed_ids or (order_sn and order_sn in processed_order_sns):
+            await flush_batch()
+            skipped_diagnoses = _diagnosis_payload(record, prefer_ai=True)
+            if patient_key and _has_any_diagnosis(skipped_diagnoses):
+                previous_diagnoses_by_patient[patient_key] = skipped_diagnoses
+            skipped += 1
+            skipped_existing += 1
+            logger.info(f"数据已经处理过，【SKIP】 {order_sn or identity}")
+            continue
+        if not doctor_ids and args.limit and attempted >= args.limit:
+            break
+        attempted += 1
+        if doctor_id:
+            attempted_by_doctor[doctor_id] += 1
+        record_id = _record_key(record, index)
+        extract_current_history = (
+            _text(record.get("is_first")) == "复诊"
+            and bool(patient_key)
+            and patient_visit_counts[patient_key] > 1
+        )
+        pending_batch.append(
+            {
+                "record": record,
+                "record_id": record_id,
+                "identity": identity,
+                "order_sn": order_sn,
+                "patient_key": patient_key,
+                "extract_current_history": extract_current_history,
+                "use_rag": args.use_rag,
+            }
+        )
+        if len(pending_batch) >= batch_size:
+            await flush_batch()
+    await flush_batch()
+    if planned_total and completed != last_progress_completed:
+        logger.info(
+            _progress_log_message(
+                completed=completed,
+                total=planned_total,
+                succeeded=succeeded,
+                failed=failed,
+                filtered=filtered,
+                skipped_existing=skipped_existing,
+                elapsed=time.monotonic() - progress_started_at,
+                scope=progress_scope,
+            )
+        )
+    return succeeded, failed, skipped
+
+
 async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
+    if getattr(args, "data_source", "local") == "mysql":
+        return await process_mysql_records(args)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     doctor_ids = set(args.doctor_id or [])
     reprocess_selected = bool(
@@ -2626,6 +2973,12 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="基于 LangChain 的多医生病历 AI 清洗与结构化脚本")
     parser.add_argument(
+        "--data-source",
+        choices=("local", "mysql"),
+        default="local",
+        help="数据来源和结果写入位置：local 读写本地文件；mysql 读写 MySQL 表，默认 local",
+    )
+    parser.add_argument(
         "--input",
         type=Path,
         default=DEFAULT_INPUT,
@@ -2786,11 +3139,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if not args.input.exists():
+    if args.data_source == "local" and not args.input.exists():
         raise FileNotFoundError(f"输入路径不存在: {args.input}")
     succeeded, failed, skipped = asyncio.run(process_records(args))
+    output_location = str(args.output_dir) if args.data_source == "local" else f"MySQL 表 {MYSQL_RECORD_TABLE}"
     logger.info(
-        f"处理完成: 成功 {succeeded} 条，失败 {failed} 条，跳过已处理或过滤 {skipped} 条，输出目录 {args.output_dir}"
+        f"处理完成: 成功 {succeeded} 条，失败 {failed} 条，跳过已处理或过滤 {skipped} 条，输出位置 {output_location}"
     )
 
 

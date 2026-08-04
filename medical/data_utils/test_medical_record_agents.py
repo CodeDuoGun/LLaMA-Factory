@@ -23,8 +23,10 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import HumanMessage
 from PIL import Image
+from sqlalchemy import Boolean, Column, Integer, MetaData, String, Table, Text
 
 from medical.data_utils import medical_record_agents
+from medical.data_utils.db_manager import DBManager
 from medical.schema.clear_record_basemodel import (
     AgentReviewResult,
     CurrentVisitHistoryResult,
@@ -371,6 +373,97 @@ def test_process_records_limits_attempts_per_doctor(tmp_path, monkeypatch) -> No
 
     assert asyncio.run(medical_record_agents.process_records(args)) == (2, 0, 0)
     assert processed_order_sns == ["ORDER-43-1", "ORDER-52-1"]
+
+
+def test_process_records_mysql_reads_and_updates_same_table(tmp_path, monkeypatch) -> None:
+    database_url = f"sqlite:///{tmp_path / 'records.db'}"
+    manager = DBManager(database_url)
+    metadata = MetaData()
+    table = Table(
+        "medical_records",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("order_sn", String(64), nullable=False),
+        Column("doctor_id", String(16)),
+        Column("doctor_name", String(64)),
+        Column("patient_id", String(32)),
+        Column("is_first", String(16)),
+        Column("patient_appeal", Text),
+        Column("new_medical_history", Text),
+        Column("diagnosis_illness", Text),
+        Column("ai_patient_appeal", Text),
+        Column("ai_processing_complete", Boolean),
+        Column("ai_record_identity", Text),
+        Column("ai_processing_version", String(32)),
+    )
+    manager.create_table(table)
+    manager.insert(
+        "medical_records",
+        {
+            "id": 1,
+            "order_sn": "MYSQL-1",
+            "doctor_id": "43",
+            "doctor_name": "朱子奇",
+            "patient_id": "100",
+            "is_first": "初诊",
+            "patient_appeal": "胃胀",
+            "new_medical_history": "胃胀三天",
+            "diagnosis_illness": "慢性胃炎",
+            "ai_processing_complete": False,
+        },
+    )
+    manager.close()
+
+    monkeypatch.setattr(medical_record_agents, "build_model", lambda *args, **kwargs: object())
+    monkeypatch.setattr(medical_record_agents, "MYSQL_DATABASE_URL", database_url)
+    monkeypatch.setattr(medical_record_agents, "MYSQL_RECORD_TABLE", "medical_records")
+
+    class FakeAgents:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def process(self, record, **kwargs):
+            return {**record, "ai_patient_appeal": "AI 胃胀"}
+
+    monkeypatch.setattr(medical_record_agents, "MedicalRecordAgents", FakeAgents)
+    args = argparse.Namespace(
+        data_source="mysql",
+        output_dir=tmp_path / "processed_data",
+        doctor_id=[],
+        model="text-model",
+        diagnosis_model="diagnosis-model",
+        diagnosis_base_url="",
+        diagnosis_api_key="",
+        vlm_model="vlm-model",
+        vlm_base_url="",
+        base_url="",
+        vlm_api_key="",
+        reviewer_model="kimi/kimi-k3",
+        reviewer_base_url="",
+        reviewer_api_key="",
+        enable_review=False,
+        api_key="",
+        reprocess=False,
+        reprocess_failures=False,
+        reprocess_missing_histories=False,
+        limit=0,
+        use_rag=False,
+        interval=0,
+        fail_fast=False,
+        timeout=120,
+        max_retries=2,
+        batch_size=8,
+        record_timeout=0,
+        progress_every=10,
+    )
+
+    assert asyncio.run(medical_record_agents.process_records(args)) == (1, 0, 0)
+    manager = DBManager(database_url)
+    row = manager.select_one("medical_records", filters={"id": 1})
+    manager.close()
+    assert row["ai_patient_appeal"] == "AI 胃胀"
+    assert row["ai_processing_complete"] is True
+    assert row["ai_record_identity"] == "43:1"
 
 
 def test_count_planned_records_excludes_processed_and_applies_per_doctor_limit(tmp_path) -> None:

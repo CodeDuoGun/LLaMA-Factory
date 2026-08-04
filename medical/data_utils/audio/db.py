@@ -5,8 +5,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-from medical.data_utils.config import config
-from medical.data_utils.log import logger
+from medical.config import config
+from medical.utils.log import logger
 from medical.data_utils.audio.audio_db_schema import AudioLable
 
 # 创建数据库引擎

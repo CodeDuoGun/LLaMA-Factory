@@ -23,7 +23,7 @@ from sqlalchemy.engine import Connection, Engine, Result
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import StaticPool
 
-from medical.data_utils.config import config
+from medical.config import config
 
 
 class DBManager:
