@@ -38,6 +38,7 @@ You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2
       <button class="tab" type="button" data-view="base-formula" aria-selected="false">基础方图谱</button>
       <button class="tab" type="button" data-view="revisit" aria-selected="false">复诊调方</button>
       <button class="tab" type="button" data-view="patient" aria-selected="false">患者时间轴</button>
+      <button class="tab" type="button" data-view="annotation" aria-selected="false">病历标注</button>
     </nav>
 
     <main>
@@ -262,7 +263,47 @@ You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2
           </article>
         </div>
       </section>
+
+      <section id="view-annotation" class="view" aria-labelledby="annotation-title" hidden>
+        <div class="section-heading with-controls">
+          <div>
+            <p class="section-kicker">HUMAN REVIEW · AI FIELDS ONLY</p>
+            <h2 id="annotation-title">AI 病历审核标注</h2>
+            <p class="annotation-scope-note">左侧原始字段仅供核对；右侧仅审核并修改 AI 字段。保存不会改动原始病历。</p>
+          </div>
+          <form id="annotation-search-form" class="search-form">
+            <label class="control-label">患者 ID<input id="annotation-query" name="annotation_patient_id" type="search" inputmode="numeric" placeholder="例如：655054…" autocomplete="off" /></label>
+            <button type="submit" class="primary-button">查询</button>
+          </form>
+        </div>
+        <div class="patient-layout annotation-layout">
+          <aside class="panel patient-list-panel">
+            <div class="panel-heading"><h3>待审核患者</h3><span id="annotation-patient-count">按 patient_id 聚合</span></div>
+            <div id="annotation-patient-list" class="patient-list"></div>
+            <button id="annotation-load-more" type="button" class="annotation-load-more" hidden>加载更多患者</button>
+          </aside>
+          <article class="annotation-workspace">
+            <div class="panel annotation-heading-panel">
+              <div class="panel-heading"><h3 id="annotation-records-title">选择一位患者</h3><span id="annotation-records-meta"></span></div>
+              <div class="annotation-legend"><span class="original-legend">原始字段 · 只读</span><span class="ai-legend">AI 标注字段 · 可编辑</span></div>
+            </div>
+            <div id="annotation-records" class="annotation-records empty-state">从左侧选择患者，逐病历审核 AI 标注结果。</div>
+          </article>
+        </div>
+      </section>
     </main>
+
+    <dialog id="annotation-image-dialog" class="image-preview-dialog" aria-labelledby="annotation-image-title">
+      <div class="image-preview-toolbar">
+        <div><strong id="annotation-image-title">病历原始图片</strong><span id="annotation-image-meta"></span></div>
+        <button id="annotation-image-close" type="button" class="image-preview-close" aria-label="关闭图片预览">关闭</button>
+      </div>
+      <div class="image-preview-stage">
+        <button id="annotation-image-previous" type="button" class="image-preview-navigation is-previous" aria-label="上一张图片">←</button>
+        <img id="annotation-image-preview" alt="" width="1600" height="1200" />
+        <button id="annotation-image-next" type="button" class="image-preview-navigation is-next" aria-label="下一张图片">→</button>
+      </div>
+    </dialog>
 
     <footer>姓名及联系方式不展示 · 分析结果用于诊疗模式研究，不作为临床决策依据</footer>
     <script src="/static/app.js" defer></script>

@@ -12,6 +12,14 @@ const state = {
   overview: null,
   diseases: [],
   selectedPatient: null,
+  selectedAnnotationPatient: null,
+  annotationFields: [],
+  annotationPatients: [],
+  annotationPatientQuery: "",
+  annotationPatientOffset: 0,
+  annotationPatientHasMore: false,
+  annotationImagePreviewItems: [],
+  annotationImagePreviewIndex: 0,
   llmConfigured: null,
   baseFormulaVersion: 0,
   baseFormula: { metadata: null, strata: null, results: {}, loading: new Set(), selected: null, dimensions: ["diagnosis_illness", "diagnosis_disease"] },
@@ -541,6 +549,283 @@ async function openPatient(patientKey, preservePatientList = false) {
   }
 }
 
+function annotationStatus(item) {
+  if (item.human_record_count === item.record_count) return ["已完成", "is-complete"];
+  if (item.human_record_count > 0) return [`${item.human_record_count}/${item.record_count} 已审核`, "is-partial"];
+  return ["待审核", ""];
+}
+
+function renderAnnotationPatientList() {
+  $("#annotation-patient-list").innerHTML = state.annotationPatients.length ? state.annotationPatients.map((item) => {
+    const [status, statusClass] = annotationStatus(item);
+    return `<button class="patient-button annotation-patient-button ${state.selectedAnnotationPatient === item.patient_id ? "is-active" : ""}" data-annotation-patient="${escapeHtml(item.patient_id)}">
+      <strong>${escapeHtml(item.patient_id)}</strong><span class="annotation-status ${statusClass}">${escapeHtml(status)}</span>
+      <small>${item.record_count} 份病历 · ${item.human_record_count} 份已人工审核</small></button>`;
+  }).join("") : '<div class="empty-state">未找到匹配患者</div>';
+  $("#annotation-load-more").hidden = !state.annotationPatientHasMore;
+}
+
+async function loadAnnotationPatientList(query = "", append = false) {
+  const offset = append ? state.annotationPatientOffset : 0;
+  const params = new URLSearchParams({query, limit: "200", offset: String(offset)});
+  const data = await api(`/api/annotations/patients?${params}`);
+  state.annotationPatientQuery = query;
+  state.annotationPatients = append ? state.annotationPatients.concat(data.items) : data.items;
+  state.annotationPatientOffset = offset + data.items.length;
+  state.annotationPatientHasMore = data.has_more;
+  $("#annotation-patient-count").textContent = `已显示 ${state.annotationPatients.length}/${data.total} 位`;
+  renderAnnotationPatientList();
+  document.querySelectorAll("[data-annotation-patient]").forEach((button) => button.addEventListener("click", () => {
+    openAnnotationPatient(button.dataset.annotationPatient, true).catch(showError);
+  }));
+}
+
+function annotationValue(value, kind) {
+  if (value == null) return "";
+  if (kind === "json") return JSON.stringify(value, null, 2);
+  return String(value);
+}
+
+function annotationOriginalValue(record, field) {
+  if (!field.original_field) return "原始病历无对应字段";
+  const value = record.original[field.original_field];
+  if (value == null || value === "") return "未记录";
+  return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
+function annotationImages(value) {
+  const images = [];
+  const seen = new Set();
+  const add = (url, time = "") => {
+    if (typeof url !== "string" || !/^https?:\/\//i.test(url) || seen.has(url) || images.length >= 24) return;
+    seen.add(url);
+    images.push({url, time: String(time || "")});
+  };
+  const visit = (node, inheritedTime = "") => {
+    if (Array.isArray(node)) {
+      node.forEach((item) => visit(item, inheritedTime));
+      return;
+    }
+    if (!node || typeof node !== "object") {
+      if (typeof node === "string") add(node, inheritedTime);
+      return;
+    }
+    const time = node.time || node.created_at || node.upload_time || inheritedTime;
+    const directUrl = node.img || node.image || node.image_url || node.url || node.src;
+    if (directUrl) add(directUrl, time);
+    Object.entries(node).forEach(([key, item]) => {
+      if (!["img", "image", "image_url", "url", "src"].includes(key)) visit(item, time);
+    });
+  };
+  visit(value);
+  return images;
+}
+
+function annotationOriginalContent(record, field) {
+  const value = field.original_field ? record.original[field.original_field] : null;
+  if (field.name === "ai_patient_appeal") {
+    const complaintFields = [
+      ["患者主诉", "patient_appeal"],
+      ["医生主诉", "doc_ass_stu_appeal"],
+    ];
+    return `<div class="annotation-complaint-lines">${complaintFields.map(([label, fieldName]) => {
+      const complaint = record.original[fieldName];
+      const text = complaint == null || complaint === "" ? "未记录" : annotationOriginalValue({original: {[fieldName]: complaint}}, {original_field: fieldName});
+      return `<div class="annotation-complaint-line ${text === "未记录" ? "is-empty" : ""}"><span><strong>${label}</strong><code>${fieldName}</code></span><p>${escapeHtml(text)}</p></div>`;
+    }).join("")}</div>`;
+  }
+  const isImageField = ["tongue_face_img", "inspection_report_img"].includes(field.original_field);
+  if (isImageField) {
+    const images = annotationImages(value);
+    if (images.length) return `<div class="annotation-image-gallery">${images.map((item, imageIndex) => `
+      <button type="button" class="annotation-thumbnail" data-preview-src="${escapeHtml(item.url)}" data-preview-label="${escapeHtml(`${field.label} ${imageIndex + 1}/${images.length}`)}" data-preview-meta="${escapeHtml(item.time)}" aria-label="放大查看${escapeHtml(field.label)}第 ${imageIndex + 1} 张图片">
+        <img src="${escapeHtml(item.url)}" alt="${escapeHtml(field.label)}缩略图 ${imageIndex + 1}" width="96" height="76" loading="lazy" />
+        ${item.time ? `<span>${escapeHtml(item.time)}</span>` : ""}
+      </button>`).join("")}</div>`;
+  }
+  const originalValue = annotationOriginalValue(record, field);
+  return `<pre>${escapeHtml(originalValue)}</pre>`;
+}
+
+function annotationAiPreview(record, field, hasAiValue) {
+  if (!hasAiValue) return "";
+  const display = record.ai_display?.[field.name];
+  if (field.name === "ai_tongue_face_img" && display && typeof display === "object") {
+    const labels = {tongue: "舌象", face: "面象", lesions: "患处"};
+    const sections = Object.entries(labels).filter(([name]) => display[name]).map(([name, label]) => `
+      <div class="ai-readable-section"><strong>${label}</strong><p>${escapeHtml(display[name])}</p></div>`).join("");
+    return sections ? `<div class="ai-readable-preview">${sections}</div>` : "";
+  }
+  if (field.name === "ai_inspection_report_img" && typeof display === "string" && display.trim()) {
+    return `<div class="ai-readable-preview inspection-readable-preview">${display.split("\n").filter(Boolean).map((line) => `<p>${escapeHtml(line)}</p>`).join("")}</div>`;
+  }
+  return "";
+}
+
+function annotationVisitType(value) {
+  if (value === "初诊" || value === "复诊") return value;
+  if (value === true || value === 1 || value === "1") return "初诊";
+  if (value === false || value === 0 || value === "0") return "复诊";
+  return "类型未记录";
+}
+
+function annotationRows(value, kind) {
+  if (!value) return 1;
+  const lines = String(value).split("\n").reduce((count, line) => count + Math.max(1, Math.ceil(line.length / 72)), 0);
+  return Math.min(kind === "json" ? 10 : kind === "long_text" ? 7 : 3, Math.max(1, lines));
+}
+
+function annotationRecord(record, index) {
+  const statusClass = record.operator === "HUMAN" ? "is-human" : "";
+  const fields = state.annotationFields.map((field) => {
+    const aiValue = annotationValue(record.ai[field.name], field.kind);
+    const originalValue = annotationOriginalValue(record, field);
+    const originalEmpty = field.name === "ai_patient_appeal"
+      ? ![record.original.patient_appeal, record.original.doc_ass_stu_appeal].some((value) => value != null && value !== "")
+      : originalValue === "未记录" || originalValue === "原始病历无对应字段";
+    const originalSource = field.name === "ai_patient_appeal"
+      ? "patient_appeal / doc_ass_stu_appeal"
+      : record.original_sources?.[field.name] || field.original_field || "无原字段";
+    const aiPreview = annotationAiPreview(record, field, Boolean(aiValue));
+    const editor = `<textarea aria-label="${escapeHtml(`${field.label} AI 标注`)}" data-annotation-index="${index}" data-annotation-field="${escapeHtml(field.name)}" data-annotation-kind="${escapeHtml(field.kind)}" rows="${annotationRows(aiValue, field.kind)}" placeholder="AI 未生成内容，可在此补充…">${escapeHtml(aiValue)}</textarea>`;
+    return `<div class="annotation-field-row ${!aiValue ? "has-empty-ai" : ""}">
+    <div class="annotation-original ${originalEmpty ? "is-empty" : ""}">
+      <div class="annotation-field-label"><strong>${escapeHtml(field.label)}</strong><code>${escapeHtml(originalSource)}</code></div>
+      ${annotationOriginalContent(record, field)}
+    </div>
+    <div class="annotation-ai">
+      <span class="annotation-field-label"><strong>${escapeHtml(field.label)} · AI</strong><code>${escapeHtml(field.name)}</code></span>
+      ${aiPreview}${aiPreview ? `<details class="structured-json-editor"><summary>查看或编辑结构化 JSON</summary>${editor}</details>` : editor}
+    </div>
+  </div>`;
+  }).join("");
+  return `<details class="annotation-record panel" data-annotation-record="${index}" ${index === 0 ? "open" : ""}>
+    <summary class="annotation-record-head">
+      <div><div class="timeline-date">${escapeHtml(record.visit_date || "日期未记录")} · ${escapeHtml(annotationVisitType(record.is_first))}</div>
+      <h3>病历 ${escapeHtml(record.medical_record_id || record.annotation_record_id)}</h3>
+      <p>${escapeHtml(record.patient_sex || "性别未记录")} · ${escapeHtml(record.patient_age || "年龄未记录")}岁 · 咨询单 ${escapeHtml(record.order_sn)} · AI 版本 ${escapeHtml(record.ai_processing_version || "未记录")}</p></div>
+      <div class="annotation-record-state"><span class="operator-badge ${statusClass}">${record.operator === "HUMAN" ? "人工已审核" : "AI 待审核"}</span><span class="annotation-expand-label">展开审核</span></div>
+    </summary>
+    <div class="annotation-record-body"><div class="annotation-field-list">${fields}</div>
+    <div class="annotation-save-bar"><span class="annotation-save-message" aria-live="polite"></span><button type="button" class="primary-button" data-save-annotation="${index}">保存本份病历</button></div></div>
+  </details>`;
+}
+
+async function openAnnotationPatient(patientKey, preservePatientList = false) {
+  switchView("annotation");
+  state.selectedAnnotationPatient = String(patientKey);
+  if (!preservePatientList) $("#annotation-query").value = patientKey;
+  const [fields, data] = await Promise.all([
+    state.annotationFields.length ? Promise.resolve({items: state.annotationFields}) : api("/api/annotations/fields"),
+    api(`/api/annotations/patients/${encodeURIComponent(patientKey)}`),
+  ]);
+  state.annotationFields = fields.items;
+  $("#annotation-records-title").textContent = `患者 ID：${data.patient_id}`;
+  $("#annotation-records-meta").textContent = `${data.record_count} 份病历`;
+  $("#annotation-records").className = "annotation-records";
+  $("#annotation-records").innerHTML = data.records.map(annotationRecord).join("");
+  document.querySelectorAll("[data-save-annotation]").forEach((button) => button.addEventListener("click", () => {
+    saveAnnotationRecord(data.records[Number(button.dataset.saveAnnotation)], Number(button.dataset.saveAnnotation)).catch(showError);
+  }));
+  document.querySelectorAll("[data-annotation-patient]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.annotationPatient === String(patientKey));
+  });
+  $("#annotation-records").querySelectorAll("[data-annotation-field]").forEach((input) => {
+    input.addEventListener("input", () => {
+      const record = input.closest(".annotation-record");
+      record.classList.add("has-unsaved-changes");
+      record.querySelector(".annotation-save-message").textContent = "有未保存修改";
+    });
+  });
+  $("#annotation-records").querySelectorAll("[data-preview-src]").forEach((button) => {
+    button.addEventListener("click", () => openAnnotationImagePreview(button));
+  });
+}
+
+function openAnnotationImagePreview(button) {
+  const dialog = $("#annotation-image-dialog");
+  const galleryButtons = [...button.closest(".annotation-image-gallery").querySelectorAll("[data-preview-src]")];
+  state.annotationImagePreviewItems = galleryButtons.map((item) => ({
+    src: item.dataset.previewSrc,
+    label: item.dataset.previewLabel,
+    meta: item.dataset.previewMeta || "",
+  }));
+  state.annotationImagePreviewIndex = Math.max(0, galleryButtons.indexOf(button));
+  renderAnnotationImagePreview();
+  if (!dialog.open) dialog.showModal();
+}
+
+function renderAnnotationImagePreview() {
+  const item = state.annotationImagePreviewItems[state.annotationImagePreviewIndex];
+  if (!item) return;
+  const image = $("#annotation-image-preview");
+  image.src = item.src;
+  image.alt = item.label;
+  $("#annotation-image-title").textContent = item.label;
+  $("#annotation-image-meta").textContent = item.meta;
+  $("#annotation-image-previous").disabled = state.annotationImagePreviewIndex === 0;
+  $("#annotation-image-next").disabled = state.annotationImagePreviewIndex === state.annotationImagePreviewItems.length - 1;
+}
+
+function stepAnnotationImagePreview(offset) {
+  const nextIndex = state.annotationImagePreviewIndex + offset;
+  if (nextIndex < 0 || nextIndex >= state.annotationImagePreviewItems.length) return;
+  state.annotationImagePreviewIndex = nextIndex;
+  renderAnnotationImagePreview();
+}
+
+function closeAnnotationImagePreview() {
+  const dialog = $("#annotation-image-dialog");
+  dialog.close();
+  $("#annotation-image-preview").src = "";
+  state.annotationImagePreviewItems = [];
+  state.annotationImagePreviewIndex = 0;
+}
+
+async function saveAnnotationRecord(record, index) {
+  const container = document.querySelector(`[data-annotation-record="${index}"]`);
+  const button = container.querySelector("[data-save-annotation]");
+  const message = container.querySelector(".annotation-save-message");
+  const fields = {};
+  for (const input of container.querySelectorAll("[data-annotation-field]")) {
+    let value = input.value;
+    if (input.dataset.annotationKind === "json") {
+      try { value = value.trim() ? JSON.parse(value) : null; }
+      catch (_) {
+        input.focus();
+        message.textContent = `${input.dataset.annotationField} 不是合法 JSON`;
+        message.className = "annotation-save-message is-error";
+        return;
+      }
+    }
+    fields[input.dataset.annotationField] = value;
+  }
+  button.disabled = true;
+  const previousButtonText = button.textContent;
+  button.textContent = "正在保存…";
+  message.textContent = "正在保存…";
+  message.className = "annotation-save-message";
+  try {
+    await api("/api/annotations/save", true, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({record_id: record.annotation_record_id, fields}),
+    });
+    record.operator = "HUMAN";
+    record.status = "labeled";
+    const badge = container.querySelector(".operator-badge");
+    badge.textContent = "人工已审核";
+    badge.classList.add("is-human");
+    message.textContent = "已保存，原始字段未修改";
+    message.className = "annotation-save-message is-success";
+    container.classList.remove("has-unsaved-changes");
+    await loadAnnotationPatientList(state.annotationPatientQuery);
+  } finally {
+    button.disabled = false;
+    button.textContent = previousButtonText;
+  }
+}
+
 async function loadDoctors() {
   const [data, llmStatus] = await Promise.all([api("/api/doctors", false), api("/api/llm/status", false)]);
   state.llmConfigured = llmStatus.configured;
@@ -557,6 +842,10 @@ async function loadDoctor(doctorKey) {
   const select = $("#doctor-select");
   state.doctor = doctorKey;
   state.selectedPatient = null;
+  state.selectedAnnotationPatient = null;
+  state.annotationPatients = [];
+  state.annotationPatientOffset = 0;
+  state.annotationPatientHasMore = false;
   state.baseFormulaVersion += 1;
   state.baseFormula = { metadata: null, strata: null, results: {}, loading: new Set(), selected: null, dimensions: selectedFormulaDimensions() };
   select.disabled = true;
@@ -570,6 +859,14 @@ async function loadDoctor(doctorKey) {
   $("#timeline-meta").textContent = "";
   $("#timeline").className = "timeline empty-state";
   $("#timeline").textContent = "从左侧选择患者 ID，查看病情与调方过程。";
+  $("#annotation-query").value = "";
+  $("#annotation-patient-list").innerHTML = "";
+  $("#annotation-patient-count").textContent = "按 patient_id 聚合";
+  $("#annotation-load-more").hidden = true;
+  $("#annotation-records-title").textContent = "选择一位患者";
+  $("#annotation-records-meta").textContent = "";
+  $("#annotation-records").className = "annotation-records empty-state";
+  $("#annotation-records").textContent = "从左侧选择患者，逐病历审核 AI 标注结果。";
   resetLLMAnalysis();
   try {
     await Promise.all([loadOverview(), loadDiseases()]);
@@ -577,6 +874,7 @@ async function loadDoctor(doctorKey) {
     if (activeView === "base-formula") await loadBaseFormulaStrata();
     if (activeView === "revisit") await loadRevisits();
     if (activeView === "patient") await loadPatientList();
+    if (activeView === "annotation") await loadAnnotationPatientList();
   } finally {
     select.disabled = false;
   }
@@ -596,6 +894,7 @@ function switchView(view) {
   if (view === "base-formula") loadBaseFormulaStrata().catch(showError);
   if (view === "revisit") loadRevisits().catch(showError);
   if (view === "patient" && !$("#patient-list").children.length) loadPatientList().catch(showError);
+  if (view === "annotation" && !$("#annotation-patient-list").children.length) loadAnnotationPatientList().catch(showError);
 }
 
 function bindEvents() {
@@ -633,6 +932,38 @@ function bindEvents() {
     const query = $("#patient-query").value.trim();
     if (/^\d+$/.test(query)) openPatient(query).catch(showError);
     else loadPatientList(query).catch(showError);
+  });
+  $("#annotation-search-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const query = $("#annotation-query").value.trim();
+    if (/^\d+$/.test(query)) openAnnotationPatient(query).catch(showError);
+    else loadAnnotationPatientList(query).catch(showError);
+  });
+  $("#annotation-load-more").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "正在加载…";
+    try {
+      await loadAnnotationPatientList(state.annotationPatientQuery, true);
+    } catch (error) {
+      showError(error);
+    } finally {
+      button.disabled = false;
+      button.textContent = "加载更多患者";
+    }
+  });
+  $("#annotation-image-close").addEventListener("click", closeAnnotationImagePreview);
+  $("#annotation-image-previous").addEventListener("click", () => stepAnnotationImagePreview(-1));
+  $("#annotation-image-next").addEventListener("click", () => stepAnnotationImagePreview(1));
+  $("#annotation-image-dialog").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeAnnotationImagePreview();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (!$("#annotation-image-dialog").open) return;
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      stepAnnotationImagePreview(event.key === "ArrowLeft" ? -1 : 1);
+    }
   });
 }
 

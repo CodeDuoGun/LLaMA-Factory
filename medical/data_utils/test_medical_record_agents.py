@@ -868,10 +868,32 @@ def test_format_inspection_result_text_keeps_valid_reports_only() -> None:
     }
 
     assert medical_record_agents.format_inspection_result_text(result) == (
-        "有效检查报告1：图片类别：影像检查报告；报告名称：胸部CT；报告日期：2021-03-10；"
-        "相对就诊时间：3个月前；解析结果：右肺见结节影；报告结论：右肺结节。\n"
-        "现病史检查证据摘要：胸部CT提示右肺结节。"
+        "有效检查报告1：报告时间：2021-03-10；报告名称：胸部CT；报告异常指标：无异常指标。"
     )
+
+
+def test_format_inspection_result_text_only_keeps_abnormal_indicators() -> None:
+    result = {
+        "reports": [
+            {
+                "is_valid_report": True,
+                "report_name": "血常规",
+                "report_date": "2026-01-02",
+                "content": "其他解析内容",
+                "abnormal_indicators": ["白细胞升高", "C 反应蛋白升高"],
+                "conclusion": "考虑炎症",
+            }
+        ]
+    }
+
+    text = medical_record_agents.format_inspection_result_text(result)
+
+    assert text == (
+        "有效检查报告1：报告时间：2026-01-02；报告名称：血常规；"
+        "报告异常指标：白细胞升高、C 反应蛋白升高。"
+    )
+    assert "其他解析内容" not in text
+    assert "考虑炎症" not in text
 
 
 def test_format_tongue_face_result_text_uses_natural_language_sections() -> None:

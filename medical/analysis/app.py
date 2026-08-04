@@ -25,7 +25,10 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 
+from medical.analysis.annotation import DEFAULT_ANNOTATION_TABLE, MedicalAnnotationRepository, MedicalAnnotationService
 from medical.analysis.base_formula import (
     discover_base_formulas,
     discover_base_formulas_by_dimensions,
@@ -36,11 +39,19 @@ from medical.analysis.base_formula import (
 from medical.analysis.catalog import DoctorCatalog
 from medical.analysis.engine import MedicalAnalysis
 from medical.analysis.llm import PrescriptionLLMService
+from medical.data_utils.db_manager import DBManager
 
 
 MODULE_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = MODULE_DIR.parent / "data" / "202301_online"
 DEFAULT_DOCTOR = "1314"
+
+
+class AnnotationSaveRequest(BaseModel):
+    """人工审核后允许写回的 AI 字段集合."""
+
+    record_id: int = Field(gt=0)
+    fields: dict[str, object]
 
 
 @asynccontextmanager
@@ -56,7 +67,17 @@ async def lifespan(app: FastAPI):
     app.state.catalog.get()
     app.state.llm = PrescriptionLLMService()
     app.state.base_formula_cache = {}
-    yield
+    annotation_manager = DBManager(os.getenv("MEDICAL_ANNOTATION_DATABASE_URL"))
+    app.state.annotation_service = MedicalAnnotationService(
+        MedicalAnnotationRepository(
+            annotation_manager,
+            table_name=os.getenv("MEDICAL_ANNOTATION_TABLE", DEFAULT_ANNOTATION_TABLE),
+        )
+    )
+    try:
+        yield
+    finally:
+        annotation_manager.close()
 
 
 app = FastAPI(
@@ -73,6 +94,17 @@ def analysis(request: Request, doctor: str | None = None) -> MedicalAnalysis:
         return request.app.state.catalog.get(doctor)
     except KeyError as error:
         raise HTTPException(status_code=404, detail=f"Doctor dataset not found: {doctor}") from error
+
+
+def annotation_doctor_id(request: Request, doctor: str | None = None) -> str:
+    doctor_id = str(analysis(request, doctor).doctor_id or "")
+    if not doctor_id:
+        raise HTTPException(status_code=422, detail="当前医生数据未包含 doctor_id，无法匹配标注表")
+    return doctor_id
+
+
+def annotation_service(request: Request) -> MedicalAnnotationService:
+    return request.app.state.annotation_service
 
 
 @app.get("/", include_in_schema=False)
@@ -389,6 +421,67 @@ def patient_timeline(request: Request, patient_id: str, doctor: str | None = Non
         return analysis(request, doctor).patient_timeline(patient_id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail=f"Patient ID not found: {patient_id}") from error
+
+
+@app.get("/api/annotations/fields")
+def annotation_fields(request: Request) -> dict[str, object]:
+    """返回人工审核页可编辑字段；系统处理字段不在该列表中."""
+    return {"items": annotation_service(request).field_metadata()}
+
+
+@app.get("/api/annotations/patients")
+def annotation_patients(
+    request: Request,
+    query: str = "",
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    doctor: str | None = None,
+) -> dict[str, object]:
+    try:
+        return annotation_service(request).patients(
+            annotation_doctor_id(request, doctor),
+            query=query.strip(),
+            limit=limit,
+            offset=offset,
+        )
+    except SQLAlchemyError as error:
+        raise HTTPException(status_code=503, detail="标注数据库暂不可用，请检查连接和数据表配置") from error
+
+
+@app.get("/api/annotations/patients/{patient_id}")
+def annotation_patient_records(
+    request: Request,
+    patient_id: int,
+    doctor: str | None = None,
+) -> dict[str, object]:
+    try:
+        return annotation_service(request).patient_records(annotation_doctor_id(request, doctor), patient_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=f"标注表中未找到患者: {patient_id}") from error
+    except SQLAlchemyError as error:
+        raise HTTPException(status_code=503, detail="标注数据库暂不可用，请检查连接和数据表配置") from error
+
+
+@app.post("/api/annotations/save")
+def save_annotation(
+    request: Request,
+    payload: AnnotationSaveRequest,
+    doctor: str | None = None,
+) -> dict[str, object]:
+    """只保存审核后的 AI 字段，并将 status/operator 原子更新为 labeled/HUMAN."""
+    try:
+        record = annotation_service(request).save(
+            payload.record_id,
+            payload.fields,
+            annotation_doctor_id(request, doctor),
+        )
+        return {"saved": True, "record": record}
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=f"标注表中未找到病历: {payload.record_id}") from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except SQLAlchemyError as error:
+        raise HTTPException(status_code=503, detail="标注保存失败，请稍后重试") from error
 
 
 @app.get("/api/llm/status")
