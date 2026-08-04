@@ -22,35 +22,38 @@
 python -m medical.analysis.app
 ```
 
-然后访问 <http://127.0.0.1:8008>。默认读取：
+然后访问 <http://127.0.0.1:8008>。默认扫描以下目录中的医生处理结果：
 
 ```text
-medical/data/202301_online/
+medical/processed_data/doctor_<doctor_id>_<doctor_name>/medical_records_ai_normalized.jsonl
 ```
 
-数据目录既可以直接包含各医生 JSON，也可以包含 `online_<doctor_key>`、`zongyuan_<doctor_key>` 子目录。
-前端医生选择器会自动显示已发现的医生；同一医生的后续补充 JSON 会自动合并，并按问诊记录 `id` 去重。
+例如朱子奇医生的数据来自：
 
 ```text
-medical/data/online_litongxin/
+medical/processed_data/doctor_43_朱子奇/medical_records_ai_normalized.jsonl
 ```
+
+每个 `doctor_*` 目录只读取 `medical_records_ai_normalized.jsonl`，不会读取同目录中的
+`medical_records_ai.jsonl` 或审计文件。前端医生选择器使用目录中的医生 ID 和姓名展示已发现的医生。
 
 也可以指定其他同结构数据：
 
 ```bash
-python -m medical.analysis.app --data /absolute/path/to/records.json --port 8008
+python -m medical.analysis.app --data /absolute/path/to/medical_records_ai_normalized.jsonl --port 8008
 ```
 
 指定数据根目录或默认医生：
 
 ```bash
-python -m medical.analysis.app --data-root medical/data --doctor zhuziqi
+python -m medical.analysis.app --data-root medical/processed_data --doctor 43
 ```
 
 或在部署时设置环境变量：
 
 ```bash
-MEDICAL_ANALYSIS_DATA=/absolute/path/to/records.json uvicorn medical.analysis.app:app --host 0.0.0.0 --port 8008
+MEDICAL_ANALYSIS_DATA=/absolute/path/to/medical_records_ai_normalized.jsonl \
+  uvicorn medical.analysis.app:app --host 0.0.0.0 --port 8008
 ```
 
 需要让局域网其他设备访问时，可直接运行：

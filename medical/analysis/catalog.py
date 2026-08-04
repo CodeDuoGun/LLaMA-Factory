@@ -25,6 +25,8 @@ from .engine import MedicalAnalysis
 
 
 DATASET_DIRECTORY_PREFIXES = ("online_", "zongyuan_")
+PROCESSED_DIRECTORY_PATTERN = re.compile(r"^doctor_(?P<doctor_id>\d+)_(?P<doctor_name>.+)$")
+NORMALIZED_RECORDS_FILENAME = "medical_records_ai_normalized.jsonl"
 DOCTOR_NAME_ALIASES = {"wuweiping": "吴卫平"}
 
 
@@ -39,7 +41,7 @@ class DoctorSource:
 
 
 class DoctorCatalog:
-    """Dataset registry grouped by supported ``medical/data/<source>_<doctor>`` directories."""
+    """Dataset registry grouped by processed doctor directories or legacy JSON datasets."""
 
     def __init__(self, sources: list[DoctorSource], default_doctor: str | None = None) -> None:
         if not sources:
@@ -60,14 +62,26 @@ class DoctorCatalog:
             return cls([source], default_doctor=source.key)
 
         root = Path(data_root).expanduser().resolve()
-        sources = []
+        processed_sources = []
+        legacy_sources = []
+        processed_layout_seen = False
         for directory in sorted(root.iterdir()):
+            processed_match = PROCESSED_DIRECTORY_PATTERN.fullmatch(directory.name) if directory.is_dir() else None
+            if processed_match:
+                processed_layout_seen = True
+                normalized_file = directory / NORMALIZED_RECORDS_FILENAME
+                if normalized_file.is_file():
+                    processed_sources.append(cls._source_from_files(directory, [normalized_file]))
+                continue
             if not directory.is_dir() or not directory.name.startswith(DATASET_DIRECTORY_PREFIXES):
                 continue
             pattern = "*_record_????????.json" if directory.name.startswith("zongyuan_") else "*.json"
             files = sorted(file for file in directory.glob(pattern) if file.is_file())
             if files:
-                sources.append(cls._source_from_files(directory, files))
+                legacy_sources.append(cls._source_from_files(directory, files))
+        if processed_layout_seen:
+            return cls(processed_sources, default_doctor=default_doctor)
+
         flat_sources: dict[str, DoctorSource] = {}
         for file in sorted(root.glob("*.json")):
             if not file.is_file() or file.name.startswith(("._", ".")):
@@ -78,11 +92,19 @@ class DoctorCatalog:
                 flat_sources[source.key].files.append(file)
             else:
                 flat_sources[source.key] = source
-        sources.extend(flat_sources.values())
+        sources = legacy_sources + list(flat_sources.values())
         return cls(sources, default_doctor=default_doctor)
 
     @staticmethod
     def _source_from_files(directory: Path, files: list[Path]) -> DoctorSource:
+        processed_match = PROCESSED_DIRECTORY_PATTERN.fullmatch(directory.name)
+        if processed_match:
+            return DoctorSource(
+                key=processed_match.group("doctor_id"),
+                name=processed_match.group("doctor_name"),
+                doctor_id=processed_match.group("doctor_id"),
+                files=files,
+            )
         key = directory.name
         for prefix in DATASET_DIRECTORY_PREFIXES:
             if key.startswith(prefix):
@@ -94,6 +116,31 @@ class DoctorCatalog:
         doctor_id_match = re.search(r"_(\d+)_\d{14}$", filename)
         doctor_id = doctor_id_match.group(1) if doctor_id_match else ""
         return DoctorSource(key=key, name=name, doctor_id=doctor_id, files=files)
+
+    @staticmethod
+    def _read_records(path: Path) -> list[dict]:
+        if path.suffix == ".jsonl":
+            records = []
+            with path.open("r", encoding="utf-8") as file:
+                for line_number, line in enumerate(file, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise ValueError(f"Invalid JSONL at {path}:{line_number}: {error}") from error
+                    if not isinstance(record, dict):
+                        raise ValueError(f"Each JSONL line must contain an object: {path}:{line_number}")
+                    records.append(record)
+            return records
+
+        with path.open("r", encoding="utf-8") as file:
+            records = json.load(file)
+        if not isinstance(records, list):
+            raise ValueError(f"The input JSON must contain a list: {path}")
+        if not all(isinstance(record, dict) for record in records):
+            raise ValueError(f"Every input JSON item must contain an object: {path}")
+        return records
 
     def list_doctors(self) -> dict[str, object]:
         items = []
@@ -123,10 +170,7 @@ class DoctorCatalog:
             doctor_ids = []
             total_records = 0
             for path in source.files:
-                with path.open("r", encoding="utf-8") as file:
-                    records = json.load(file)
-                if not isinstance(records, list):
-                    raise ValueError(f"The input JSON must contain a list: {path}")
+                records = self._read_records(path)
                 total_records += len(records)
                 for record in records:
                     record_id = record.get("id")

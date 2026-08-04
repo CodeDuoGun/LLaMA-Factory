@@ -43,7 +43,7 @@ from medical.data_utils.db_manager import DBManager
 
 
 MODULE_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_ROOT = MODULE_DIR.parent / "data" / "202301_online"
+DEFAULT_DATA_ROOT = MODULE_DIR.parent / "processed_data"
 DEFAULT_DOCTOR = "1314"
 
 
@@ -516,7 +516,7 @@ def main() -> None:
         "--data-root",
         type=Path,
         default=DEFAULT_DATA_ROOT,
-        help="Root containing doctor JSON files or online_* directories.",
+        help="Root containing doctor_* directories with medical_records_ai_normalized.jsonl.",
     )
     parser.add_argument("--doctor", default=DEFAULT_DOCTOR, help="Default doctor ID or directory key.")
     parser.add_argument("--host", default="127.0.0.1")

@@ -43,6 +43,11 @@ def _write(path: Path, records: list[dict]) -> None:
     path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
 
 
+def _write_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
+
+
 def test_catalog_discovers_doctors_and_merges_supplements(tmp_path: Path) -> None:
     _write(
         tmp_path / "online_alpha" / "甲医生_AI医生分身混合问诊数据_1_20260101000000.json", [_record(1, 1, "甲医生")]
@@ -91,3 +96,30 @@ def test_catalog_discovers_flat_online_doctor_files(tmp_path: Path) -> None:
     assert {item["doctor_name"] for item in doctors["items"]} == {"甲医生", "乙医生"}
     assert catalog.get("1").raw_record_count == 1
     assert catalog.get("2").raw_record_count == 1
+
+
+def test_catalog_discovers_only_normalized_processed_doctor_jsonl(tmp_path: Path) -> None:
+    doctor_dir = tmp_path / "doctor_43_朱子奇"
+    _write(tmp_path / "filter.json", [_record(99, 99, "非医生辅助数据")])
+    _write_jsonl(doctor_dir / "medical_records_ai.jsonl", [_record(1, 43, "朱子奇")])
+    normalized_record = _record(2, 43, "朱子奇")
+    normalized_record["ai_diagnosis_illness"] = "胃癌"
+    _write_jsonl(doctor_dir / "medical_records_ai_normalized.jsonl", [normalized_record])
+
+    catalog = DoctorCatalog.discover(tmp_path, default_doctor="43")
+    doctors = catalog.list_doctors()
+
+    assert doctors["default_doctor"] == "43"
+    assert doctors["items"] == [
+        {
+            "key": "43",
+            "doctor_name": "朱子奇",
+            "doctor_id": "43",
+            "file_count": 1,
+            "record_count": None,
+            "loaded": False,
+            "duplicate_records": 0,
+        }
+    ]
+    assert catalog.sources["43"].files == [doctor_dir / "medical_records_ai_normalized.jsonl"]
+    assert catalog.get("43").raw_record_count == 1
