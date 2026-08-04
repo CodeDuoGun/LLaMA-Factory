@@ -26,6 +26,7 @@ import tempfile
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -337,6 +338,31 @@ def _mapping_specs(args: argparse.Namespace) -> list[MappingSpec]:
             False,
         ),
     ]
+
+
+@lru_cache(maxsize=1)
+def load_default_label_mappings() -> dict[str, LabelMapping]:
+    """按需加载三份默认词表，同一进程内只读取一次 Excel."""
+    args = argparse.Namespace(
+        tcm_disease_mapping=DEFAULT_TCM_DISEASE_MAPPING,
+        tcm_syndrome_mapping=DEFAULT_TCM_SYNDROME_MAPPING,
+        western_diagnosis_mapping=DEFAULT_WESTERN_DIAGNOSIS_MAPPING,
+    )
+    mappings = [load_label_mapping(spec) for spec in _mapping_specs(args)]
+    return {mapping.spec.field_name: mapping for mapping in mappings}
+
+
+def normalize_ai_diagnosis_to_standard(field_name: str, value: Any) -> Any:
+    """先执行字段现有别名规则，再通过 Excel mapping 替换为标准名."""
+    mappings = load_default_label_mappings()
+    if field_name not in mappings:
+        raise ValueError(f"不支持的 AI 诊断字段: {field_name}")
+    mapping = mappings[field_name]
+    alias_normalized = mapping.spec.normalizer(value)
+    if not alias_normalized:
+        return alias_normalized
+    standard_value, _, _ = normalize_label_value(alias_normalized, mapping)
+    return standard_value
 
 
 def _default_output(input_path: Path) -> Path:

@@ -45,7 +45,7 @@ import re
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import ExitStack
 from datetime import date
 from html.parser import HTMLParser
@@ -72,7 +72,6 @@ from medical.data_utils.structured_agent import (
 from medical.utils.log import logger
 from medical.data_utils.medical_record_formatters import (
     format_inspection_result_text,
-    format_tongue_face_result_descriptions,
     format_tongue_face_result_text,
 )
 from dotenv import load_dotenv
@@ -84,7 +83,6 @@ from medical.schema.clear_record_basemodel import (
     HistoryCleaningResult,
     ImageClassificationResult,
     InspectionResult,
-    TONGUE_FACE_RESULT_FIELD_CN_MAPPING,
     TongueFaceResult,
 )
 
@@ -95,7 +93,8 @@ load_dotenv(PROJECT_ROOT / ".env.local")
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from medical.analysis.engine import normalize_diagnosis_value, normalize_sickness_value, normalize_syndrome_value  # noqa: E402
+from medical.analysis.engine import normalize_diagnosis_value, normalize_sickness_value  # noqa: E402
+from medical.data_utils.normalize_ai_diagnosis_labels import normalize_ai_diagnosis_to_standard  # noqa: E402
 
 DEFAULT_INPUT = Path("medical/data/202301_online")
 DEFAULT_OUTPUT_DIR = Path("medical/processed_data")
@@ -1238,19 +1237,16 @@ class MedicalRecordAgents:
             agent_name="diagnosis_completion_agent",
         )
         values = _model_dump(result)
-        normalizers = {
-            "diagnosis_illness": normalize_diagnosis_value,
-            "diagnosis_sickness": normalize_sickness_value,
-            "diagnosis_disease": normalize_syndrome_value,
-        }
         for field in DIAGNOSIS_FIELDS:
             original_value = _clean_generated_text(source_diagnoses.get(field))
             if field != "diagnosis_illness" and original_value:
-                record[f"ai_{field}"] = original_value
+                record[f"ai_{field}"] = normalize_ai_diagnosis_to_standard(f"ai_{field}", original_value)
                 record[f"ai_{field}_reason"] = "原字段非空，按要求保留原诊断结果。"
                 continue
 
-            record[f"ai_{field}"] = normalizers[field](_clean_generated_text(values.get(field)))
+            record[f"ai_{field}"] = normalize_ai_diagnosis_to_standard(
+                f"ai_{field}", _clean_generated_text(values.get(field))
+            )
             if not record[f"ai_{field}"]:
                 raise ValueError(f"DiagnosisResult.{field} 不能为空")
             reason = _clean_generated_text(values.get(f"{field}_reason"))

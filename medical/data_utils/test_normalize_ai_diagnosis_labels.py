@@ -24,6 +24,7 @@ from medical.data_utils.normalize_ai_diagnosis_labels import (
     LabelMapping,
     MappingSpec,
     load_label_mapping,
+    normalize_ai_diagnosis_to_standard,
     normalize_jsonl,
     normalize_label_value,
 )
@@ -119,3 +120,10 @@ def test_unmatched_structured_text_is_preserved_as_one_value() -> None:
     assert normalized == value
     assert matched_count == 0
     assert unmatched == [value]
+
+
+def test_agent_normalization_applies_alias_rules_before_standard_mapping() -> None:
+    assert normalize_ai_diagnosis_to_standard("ai_diagnosis_illness", "肺结节病") == "肺结节病"
+    assert normalize_ai_diagnosis_to_standard("ai_diagnosis_disease", "实热") == "里热证"
+    assert normalize_ai_diagnosis_to_standard("ai_diagnosis_sickness", "胃痞病") == "胃痞病"
+    assert normalize_ai_diagnosis_to_standard("ai_diagnosis_sickness", "咳嗽病") == "咳嗽"

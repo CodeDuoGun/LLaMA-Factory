@@ -90,6 +90,39 @@ def test_normalize_medical_history_decodes_entities_and_removes_empty_markup() -
     assert empty_record["new_medical_history"] == ""
 
 
+def test_complete_diagnoses_maps_alias_normalized_ai_values_to_standard_names() -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.reviewer_agent = None
+    agents.diagnosis_agent = SimpleNamespace()
+
+    async def ainvoke(_messages):
+        return SimpleNamespace(
+            content=json.dumps(
+                {
+                    "diagnosis_illness": "肺结节病",
+                    "diagnosis_disease": "实热",
+                    "diagnosis_sickness": "胃痞病",
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    agents.diagnosis_agent.ainvoke = ainvoke
+    record = {
+        "diagnosis_illness": "肺结节病",
+        "diagnosis_disease": "实热",
+        "diagnosis_sickness": "胃痞病",
+        "patient_appeal": "咳嗽",
+        "new_medical_history": "反复咳嗽",
+    }
+
+    asyncio.run(agents.complete_diagnoses(record))
+
+    assert record["ai_diagnosis_illness"] == "肺结节病"
+    assert record["ai_diagnosis_disease"] == "里热证"
+    assert record["ai_diagnosis_sickness"] == "胃痞病"
+
+
 def test_structured_agent_review_revises_failed_result() -> None:
     source_agent = FakeStructuredAgent(
         [

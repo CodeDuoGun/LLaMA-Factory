@@ -8,7 +8,9 @@
 - 基于病例病情和处方的 LLM 开方原因、配伍逻辑解释；
 - 相邻复诊的保留药、新增药、停用药和剂量增减；
 - 当前症状与新增药之间的探索性关联；
-- 完全脱敏的患者纵向时间轴。
+- 完全脱敏的患者纵向时间轴；
+- 按西医诊断、中医疾病、中医证候和初复诊分层的多维基础方图谱；
+- 按患者、按病历审核 AI 结构化字段的人工标注工作台。
 
 分析系统向浏览器返回原始 `patient_id`，用于患者搜索和时间轴展示；不会返回姓名、身份证号或手机号。
 
@@ -20,14 +22,14 @@
 python -m medical.analysis.app
 ```
 
-然后访问 <http://127.0.0.1:8008>。系统自动发现以下目录中的所有 JSON 文件：
+然后访问 <http://127.0.0.1:8008>。默认读取：
 
 ```text
-medical/data/online_*/
+medical/data/202301_online/
 ```
 
-每个 `online_<doctor_key>` 目录代表一位医生。前端医生选择器会自动显示已发现的医生；同一目录下的后续补充
-JSON 会自动合并，并按问诊记录 `id` 去重。例如李同新的后续文件只需放入：
+数据目录既可以直接包含各医生 JSON，也可以包含 `online_<doctor_key>`、`zongyuan_<doctor_key>` 子目录。
+前端医生选择器会自动显示已发现的医生；同一医生的后续补充 JSON 会自动合并，并按问诊记录 `id` 去重。
 
 ```text
 medical/data/online_litongxin/
@@ -51,6 +53,64 @@ python -m medical.analysis.app --data-root medical/data --doctor zhuziqi
 MEDICAL_ANALYSIS_DATA=/absolute/path/to/records.json uvicorn medical.analysis.app:app --host 0.0.0.0 --port 8008
 ```
 
+需要让局域网其他设备访问时，可直接运行：
+
+```bash
+uvicorn medical.analysis.app:app --host 0.0.0.0 --port 8008
+```
+
+其他设备通过 `http://<运行机器的局域网IP>:8008` 访问；同时需要确保系统防火墙允许 TCP 8008 端口。
+
+## 样本分析界面
+
+页面顶部的医生选择会作用于当前全部分析页签。切换医生后，各页签只展示该医生的数据，避免跨医生混合统计。
+
+| 页签 | 主要内容 | 使用方式 |
+|---|---|---|
+| 总览 | 病历、患者、复诊规模，三类诊断分布，高频药物和数据质量 | 用于先判断样本规模、字段完整性和主要病种构成 |
+| 疾病与处方 | 病种核心药、使用率、Lift、剂量，同病异方和相似方异病 | 选择疾病后查看聚合结果；展开病例可按需调用 LLM 分析处方 |
+| 多维基础方图谱 | 西医诊断、中医疾病、中医证候、初复诊等维度组合，候选基础方与对照实验 | 设置维度和最小患者数，仅对达到阈值的分层执行挖掘 |
+| 复诊调方 | 相邻就诊的保留药、新增药、停用药和剂量变化 | 可按疾病、当前症状和疗效反馈筛选 |
+| 患者时间轴 | 同一患者的初复诊顺序、病情和完整处方 | 支持患者 ID 搜索和初诊/复诊筛选 |
+| 病历标注 | 原始字段与 AI 字段并排审核，按患者逐条保存 | 只修改 `ai_` 字段，保存后同步更新数据库标注状态 |
+
+### 病历标注
+
+病历标注页的数据来自 MySQL 标注表，而不是浏览器直接修改源 JSON。默认表名为
+`mlops_annotation_medical_record`，可通过环境变量覆盖：
+
+```bash
+export MEDICAL_ANNOTATION_DATABASE_URL='mysql+pymysql://user:password@host:port/database?charset=utf8mb4'
+export MEDICAL_ANNOTATION_TABLE='mlops_annotation_medical_record'
+python -m medical.analysis.app
+```
+
+若未设置 `MEDICAL_ANNOTATION_DATABASE_URL`，服务会回退读取 `medical/data_utils/config.yaml` 或 `.env`
+中的 `DATABASE_URL`。分析数据中的医生 ID 需要与标注表中的医生 ID 一致。
+
+标注流程如下：
+
+1. 左侧选择患者，再按时间顺序选择该患者的病历。
+2. 左侧展示原始字段且只读，右侧展示并允许修改相应的 `ai_` 字段；输入区域会随内容量调整高度。
+3. 主诉原始侧分别展示 `patient_appeal` 和 `doc_ass_stu_appeal`。检查报告图片优先使用
+   `inspection_report_img`，为空时使用 `admin_report_img`；舌面图片优先使用 `tongue_face_img`，为空时使用
+   `admin_face_img`。
+4. 图片默认显示缩略图，点击后可放大；同一字段有多张图片时可点击左右按钮或使用键盘方向键切换。
+5. AI 舌面图结果通过 `format_tongue_face_result_descriptions` 转为可读文本；AI 检查报告仅展示报告时间、
+   报告名称和异常指标，没有异常指标时显示“无异常指标”。复杂原始 JSON 仍可展开查看和编辑。
+6. 点击保存时，只更新允许标注的 AI 字段，不改动任何原始字段；同一数据库事务中将该病历
+   `status` 更新为 `labeled`、`operator` 更新为 `HUMAN`。
+
+默认标注全部业务 `ai_` 字段，但排除流程和一致性元数据：
+
+```text
+ai_complaint_history_issues
+ai_complaint_history_consistent
+ai_processing_complete
+ai_processing_version
+ai_record_identity
+```
+
 ## API
 
 | 地址 | 用途 |
@@ -62,11 +122,18 @@ MEDICAL_ANALYSIS_DATA=/absolute/path/to/records.json uvicorn medical.analysis.ap
 | `GET /api/diseases/{disease}` | 病种核心药、症状和调方关联 |
 | `GET /api/diseases/{disease}/comparisons` | 同病异方、相似方异病病例 |
 | `GET /api/base-formulas/strata` | 疾病—证候组合、独立患者数和可挖掘状态 |
+| `GET /api/base-formulas/dimensions` | 多维基础方可选维度和取值 |
+| `GET /api/base-formulas/multidimensional/strata` | 多维组合分层及样本量 |
+| `GET /api/base-formulas/multidimensional` | 查询指定多维分层的候选基础方 |
 | `GET /api/base-formulas` | 按疾病和证候查询患者加权的候选基础方 |
 | `GET /api/revisits` | 可按疾病、症状、反馈筛选的复诊变化对 |
 | `GET /api/associations` | 症状—新增药探索性 Lift |
 | `GET /api/patients` | 带 `patient_id` 的患者列表 |
 | `GET /api/patients/{patient_id}` | 按 `patient_id` 查询患者时间轴 |
+| `GET /api/annotations/fields` | 可标注 AI 字段及展示信息 |
+| `GET /api/annotations/patients` | 标注患者列表和进度 |
+| `GET /api/annotations/patients/{patient_id}` | 某患者的待审核病历 |
+| `POST /api/annotations/save` | 保存 AI 字段并标记为人工已标注 |
 | `GET /api/llm/status` | LLM 配置状态 |
 | `POST /api/visits/{visit_id}/prescription-explanation` | 生成处方原因与配伍逻辑 |
 | `GET /docs` | FastAPI 自动接口文档 |
@@ -109,7 +176,7 @@ export MEDICAL_ANALYSIS_LLM_MODEL=your-model
 ## 测试
 
 ```bash
-WANDB_DISABLED=true pytest -q --import-mode=importlib medical/analysis/tests
+PYTHONPATH=. WANDB_DISABLED=true pytest -q --import-mode=importlib medical/analysis/tests
 ```
 
 ## 患者加权的基方挖掘
