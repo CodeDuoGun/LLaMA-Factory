@@ -35,10 +35,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     import_parser = subparsers.add_parser(
         "import",
-        help="创建表并批量写入 JSONL，已存在 order_sn + AI 版本会跳过",
+        help="创建表并批量写入 JSONL，order_sn 已存在则更新，否则插入",
     )
     import_parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     import_parser.add_argument("--batch-size", type=int, default=100)
+
+    migrate_parser = subparsers.add_parser(
+        "add-treatment-principle-column",
+        help="新增 ai_treatment_principle 字段",
+    )
+    migrate_parser.add_argument("--yes", action="store_true", help="确认修改数据表结构")
+
+    delete_doctor_parser = subparsers.add_parser("delete-doctor", help="删除指定 doctor_id 的所有行数据")
+    delete_doctor_parser.add_argument("doctor_id", help="医生 ID")
+    delete_doctor_parser.add_argument("--yes", action="store_true", help="确认删除该医生的全部记录")
 
     clear_parser = subparsers.add_parser("clear", help="清空数据表")
     clear_parser.add_argument("--yes", action="store_true", help="确认清空整张表")
@@ -71,9 +81,22 @@ def main() -> None:
     if args.command == "import":
         count = repository.import_jsonl(args.input, batch_size=args.batch_size)
         print(
-            f"已新增 {count} 条 AI 病例标注记录；"
-            f"已存在 order_sn + AI 版本的记录已跳过；数据表: {repository.table.name}"
+            f"已写入或更新 {count} 条 AI 病例标注记录；"
+            f"order_sn 已存在的记录已更新；数据表: {repository.table.name}"
         )
+    elif args.command == "add-treatment-principle-column":
+        if not args.yes:
+            raise SystemExit("修改数据表结构需要显式添加 --yes")
+        added = repository.add_ai_treatment_principle_column()
+        if added:
+            print(f"已为数据表 {repository.table.name} 新增字段 ai_treatment_principle")
+        else:
+            print(f"数据表 {repository.table.name} 已存在字段 ai_treatment_principle，无需修改")
+    elif args.command == "delete-doctor":
+        if not args.yes:
+            raise SystemExit("删除指定 doctor_id 的全部记录需要显式添加 --yes")
+        count = repository.delete_by_doctor_id(args.doctor_id)
+        print(f"已删除数据表 {repository.table.name} 中 doctor_id={args.doctor_id} 的 {count} 行")
     elif args.command == "clear":
         if not args.yes:
             raise SystemExit("清空整张表需要显式添加 --yes")

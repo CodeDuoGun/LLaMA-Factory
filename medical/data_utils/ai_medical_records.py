@@ -33,7 +33,10 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    inspect,
     insert,
+    text,
+    update,
 )
 
 
@@ -132,6 +135,7 @@ AI_TEXT_FIELDS = (
     "ai_diagnosis_sickness_reason",
     "ai_disease_stage",
     "ai_disease_course",
+    "ai_treatment_principle",
     "ai_record_identity",
 )
 AI_JSON_FIELDS = (
@@ -326,32 +330,74 @@ class AIMedicalRecordRepository:
         """不存在时创建数据表."""
         self.manager.create_table(self.table, checkfirst=True)
 
+    def add_ai_treatment_principle_column(self) -> bool:
+        """为当前标注表补充 ai_treatment_principle 字段，已存在时跳过."""
+        self.create_table()
+        inspector = inspect(self.manager.engine)
+        column_names = {column["name"] for column in inspector.get_columns(self.table.name, schema=self.table.schema)}
+        if "ai_treatment_principle" in column_names:
+            return False
+
+        preparer = self.manager.engine.dialect.identifier_preparer
+        table_name = preparer.quote(self.table.name)
+        if self.table.schema:
+            table_name = f"{preparer.quote_schema(self.table.schema)}.{table_name}"
+        column_name = preparer.quote("ai_treatment_principle")
+        with self.manager.connection(transactional=True) as connection:
+            connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} TEXT"))
+        self.manager.refresh_table(self.table.name, schema=self.table.schema)
+        return True
+
+    def batch_upsert_by_order_sn(
+        self,
+        records: Iterable[Mapping[str, Any]],
+        *,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+    ) -> int:
+        """分批写入病历；order_sn 已存在时更新该记录，否则插入新记录."""
+        total = 0
+        for batch in _batched((record_to_row(record) for record in records), batch_size):
+            rows = self._dedupe_rows_by_order_sn(batch)
+            if not rows:
+                continue
+            existing_order_sns = self._existing_order_sns(rows)
+            rows_to_update = [row for row in rows if row["order_sn"] in existing_order_sns]
+            rows_to_insert = [row for row in rows if row["order_sn"] not in existing_order_sns]
+            with self.manager.connection(transactional=True) as connection:
+                for row in rows_to_update:
+                    connection.execute(
+                        update(self.table)
+                        .where(self.table.c.order_sn == row["order_sn"])
+                        .values(**row)
+                    )
+                if rows_to_insert:
+                    connection.execute(insert(self.table), rows_to_insert)
+            total += len(rows_to_update) + len(rows_to_insert)
+        return total
+
     def batch_insert_missing(
         self,
         records: Iterable[Mapping[str, Any]],
         *,
         batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> int:
-        """分批新增病历；order_sn + ai_processing_version 已存在的数据会跳过."""
-        total = 0
-        for batch in _batched((record_to_row(record) for record in records), batch_size):
-            rows = self._exclude_existing_rows(batch)
-            if not rows:
-                continue
-            with self.manager.connection(transactional=True) as connection:
-                connection.execute(insert(self.table), rows)
-            total += len(rows)
-        return total
+        """兼容旧方法名：按 order_sn 执行更新或插入."""
+        return self.batch_upsert_by_order_sn(records, batch_size=batch_size)
 
     def import_jsonl(self, path: str | Path, *, batch_size: int = DEFAULT_BATCH_SIZE) -> int:
-        """创建表并批量导入 JSONL，已存在 order_sn + ai_processing_version 的记录会跳过."""
+        """创建表并批量导入 JSONL，order_sn 已存在时更新，否则插入."""
         self.create_table()
-        return self.batch_insert_missing(iter_jsonl(path), batch_size=batch_size)
+        return self.batch_upsert_by_order_sn(iter_jsonl(path), batch_size=batch_size)
 
     def clear(self) -> int:
         """清空数据表，返回删除行数."""
         self.create_table()
         return self.manager.delete(self.table.name, filters=None, allow_all=True)
+
+    def delete_by_doctor_id(self, doctor_id: int | str) -> int:
+        """删除指定 doctor_id 的全部记录，返回删除行数."""
+        self.create_table()
+        return self.manager.delete(self.table.name, filters={"doctor_id": doctor_id})
 
     def get_by_patient_id(self, patient_id: int, *, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         """按患者 ID 查询病历列表."""
@@ -420,3 +466,19 @@ class AIMedicalRecordRepository:
         )
         existing_keys = {(row["order_sn"], row["ai_processing_version"]) for row in existing_rows}
         return [row for row in unique_rows if (row["order_sn"], row["ai_processing_version"]) not in existing_keys]
+
+    @staticmethod
+    def _dedupe_rows_by_order_sn(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        unique_rows: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            unique_rows[row["order_sn"]] = row
+        return list(unique_rows.values())
+
+    def _existing_order_sns(self, rows: list[dict[str, Any]]) -> set[str]:
+        order_sns = [row["order_sn"] for row in rows]
+        existing_rows = self.manager.select(
+            self.table.name,
+            filters={"order_sn": order_sns},
+            columns=["order_sn"],
+        )
+        return {row["order_sn"] for row in existing_rows}
