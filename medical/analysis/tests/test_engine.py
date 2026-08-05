@@ -96,6 +96,7 @@ def test_diagnosis_value_normalizes_separator_order_and_duplicates() -> None:
     assert normalize_diagnosis_value("肝脾血瘀证,l") == "l、肝脾血瘀证"
     assert normalize_diagnosis_value("？2型糖尿病？,HPV感染") == "2型糖尿病、HPV感染"
     assert normalize_diagnosis_value("多囊卵巢综合征[Stein-Leventhal综合征]") == "多囊卵巢综合征"
+    assert normalize_diagnosis_value("酒渣鼻、玫瑰痤疮") == "玫瑰痤疮"
 
 
 def test_syndrome_value_normalizes_suffix_order_and_concatenation() -> None:
@@ -125,6 +126,7 @@ def test_sickness_value_uses_tcm_disease_aliases_only() -> None:
     assert normalize_sickness_value("咳嗽病") == "咳嗽"
     assert normalize_sickness_value("肺结节病") == "肺结节病"
     assert normalize_sickness_value("咳嗽病、胃痞病、咳嗽病") == "咳嗽、胃痞病"
+    assert normalize_sickness_value("酒槽鼻、酒齄鼻") == "酒齄鼻"
 
 
 def test_longitudinal_difference_uses_patient_id() -> None:

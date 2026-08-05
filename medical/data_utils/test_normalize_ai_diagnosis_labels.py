@@ -127,3 +127,5 @@ def test_agent_normalization_applies_alias_rules_before_standard_mapping() -> No
     assert normalize_ai_diagnosis_to_standard("ai_diagnosis_disease", "实热") == "里热证"
     assert normalize_ai_diagnosis_to_standard("ai_diagnosis_sickness", "胃痞病") == "胃痞病"
     assert normalize_ai_diagnosis_to_standard("ai_diagnosis_sickness", "咳嗽病") == "咳嗽"
+    assert normalize_ai_diagnosis_to_standard("ai_diagnosis_illness", "酒渣鼻、玫瑰痤疮") == "玫瑰痤疮"
+    assert normalize_ai_diagnosis_to_standard("ai_diagnosis_sickness", "酒槽鼻、酒齄鼻") == "酒齄鼻"

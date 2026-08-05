@@ -408,6 +408,38 @@ tbody tr:hover { background: rgb(29 107 80 / 5%); }
 .image-preview-navigation:hover:not(:disabled) { border-color: white; background: rgb(10 17 13 / 90%); }
 .image-preview-navigation:focus-visible { outline: 3px solid rgb(255 255 255 / 28%); outline-offset: 2px; }
 .image-preview-navigation:disabled { opacity: .2; cursor: default; }
+.rag-eval-intro { justify-content: flex-start; }
+.rag-eval-intro > div { max-width: 780px; }
+.rag-eval-intro .section-note { max-width: none; margin: 8px 0 0; text-align: left; line-height: 1.7; }
+.rag-eval-config-panel { margin-bottom: 16px; padding: 18px 20px 20px; }
+.rag-eval-config-heading { margin-bottom: 16px; }
+.rag-eval-controls { display: grid; grid-template-columns: minmax(280px, 1.8fr) minmax(150px, .7fr) minmax(150px, .7fr) auto; gap: 14px; align-items: start; }
+.rag-eval-controls .control-label { min-width: 0; }
+.rag-eval-controls input { width: 100%; min-width: 0; min-height: 42px; }
+.rag-eval-controls small { display: block; margin-top: 4px; color: var(--muted); font-weight: 400; }
+.rag-eval-action { display: flex; align-items: flex-start; padding-top: 23px; }
+.rag-eval-action .primary-button { min-width: 112px; height: 42px; padding-block: 0; white-space: nowrap; }
+.rag-eval-action .primary-button:disabled { cursor: not-allowed; opacity: .48; }
+.rag-eval-dataset { margin-bottom: 16px; }
+.rag-eval-dataset-body { padding: 8px 0 4px; }
+.rag-eval-dataset-body code, .rag-eval-path { overflow-wrap: anywhere; }
+.rag-eval-dataset-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.rag-eval-dataset-grid > div { display: grid; gap: 3px; padding: 14px; border-radius: 10px; background: var(--surface-strong); }
+.rag-eval-dataset-grid strong { font-family: Georgia, serif; font-size: 25px; font-weight: 500; }
+.rag-eval-dataset-grid span, .rag-eval-path { color: var(--muted); font-size: 12px; }
+.rag-eval-path { margin: 12px 0 0; }
+.rag-eval-warning, .rag-eval-error, .rag-eval-refused { color: var(--red); }
+.rag-eval-status { display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 9px; background: var(--surface-strong); font-size: 11px; }
+.rag-eval-status.is-ready { background: #e7f3eb; color: #27613a; }
+.rag-eval-status.is-missing { background: #f4efe5; color: #755d2b; }
+.rag-eval-status.is-error { background: #f9e8e5; color: var(--red); }
+.rag-eval-progress-panel { margin-bottom: 16px; }
+.rag-eval-progress-track { height: 9px; overflow: hidden; border-radius: 999px; background: var(--surface-strong); }
+.rag-eval-progress-track span { display: block; width: 0; height: 100%; border-radius: inherit; background: var(--green); transition: width .35s ease; }
+.rag-eval-progress-panel p { margin: 10px 0 0; }
+.rag-eval-metrics { grid-template-columns: repeat(4, 1fr); }
+#rag-eval-details-panel td { min-width: 110px; vertical-align: top; }
+#rag-eval-details-panel td:nth-child(3), #rag-eval-details-panel td:nth-child(4) { min-width: 230px; }
 .empty-state { place-items: center; min-height: 300px; color: var(--muted); text-align: center; }
 .empty-state::before { display: none; }
 
@@ -416,6 +448,10 @@ footer { border-top: 1px solid var(--line); padding: 22px 0 34px; color: var(--m
 
 @media (max-width: 1050px) {
   .metric-grid { grid-template-columns: repeat(3, 1fr); }
+  .rag-eval-controls { grid-template-columns: repeat(2, 1fr); }
+  .rag-eval-action { padding-top: 23px; }
+  .rag-eval-action .primary-button { width: 100%; }
+  .rag-eval-dataset-grid { grid-template-columns: repeat(2, 1fr); }
   .metric-grid.compact, .quality-grid { grid-template-columns: repeat(2, 1fr); }
   .disease-layout { grid-template-columns: 1.3fr .7fr; }
 }
@@ -437,6 +473,8 @@ footer { border-top: 1px solid var(--line); padding: 22px 0 34px; color: var(--m
   .tabs { overflow-x: auto; }
   .tab { white-space: nowrap; padding-inline: 12px; }
   .metric-grid, .metric-grid.compact { grid-template-columns: repeat(2, 1fr); }
+  .rag-eval-controls, .rag-eval-dataset-grid { grid-template-columns: 1fr; }
+  .rag-eval-action { padding-top: 0; }
   .two-column, .three-column, .patient-layout, .formula-hero { grid-template-columns: 1fr; }
   .quality-grid { grid-template-columns: 1fr; }
   .filter-row, .search-form { width: 100%; flex-wrap: wrap; }

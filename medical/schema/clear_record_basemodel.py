@@ -37,17 +37,25 @@ class DiagnosisResult(BaseModel):
         return text
 
 class HistoryCleaningResult(BaseModel):
-    """主诉、现病史一致性校验及五史清洗结果."""
+    """主诉、现病史、五史及诊断的一体化清洗结果."""
 
-    patient_appeal: str = Field(default="", description="清洗或补全后的主诉，最终必须有内容")
+    patient_appeal: str = Field(default="", description="清洗后的主诉；所有允许来源均无有效信息时可为空")
     new_medical_history: str = Field(default="", description="经一致性校验、清洗或补全后的本次现病史，最终必须有内容")
     complaint_history_consistent: bool | None = Field(default=None, description="主诉与本次现病史是否一致")
     consistency_issues: list[str] = Field(default_factory=list, description="不一致点；无不一致时为空")
     old_medical_history: str = Field(default="", description="有效既往史")
     allergic_history: str = Field(default="", description="有效过敏史")
     personal_history: str = Field(default="", description="有效个人史")
-    special_history: str = Field(default="", description="有效专科史、婚育史或月经史")
+    special_history: str = Field(default="", description="有效专科特殊史，不与生育史、婚恋史重复")
+    birth_detail: str = Field(default="", description="有效生育史")
+    marriage_history: str = Field(default="", description="有效婚恋史")
     family_history: str = Field(default="", description="有效家族史")
+    diagnosis_illness: str = Field(default="", description="清洗修正后的西医诊断")
+    diagnosis_illness_reason: str = Field(default="", description="西医诊断修正理由")
+    diagnosis_disease: str = Field(default="", description="清洗修正后的中医证型")
+    diagnosis_disease_reason: str = Field(default="", description="中医证型修正理由")
+    diagnosis_sickness: str = Field(default="", description="清洗修正后的中医诊断")
+    diagnosis_sickness_reason: str = Field(default="", description="中医诊断修正理由")
 
     @field_validator("complaint_history_consistent", mode="before")
     @classmethod

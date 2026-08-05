@@ -39,6 +39,7 @@ from medical.analysis.base_formula import (
 from medical.analysis.catalog import DoctorCatalog
 from medical.analysis.engine import MedicalAnalysis
 from medical.analysis.llm import PrescriptionLLMService
+from medical.analysis.prescription_rag_eval import DEFAULT_INDEX_NAME, PrescriptionRAGEvaluationJobs
 from medical.data_utils.db_manager import DBManager
 
 
@@ -54,6 +55,14 @@ class AnnotationSaveRequest(BaseModel):
     fields: dict[str, object]
 
 
+class PrescriptionRAGEvaluationRequest(BaseModel):
+    """开方RAG评测任务参数."""
+
+    index_name: str = Field(default=DEFAULT_INDEX_NAME, min_length=1, max_length=200)
+    limit: int = Field(default=0, ge=0, le=10000)
+    top_k: int = Field(default=10, ge=10, le=100)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     explicit_file = os.getenv("MEDICAL_ANALYSIS_DATA")
@@ -66,6 +75,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.catalog.get()
     app.state.llm = PrescriptionLLMService()
+    app.state.prescription_rag_eval = PrescriptionRAGEvaluationJobs()
     app.state.base_formula_cache = {}
     annotation_manager = DBManager(os.getenv("MEDICAL_ANNOTATION_DATABASE_URL"))
     app.state.annotation_service = MedicalAnnotationService(
@@ -77,6 +87,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        app.state.prescription_rag_eval.close()
         annotation_manager.close()
 
 
@@ -482,6 +493,52 @@ def save_annotation(
         raise HTTPException(status_code=422, detail=str(error)) from error
     except SQLAlchemyError as error:
         raise HTTPException(status_code=503, detail="标注保存失败，请稍后重试") from error
+
+
+@app.get("/api/prescription-rag-eval/dataset")
+def prescription_rag_eval_dataset(request: Request, doctor: str | None = None) -> dict[str, object]:
+    """返回当前医生评测集的患者级隔离检查和样本规模."""
+    service = analysis(request, doctor)
+    doctor_id = str(service.doctor_id or "")
+    if not doctor_id:
+        raise HTTPException(status_code=422, detail="当前医生数据未包含 doctor_id")
+    try:
+        info = request.app.state.prescription_rag_eval.datasets.info(doctor_id, service.doctor_name)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    info["agent"] = request.app.state.prescription_rag_eval.evaluator_factory.__name__
+    return info
+
+
+@app.post("/api/prescription-rag-eval/run")
+def run_prescription_rag_eval(
+    request: Request,
+    payload: PrescriptionRAGEvaluationRequest,
+    doctor: str | None = None,
+) -> dict[str, object]:
+    """后台运行辨病、病例检索、开方和逐项评测."""
+    service = analysis(request, doctor)
+    try:
+        return request.app.state.prescription_rag_eval.start(
+            str(service.doctor_id or ""),
+            service.doctor_name,
+            index_name=payload.index_name,
+            limit=payload.limit,
+            top_k=payload.top_k,
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=f"未找到评测数据集，期望路径: {error}") from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.get("/api/prescription-rag-eval/jobs/{job_id}")
+def prescription_rag_eval_job(request: Request, job_id: str) -> dict[str, object]:
+    """查询后台评测进度和结果."""
+    try:
+        return request.app.state.prescription_rag_eval.get(job_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=f"评测任务不存在: {job_id}") from error
 
 
 @app.get("/api/llm/status")

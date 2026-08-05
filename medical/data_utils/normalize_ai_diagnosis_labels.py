@@ -49,6 +49,16 @@ DEFAULT_INPUT = PROJECT_ROOT / "medical/processed_data/doctor_43_朱子奇/medic
 DEFAULT_TCM_DISEASE_MAPPING = PROJECT_ROOT / "medical/data/辨病.xlsx"
 DEFAULT_TCM_SYNDROME_MAPPING = PROJECT_ROOT / "medical/data/辩证.xlsx"
 DEFAULT_WESTERN_DIAGNOSIS_MAPPING = PROJECT_ROOT / "medical/data/ICD10.xlsx"
+FINAL_LABEL_OVERRIDES = {
+    "ai_diagnosis_illness": {
+        "酒渣鼻": "玫瑰痤疮",
+        "玫瑰痤疮": "玫瑰痤疮",
+    },
+    "ai_diagnosis_sickness": {
+        "酒槽鼻": "酒齄鼻",
+        "酒齄鼻": "酒齄鼻",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -162,7 +172,13 @@ def normalize_label_value(value: Any, mapping: LabelMapping) -> tuple[Any, int, 
     mapped_parts = []
     matched_count = 0
     unmatched = []
+    final_overrides = FINAL_LABEL_OVERRIDES.get(mapping.spec.field_name, {})
     for raw_part in raw_parts:
+        forced_standard = final_overrides.get(raw_part)
+        if forced_standard is not None:
+            mapped_parts.append(forced_standard)
+            matched_count += 1
+            continue
         standard_name = mapping.alias_to_standard.get(raw_part)
         if standard_name is not None:
             mapped_parts.append(standard_name)
@@ -178,6 +194,7 @@ def normalize_label_value(value: Any, mapping: LabelMapping) -> tuple[Any, int, 
         else:
             mapped_parts.append(raw_part)
             unmatched.append(raw_part)
+    mapped_parts = [final_overrides.get(part, part) for part in mapped_parts]
     return "、".join(dict.fromkeys(mapped_parts)), matched_count, unmatched
 
 

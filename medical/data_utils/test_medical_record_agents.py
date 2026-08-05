@@ -17,8 +17,11 @@ import asyncio
 import base64
 import json
 import sys
-from io import BytesIO
+from datetime import date, datetime, time
+from decimal import Decimal
+from io import BytesIO, StringIO
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from langchain_core.messages import HumanMessage
@@ -36,6 +39,7 @@ from medical.schema.clear_record_basemodel import (
     InspectionFinding,
     InspectionResult,
     TongueFaceResult,
+    TreatmentPrincipleResult,
 )
 
 
@@ -51,6 +55,194 @@ class FakeStructuredAgent:
             "structured_response": response,
             "messages": [SimpleNamespace(content=f"returned {type(response).__name__}", tool_calls=[])],
         }
+
+
+def test_write_jsonl_serializes_common_mysql_types() -> None:
+    destination = StringIO()
+    medical_record_agents._write_jsonl(
+        destination,
+        {
+            "created_at": datetime(2026, 8, 5, 14, 30, 1),
+            "birthday": date(1990, 1, 2),
+            "visit_time": time(9, 15, 30),
+            "dose": Decimal("10.5"),
+            "count": Decimal("3"),
+            "record_uuid": UUID("12345678-1234-5678-1234-567812345678"),
+            "raw_text": "病历".encode(),
+        },
+    )
+
+    record = json.loads(destination.getvalue())
+    assert record == {
+        "created_at": "2026-08-05T14:30:01",
+        "birthday": "1990-01-02",
+        "visit_time": "09:15:30",
+        "dose": 10.5,
+        "count": 3,
+        "record_uuid": "12345678-1234-5678-1234-567812345678",
+        "raw_text": "病历",
+    }
+
+
+def test_history_fields_include_birth_and_normalized_marriage_history() -> None:
+    assert "birth_detail" in medical_record_agents.HISTORY_FIELDS
+    assert "marriage_history" in medical_record_agents.HISTORY_FIELDS
+    assert medical_record_agents._history_payload(
+        {"birth_detail": "育有1女", "is_marriage_history": "已婚"}
+    ) == {
+        "old_medical_history": "",
+        "allergic_history": "",
+        "personal_history": "",
+        "special_history": "",
+        "birth_detail": "育有1女",
+        "marriage_history": "已婚",
+        "family_history": "",
+    }
+    assert medical_record_agents._history_payload(
+        {"birth_detail": "育有1女", "is_marriage_history": "已婚"}, ai=True
+    )["birth_detail"] == "育有1女"
+
+
+def test_format_treatment_prescription_evidence_separates_internal_and_external() -> None:
+    prescriptions = [
+        {
+            "usage_type": "内服",
+            "prescription_items": {"drugList": [{"show_name": "黄芩"}, {"show_name": "黄芩"}]},
+        },
+        {
+            "usage_type": "外用",
+            "prescription_items": {"drugList": [{"show_name": "苦参"}]},
+        },
+    ]
+
+    assert medical_record_agents.format_treatment_prescription_evidence(prescriptions) == {
+        "内服": ["黄芩"],
+        "外用": ["苦参"],
+        "其他": [],
+    }
+
+
+def test_infer_treatment_principle_prioritizes_syndrome_evidence_and_splits_prescriptions() -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    treatment_agent = FakeStructuredAgent([TreatmentPrincipleResult(treatment_principle="清热利湿解毒，兼活血")])
+    agents.treatment_principle_agent = treatment_agent
+    agents.reviewer_agent = None
+    record = {
+        "ai_patient_appeal": "面部红斑丘疹",
+        "ai_new_medical_history": "面部红斑丘疹，舌红苔黄腻。",
+        "ai_diagnosis_illness": "玫瑰痤疮",
+        "ai_diagnosis_disease": "湿毒蕴肤证",
+        "ai_diagnosis_sickness": "酒齄鼻",
+        "ai_pathogenesis": ["湿毒蕴肤"],
+        "ai_disease_location": ["面部肌肤"],
+        "ai_disease_stage": "慢性活动期",
+        "ai_key_symptoms": ["面部红斑丘疹", "舌红苔黄腻"],
+        "is_marriage_history": "已婚",
+        "ps": [
+            {"usage_type": "内服", "prescription_items": {"drugList": [{"show_name": "黄芩"}]}},
+            {"usage_type": "外用", "prescription_items": {"drugList": [{"show_name": "苦参"}]}},
+        ],
+    }
+
+    asyncio.run(agents.infer_treatment_principle(record))
+
+    prompt = treatment_agent.calls[0]["messages"][0].content
+    assert '"中医证型":"湿毒蕴肤证"' in prompt
+    assert '"病机":["湿毒蕴肤"]' in prompt
+    assert '"内服":["黄芩"]' in prompt
+    assert '"外用":["苦参"]' in prompt
+    assert "剂量" not in prompt
+    assert record["ai_treatment_principle"] == "清热利湿解毒，兼活血"
+
+
+def test_export_mysql_records_serializes_datetime_and_replaces_partial_file(tmp_path, monkeypatch) -> None:
+    class FakeManager:
+        def __init__(self, database_url):
+            self.database_url = database_url
+
+        def refresh_table(self, table_name):
+            return SimpleNamespace(c={"id": object(), "doctor_id": object(), "doctor_name": object()})
+
+        def select(self, *args, **kwargs):
+            return [
+                {
+                    "id": 1,
+                    "doctor_id": "43",
+                    "doctor_name": "朱子奇",
+                    "created_at": datetime(2026, 8, 5, 14, 30, 1),
+                }
+            ]
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("medical.data_utils.db_manager.DBManager", FakeManager)
+    output_path = tmp_path / "doctor_43_朱子奇" / "records.jsonl"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("partial-record\n", encoding="utf-8")
+    args = SimpleNamespace(output_dir=tmp_path, doctor_id=[], limit=0)
+
+    assert medical_record_agents.export_mysql_records_to_local(args) == 1
+
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert rows == [
+        {
+            "id": 1,
+            "doctor_id": "43",
+            "doctor_name": "朱子奇",
+            "created_at": "2026-08-05T14:30:01",
+        }
+    ]
+
+
+def test_export_mysql_records_filters_multiple_doctors_and_splits_directories(tmp_path, monkeypatch) -> None:
+    select_calls = []
+
+    class FakeManager:
+        def __init__(self, database_url):
+            self.database_url = database_url
+
+        def refresh_table(self, table_name):
+            return SimpleNamespace(c={"id": object(), "doctor_id": object(), "doctor_name": object()})
+
+        def select(self, *args, **kwargs):
+            select_calls.append((args, kwargs))
+            # 故意返回一个未选医生，验证导出层不会依赖数据库适配器一定正确应用 filters。
+            return [
+                {"id": 1, "doctor_id": 43, "doctor_name": "朱子奇"},
+                {"id": 2, "doctor_id": "52", "doctor_name": "测试医生"},
+                {"id": 3, "doctor_id": "99", "doctor_name": "未选择医生"},
+            ]
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("medical.data_utils.db_manager.DBManager", FakeManager)
+    args = SimpleNamespace(output_dir=tmp_path, doctor_id=["52", "43", "43"], limit=0)
+
+    assert medical_record_agents.export_mysql_records_to_local(args) == 2
+    assert select_calls[0][1]["filters"] == {"doctor_id": ["43", "52"]}
+    assert (tmp_path / "doctor_43_朱子奇" / "records.jsonl").exists()
+    assert (tmp_path / "doctor_52_测试医生" / "records.jsonl").exists()
+    assert not (tmp_path / "doctor_99_未选择医生").exists()
+
+
+def test_export_mysql_records_rejects_doctor_filter_without_doctor_column(tmp_path, monkeypatch) -> None:
+    class FakeManager:
+        def __init__(self, database_url):
+            self.database_url = database_url
+
+        def refresh_table(self, table_name):
+            return SimpleNamespace(c={"id": object()})
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("medical.data_utils.db_manager.DBManager", FakeManager)
+    args = SimpleNamespace(output_dir=tmp_path, doctor_id=["43"], limit=0)
+
+    with pytest.raises(ValueError, match="不存在 doctor_id 字段"):
+        medical_record_agents.export_mysql_records_to_local(args)
 
 
 def test_normalize_medical_history_removes_frontend_tags() -> None:
@@ -835,10 +1027,12 @@ def test_process_record_batch_isolates_errors_and_timeouts() -> None:
 
 def test_process_record_batch_keeps_same_patient_visits_sequential() -> None:
     seen_previous_diagnoses = []
+    seen_previous_context = []
 
     class FakeAgents:
         async def process(self, record, **kwargs):
             seen_previous_diagnoses.append(record.get("__previous_diagnoses"))
+            seen_previous_context.append(record.get("__previous_record_context"))
             await asyncio.sleep(0)
             enriched = dict(record)
             enriched["ai_diagnosis_illness"] = record["diagnosis_illness"]
@@ -850,6 +1044,9 @@ def test_process_record_batch_keeps_same_patient_visits_sequential() -> None:
                 "id": record_id,
                 "doctor_id": "43",
                 "diagnosis_illness": diagnosis,
+                "patient_appeal": f"{diagnosis}主诉",
+                "new_medical_history": f"{diagnosis}现病史",
+                "see_doc_time": f"2026-01-0{record_id[-1]} 09:00:00",
             },
             "record_id": record_id,
             "identity": f"43:{record_id}",
@@ -875,6 +1072,14 @@ def test_process_record_batch_keeps_same_patient_visits_sequential() -> None:
             "diagnosis_illness": "诊断一",
             "diagnosis_disease": "",
             "diagnosis_sickness": "",
+        },
+    ]
+    assert seen_previous_context == [
+        None,
+        {
+            "visit_time": "2026-01-01 09:00:00",
+            "chief_complaint": "诊断一主诉",
+            "present_history": "诊断一现病史",
         },
     ]
 
@@ -1196,6 +1401,144 @@ def test_clean_histories_keeps_model_corrected_non_empty_complaint_and_history()
 
     assert record["ai_patient_appeal"] == "反复胃脘胀痛1年余，加重1周"
     assert record["ai_new_medical_history"].startswith("患者反复胃脘胀痛1年余")
+
+
+def test_clean_histories_passes_extended_context_and_writes_diagnoses() -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.reviewer_agent = None
+    agents.history_agent = FakeStructuredAgent(
+        [
+            HistoryCleaningResult(
+                patient_appeal="反复胃脘胀痛1年",
+                new_medical_history="患者反复胃脘胀痛1年。",
+                diagnosis_illness="慢性胃炎",
+                diagnosis_illness_reason="规范原西医诊断",
+                diagnosis_disease="脾胃虚弱证",
+                diagnosis_disease_reason="规范原中医证型",
+                diagnosis_sickness="胃痞病",
+                diagnosis_sickness_reason="规范原中医诊断",
+            )
+        ]
+    )
+    record = {
+        "patient_appeal": "胃胀1年",
+        "new_medical_history": "胃胀反复。",
+        "admin_face_describe": "舌淡，面色少华",
+        "birth_detail": "育有1子",
+        "is_marriage_history": "已婚",
+        "diagnosis_illness": "慢性胃炎",
+        "diagnosis_disease": "脾胃虚弱",
+        "diagnosis_sickness": "胃痞",
+        "ai_inspection_report_img": {},
+        "ai_tongue_face_img": {},
+    }
+
+    asyncio.run(agents.clean_histories(record))
+    prompt_content = agents.history_agent.calls[0]["messages"][0].content
+
+    assert "舌象及面相 admin_face_describe：舌淡，面色少华" in prompt_content
+    assert "生育史 birth_detail：育有1子" in prompt_content
+    assert "婚恋史 is_marriage_history：已婚" in prompt_content
+    assert "西医诊断 diagnosis_illness：慢性胃炎" in prompt_content
+    assert "中医证型 diagnosis_disease：脾胃虚弱" in prompt_content
+    assert "中医诊断 diagnosis_sickness：胃痞" in prompt_content
+    assert record["ai_diagnosis_illness"] == "慢性胃炎"
+    assert record["ai_diagnosis_illness_reason"] == "规范原西医诊断"
+    assert record["ai_diagnosis_disease_reason"] == "规范原中医证型"
+    assert record["ai_diagnosis_sickness_reason"] == "规范原中医诊断"
+
+
+def test_clean_histories_uses_previous_visit_and_moves_menstrual_history() -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.reviewer_agent = None
+    agents.history_agent = FakeStructuredAgent(
+        [
+            HistoryCleaningResult(
+                patient_appeal="",
+                new_medical_history="面部灼痛3日。",
+                personal_history="偶尔饮酒；月经周期28天",
+                special_history="末次月经2026年7月1日",
+            )
+        ]
+    )
+    record = {
+        "patient_appeal": "面部灼痛3日、瘙痒",
+        "new_medical_history": "面部灼痛3日。",
+        "personal_history": "偶尔饮酒；月经周期28天",
+        "special_history": "末次月经2026年7月1日",
+        "ai_inspection_report_img": {},
+        "ai_tongue_face_img": {},
+        "see_doc_time": "2026-07-10 09:00:00",
+        "__previous_record_context": {
+            "visit_time": "2026-06-20 09:00:00",
+            "chief_complaint": "反复面红",
+            "present_history": "反复面红伴灼热。",
+        },
+    }
+
+    asyncio.run(agents.clean_histories(record))
+    prompt_content = agents.history_agent.calls[0]["messages"][0].content
+
+    assert "上一次就诊时间：2026-06-20 09:00:00" in prompt_content
+    assert "上一次看诊主诉：反复面红" in prompt_content
+    assert "上一次病历现病史：反复面红伴灼热。" in prompt_content
+    assert "月经" not in record["ai_personal_history"]
+    assert "末次月经" not in record["ai_special_history"]
+    assert "月经周期28天" in record["ai_new_medical_history"]
+    assert "末次月经2026年7月1日" in record["ai_new_medical_history"]
+    assert "瘙痒" in record["ai_new_medical_history"]
+    assert record["ai_new_medical_history"].count("面部灼痛3日") == 1
+
+
+def test_complaint_fallback_uses_previous_complaint_or_empty() -> None:
+    assert medical_record_agents._fallback_patient_appeal(
+        {"__previous_record_context": {"chief_complaint": "面红伴灼热3月"}},
+        "",
+    ) == "面红伴灼热3月"
+    assert medical_record_agents._fallback_patient_appeal({}, "现病史不应用来编造主诉") == ""
+
+
+def test_history_prompt_requires_report_interval_and_no_invented_duration() -> None:
+    prompt = medical_record_agents._load_prompt("clinical_record_cleaning_prompt_v2.txt")
+
+    assert "脸疼3日" in prompt
+    assert "禁止写成“脸疼1年余3日”" in prompt
+    assert "晚于上一次就诊时间且不晚于本次就诊时间" in prompt
+    assert "现病史遗漏的症状必须补入" in prompt
+
+
+def test_process_runs_only_selected_stage_and_records_stage_names() -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.stage_timeout = 0
+    calls = []
+
+    async def clean_histories(record):
+        calls.append("clinical_cleaning")
+        record["ai_patient_appeal"] = "胃胀3天"
+
+    agents.clean_histories = clean_histories
+    record = {
+        "order_sn": "ONLY-CLEAN-1",
+        "patient_appeal": "胃胀3天",
+        "new_medical_history": "胃胀3天。",
+        "diagnosis_illness": "胃炎",
+    }
+
+    result = asyncio.run(agents.process(record, stage_names=["clinical_cleaning"]))
+
+    assert calls == ["clinical_cleaning"]
+    assert result["ai_patient_appeal"] == "胃胀3天"
+    assert result["ai_processing_stages"] == ["clinical_cleaning"]
+
+
+def test_stage_output_name_and_image_dependency() -> None:
+    assert medical_record_agents.resolve_stage_names(["inspection_vlm"]) == (
+        "image_classification",
+        "inspection_vlm",
+    )
+    assert medical_record_agents._stage_output_file_name(
+        ["clinical_cleaning", "diagnosis_completion"]
+    ) == "medical_records_ai__stage_clinical_cleaning__diagnosis_completion.jsonl"
 
 
 def test_history_cleaning_prompt_prefers_relative_report_time() -> None:

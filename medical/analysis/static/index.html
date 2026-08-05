@@ -11,7 +11,7 @@ You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content="疾病、病情、处方关系与复诊调方分析" />
     <title>问诊处方分析</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260805-rag-layout-2" />
   </head>
   <body>
     <header class="site-header">
@@ -38,6 +38,7 @@ You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2
       <button class="tab" type="button" data-view="base-formula" aria-selected="false">基础方图谱</button>
       <button class="tab" type="button" data-view="revisit" aria-selected="false">复诊调方</button>
       <button class="tab" type="button" data-view="patient" aria-selected="false">患者时间轴</button>
+      <button class="tab" type="button" data-view="prescription-rag-eval" aria-selected="false">开方 RAG 评测</button>
       <button class="tab" type="button" data-view="annotation" aria-selected="false">病历标注</button>
     </nav>
 
@@ -262,6 +263,52 @@ You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2
             <div id="timeline" class="timeline empty-state">从左侧选择患者 ID，查看病情与调方过程。</div>
           </article>
         </div>
+      </section>
+
+      <section id="view-prescription-rag-eval" class="view" aria-labelledby="prescription-rag-eval-title" hidden>
+        <div class="section-heading rag-eval-intro">
+          <div>
+            <p class="section-kicker">PATIENT-ISOLATED · RETRIEVAL & PRESCRIPTION</p>
+            <h2 id="prescription-rag-eval-title">开方 RAG 评测</h2>
+            <p class="section-note">辨病 Agent 只读取主诉、现病史和此前病历；开方 Agent 只读取辨病结果与召回病例，不读取真实处方。</p>
+          </div>
+        </div>
+
+        <div class="panel rag-eval-config-panel">
+          <div class="panel-heading rag-eval-config-heading">
+            <h3>评测设置</h3>
+            <span>参数仅作用于当前医生的患者级测试集</span>
+          </div>
+          <form id="prescription-rag-eval-form" class="rag-eval-controls">
+            <label class="control-label">ES 索引<input id="rag-eval-index" value="alpha_medical_prescription_rag_v1" autocomplete="off" /></label>
+            <label class="control-label">评测条数<input id="rag-eval-limit" type="number" min="0" max="10000" value="0" /><small>0 表示全部 test 样本</small></label>
+            <label class="control-label">召回 Top K<input id="rag-eval-top-k" type="number" min="10" max="100" value="10" /></label>
+            <div class="rag-eval-action"><button id="rag-eval-run" type="submit" class="primary-button">开始评测</button></div>
+          </form>
+        </div>
+
+        <div id="rag-eval-dataset" class="panel rag-eval-dataset" aria-live="polite">
+          <div class="panel-heading"><h3>评测数据集</h3><span>正在检查</span></div>
+          <div class="empty-state">正在读取当前医生的患者级评测数据。</div>
+        </div>
+
+        <div id="rag-eval-progress-panel" class="panel rag-eval-progress-panel" hidden>
+          <div class="panel-heading"><h3>任务进度</h3><span id="rag-eval-job-status">等待开始</span></div>
+          <div class="rag-eval-progress-track"><span id="rag-eval-progress-bar"></span></div>
+          <p id="rag-eval-progress-text" class="section-note"></p>
+        </div>
+
+        <div id="rag-eval-metrics" class="metric-grid rag-eval-metrics" aria-live="polite"></div>
+
+        <article id="rag-eval-details-panel" class="panel" hidden>
+          <div class="panel-heading"><h3>逐病例评测明细</h3><span id="rag-eval-detail-count"></span></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Query ID</th><th>相似病例</th><th>辨病结果</th><th>生成处方</th><th>处方 P/R/F1</th><th>安全与证据</th><th>状态</th></tr></thead>
+              <tbody id="rag-eval-details"></tbody>
+            </table>
+          </div>
+        </article>
       </section>
 
       <section id="view-annotation" class="view" aria-labelledby="annotation-title" hidden>

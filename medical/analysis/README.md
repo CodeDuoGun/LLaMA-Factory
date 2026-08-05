@@ -75,7 +75,41 @@ uvicorn medical.analysis.app:app --host 0.0.0.0 --port 8008
 | 多维基础方图谱 | 西医诊断、中医疾病、中医证候、初复诊等维度组合，候选基础方与对照实验 | 设置维度和最小患者数，仅对达到阈值的分层执行挖掘 |
 | 复诊调方 | 相邻就诊的保留药、新增药、停用药和剂量变化 | 可按疾病、当前症状和疗效反馈筛选 |
 | 患者时间轴 | 同一患者的初复诊顺序、病情和完整处方 | 支持患者 ID 搜索和初诊/复诊筛选 |
+| 开方 RAG 评测 | 辨病、相似病例召回、开方和逐病例指标 | 从 `medical/eval_data` 读取患者级隔离的医生评测集，在后台串行执行 |
 | 病历标注 | 原始字段与 AI 字段并排审核，按患者逐条保存 | 只修改 `ai_` 字段，保存后同步更新数据库标注状态 |
+
+### 开方 RAG 评测
+
+评测页按当前医生发现：
+
+```text
+medical/eval_data/doctor_<doctor_id>_<doctor_name>/prescription_rag_eval.jsonl
+```
+
+运行顺序为“辨病 Agent → ES 混合召回 → 开方 Agent → 指标计算”。辨病 Agent 只接收主诉、现病史、
+各类历史和当前就诊之前的历史病历；开方 Agent 只接收本次病情、辨病结果和召回病例。两者均不会收到
+`gold` 中的真实诊断和真实处方。具体字段和患者隔离要求见 `medical/eval_data/README.md`。
+
+任务在服务端单工作线程中后台运行，浏览器关闭不会中断任务。结果写入：
+
+```text
+medical/analysis/output/prescription_rag_eval/doctor_<doctor_id>_<doctor_name>/evaluation_<job_id>.json
+```
+
+也可使用命令行：
+
+```bash
+python medical/data_utils/evaluate_prescription_rag.py \
+  --doctor-id 43 \
+  --doctor-name 朱子奇 \
+  --index alpha_medical_prescription_rag_v1 \
+  --top-k 10
+```
+
+可使用 `MEDICAL_RAG_LLM_API_KEY`、`MEDICAL_RAG_LLM_BASE_URL`、`MEDICAL_RAG_LLM_MODEL` 单独配置评测模型；
+未设置时复用 `MEDICAL_ANALYSIS_LLM_*`。评测页会展示相似病例 Recall@5/10、NDCG@10、处方药味
+Precision/Recall/F1、核心药命中率、加减药 F1、剂量范围命中率、禁忌规则违反率、无证据药物数、
+拒答率以及医生修改药味和剂量数。
 
 ### 病历标注
 
@@ -137,6 +171,9 @@ ai_record_identity
 | `GET /api/annotations/patients` | 标注患者列表和进度 |
 | `GET /api/annotations/patients/{patient_id}` | 某患者的待审核病历 |
 | `POST /api/annotations/save` | 保存 AI 字段并标记为人工已标注 |
+| `GET /api/prescription-rag-eval/dataset` | 当前医生评测集规模和患者跨 split 检查 |
+| `POST /api/prescription-rag-eval/run` | 启动后台开方 RAG 评测 |
+| `GET /api/prescription-rag-eval/jobs/{job_id}` | 查询任务进度、指标和逐病例结果 |
 | `GET /api/llm/status` | LLM 配置状态 |
 | `POST /api/visits/{visit_id}/prescription-explanation` | 生成处方原因与配伍逻辑 |
 | `GET /docs` | FastAPI 自动接口文档 |

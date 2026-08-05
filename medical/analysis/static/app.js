@@ -20,6 +20,9 @@ const state = {
   annotationPatientHasMore: false,
   annotationImagePreviewItems: [],
   annotationImagePreviewIndex: 0,
+  ragEvalDataset: null,
+  ragEvalJobId: null,
+  ragEvalPollTimer: null,
   llmConfigured: null,
   baseFormulaVersion: 0,
   baseFormula: { metadata: null, strata: null, results: {}, loading: new Set(), selected: null, dimensions: ["diagnosis_illness", "diagnosis_disease"] },
@@ -51,6 +54,128 @@ function showError(error) {
 
 function metric(label, value, detail = "") {
   return `<div class="metric"><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value">${escapeHtml(value)}</div><div class="metric-detail">${escapeHtml(detail)}</div></div>`;
+}
+
+function ragEvalMetricValue(value) {
+  return value == null ? "—" : percent(value);
+}
+
+function renderRagEvalDataset(data) {
+  const container = $("#rag-eval-dataset");
+  const runButton = $("#rag-eval-run");
+  if (!data.available) {
+    runButton.disabled = true;
+    container.innerHTML = `<div class="panel-heading"><h3>评测数据集</h3><span class="rag-eval-status is-missing">尚未准备</span></div>
+      <div class="rag-eval-dataset-body"><p>请把当前医生的患者级评测集放到：</p><code>${escapeHtml(data.expected_path)}</code>
+      <p>每行一个 JSON 对象，文件名也可使用 <code>eval_cases.jsonl</code>。</p></div>`;
+    return;
+  }
+  const leaks = data.split_leaks || [];
+  runButton.disabled = leaks.length > 0;
+  container.innerHTML = `<div class="panel-heading"><h3>评测数据集</h3><span class="rag-eval-status ${leaks.length ? "is-error" : "is-ready"}">${leaks.length ? "存在患者泄漏" : "可评测"}</span></div>
+    <div class="rag-eval-dataset-grid">
+      <div><strong>${number.format(data.case_count)}</strong><span>病例样本</span></div>
+      <div><strong>${number.format(data.patient_count)}</strong><span>独立患者</span></div>
+      <div><strong>${number.format(data.split_counts?.test || 0)}</strong><span>test 样本</span></div>
+      <div><strong>${number.format(leaks.length)}</strong><span>跨 split 患者</span></div>
+    </div>
+    <p class="rag-eval-path">${escapeHtml(data.path)}</p>
+    ${leaks.length ? `<p class="rag-eval-warning">同一患者不能同时出现在多个 split 中，请先修复：${escapeHtml(leaks.slice(0, 5).map((item) => item.patient_id).join("、"))}</p>` : ""}`;
+}
+
+async function loadRagEvalDataset() {
+  const data = await api("/api/prescription-rag-eval/dataset");
+  state.ragEvalDataset = data;
+  renderRagEvalDataset(data);
+}
+
+function ragEvalList(values) {
+  return (values || []).length ? values.join("、") : "—";
+}
+
+function renderRagEvalMetrics(metrics) {
+  $("#rag-eval-metrics").innerHTML = [
+    metric("相似病例 Recall@5", ragEvalMetricValue(metrics.similar_case_recall_at_5), "医生标注相关病例"),
+    metric("相似病例 Recall@10", ragEvalMetricValue(metrics.similar_case_recall_at_10), "医生标注相关病例"),
+    metric("相似病例 NDCG@10", metrics.similar_case_ndcg_at_10 == null ? "—" : metrics.similar_case_ndcg_at_10.toFixed(3), "支持分级相关性"),
+    metric("处方 Precision / Recall / F1", `${ragEvalMetricValue(metrics.prescription_precision)} / ${ragEvalMetricValue(metrics.prescription_recall)} / ${ragEvalMetricValue(metrics.prescription_f1)}`, "药味微平均"),
+    metric("核心药命中率", ragEvalMetricValue(metrics.core_drug_hit_rate), "按病例宏平均"),
+    metric("加减药 F1", ragEvalMetricValue(metrics.adjustment_f1), `加药 ${ragEvalMetricValue(metrics.added_drug_f1)} · 减药 ${ragEvalMetricValue(metrics.removed_drug_f1)}`),
+    metric("剂量范围命中率", ragEvalMetricValue(metrics.dose_range_hit_rate), "仅统计提供 dose_ranges 的药味"),
+    metric("禁忌规则违反率", ragEvalMetricValue(metrics.contraindication_violation_rate), "任一禁用药或禁忌配伍即违规"),
+    metric("无证据药物", number.format(metrics.unsupported_drug_count || 0), `平均 ${metrics.unsupported_drugs_per_case ?? "—"} 味/病例`),
+    metric("系统拒答率", ragEvalMetricValue(metrics.system_refusal_rate), "证据不足时明确拒绝"),
+    metric("医生修改", metrics.doctor_modification_case_count ? `${number.format(metrics.doctor_drug_modifications)} 味 / ${number.format(metrics.doctor_dose_modifications)} 剂量` : "—", "生成方调整为医生最终方所需修改"),
+    metric("任务完成", `${metrics.completed_case_count}/${metrics.case_count}`, `${metrics.failed_case_count} 条失败`),
+  ].join("");
+}
+
+function renderRagEvalDetails(details) {
+  $("#rag-eval-details-panel").hidden = false;
+  $("#rag-eval-detail-count").textContent = `${details.length} 条`;
+  $("#rag-eval-details").innerHTML = details.map((item) => {
+    if (item.error) return `<tr><td>${escapeHtml(item.query_id)}</td><td colspan="5" class="rag-eval-error">${escapeHtml(item.error)}</td><td>失败</td></tr>`;
+    const diagnosis = item.differentiation || {};
+    const proposal = item.proposal || {};
+    const metrics = item.metrics || {};
+    const prescription = proposal.refused
+      ? `<strong class="rag-eval-refused">拒答</strong><br>${escapeHtml(proposal.refusal_reason || "证据不足")}`
+      : (proposal.drugs || []).map((drug) => `${escapeHtml(drug.name)}${drug.dose ?? ""}${escapeHtml(drug.unit || "")}`).join("、") || "—";
+    return `<tr>
+      <td>${escapeHtml(item.query_id)}</td>
+      <td>${item.retrieved_cases?.length || 0} 例<br><small>R@10 ${metrics.recall_at_10 == null ? "—" : percent(metrics.recall_at_10)}</small></td>
+      <td><strong>${escapeHtml(ragEvalList(diagnosis.tcm_diseases))}</strong><br>${escapeHtml(ragEvalList(diagnosis.tcm_syndromes))}<br><small>${escapeHtml(ragEvalList(diagnosis.pathogenesis))}</small></td>
+      <td>${prescription}</td>
+      <td>${percent(metrics.prescription_precision)} / ${percent(metrics.prescription_recall)} / ${percent(metrics.prescription_f1)}</td>
+      <td>${metrics.contraindication_violation == null ? "未提供安全规则" : metrics.contraindication_violation ? `<span class="rag-eval-status is-error">禁忌违规</span>` : "未触发显式规则"}<br><small>无证据 ${metrics.unsupported_drug_count || 0} 味</small></td>
+      <td>${proposal.refused ? "已拒答" : "已生成"}</td>
+    </tr>`;
+  }).join("");
+}
+
+function updateRagEvalProgress(job) {
+  $("#rag-eval-progress-panel").hidden = false;
+  $("#rag-eval-job-status").textContent = job.status;
+  $("#rag-eval-progress-bar").style.width = `${Math.max(0, Math.min(1, job.progress || 0)) * 100}%`;
+  $("#rag-eval-progress-text").textContent = `${job.completed || 0}/${job.case_count || 0} 条 · 任务 ${job.job_id}`;
+}
+
+async function pollRagEvalJob(jobId) {
+  if (state.ragEvalJobId !== jobId) return;
+  const job = await api(`/api/prescription-rag-eval/jobs/${encodeURIComponent(jobId)}`, false);
+  updateRagEvalProgress(job);
+  if (job.status === "completed") {
+    $("#rag-eval-run").disabled = false;
+    renderRagEvalMetrics(job.result.metrics);
+    renderRagEvalDetails(job.result.details || []);
+    state.ragEvalPollTimer = null;
+    return;
+  }
+  if (job.status === "failed") {
+    $("#rag-eval-run").disabled = false;
+    state.ragEvalPollTimer = null;
+    throw new Error(job.error || "开方RAG评测失败");
+  }
+  state.ragEvalPollTimer = window.setTimeout(() => pollRagEvalJob(jobId).catch(showError), 1500);
+}
+
+async function runRagEvaluation() {
+  const button = $("#rag-eval-run");
+  button.disabled = true;
+  $("#rag-eval-metrics").innerHTML = "";
+  $("#rag-eval-details-panel").hidden = true;
+  const job = await api("/api/prescription-rag-eval/run", true, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      index_name: $("#rag-eval-index").value.trim(),
+      limit: Number($("#rag-eval-limit").value || 0),
+      top_k: Number($("#rag-eval-top-k").value || 10),
+    }),
+  });
+  state.ragEvalJobId = job.job_id;
+  updateRagEvalProgress(job);
+  await pollRagEvalJob(job.job_id);
 }
 
 function renderBars(target, rows, labelKey, valueKey, formatter = number.format) {
@@ -1000,6 +1125,10 @@ async function loadDoctor(doctorKey) {
   state.annotationPatients = [];
   state.annotationPatientOffset = 0;
   state.annotationPatientHasMore = false;
+  state.ragEvalDataset = null;
+  state.ragEvalJobId = null;
+  if (state.ragEvalPollTimer) window.clearTimeout(state.ragEvalPollTimer);
+  state.ragEvalPollTimer = null;
   state.baseFormulaVersion += 1;
   state.baseFormula = { metadata: null, strata: null, results: {}, loading: new Set(), selected: null, dimensions: selectedFormulaDimensions() };
   select.disabled = true;
@@ -1029,6 +1158,7 @@ async function loadDoctor(doctorKey) {
     if (activeView === "revisit") await loadRevisits();
     if (activeView === "patient") await loadPatientList();
     if (activeView === "annotation") await loadAnnotationPatientList();
+    if (activeView === "prescription-rag-eval") await loadRagEvalDataset();
   } finally {
     select.disabled = false;
   }
@@ -1049,10 +1179,18 @@ function switchView(view) {
   if (view === "revisit") loadRevisits().catch(showError);
   if (view === "patient" && !$("#patient-list").children.length) loadPatientList().catch(showError);
   if (view === "annotation" && !$("#annotation-patient-list").children.length) loadAnnotationPatientList().catch(showError);
+  if (view === "prescription-rag-eval" && !state.ragEvalDataset) loadRagEvalDataset().catch(showError);
 }
 
 function bindEvents() {
   document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => switchView(tab.dataset.view)));
+  $("#prescription-rag-eval-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    runRagEvaluation().catch((error) => {
+      $("#rag-eval-run").disabled = !(state.ragEvalDataset?.available && !(state.ragEvalDataset?.split_leaks || []).length);
+      showError(error);
+    });
+  });
   $("#disease-select").addEventListener("change", (event) => loadDiseaseDetail(event.target.value).catch(showError));
   $("#overview-diagnosis-limit").addEventListener("change", renderDiagnosisDistributions);
   $("#base-formula-min-patients").addEventListener("change", () => loadBaseFormulaStrata(true).catch(showError));

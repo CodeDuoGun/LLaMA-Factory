@@ -50,15 +50,36 @@ python medical/data_utils/medical_record_agents.py \
 
 | 参数 | 作用 |
 |---|---|
-| `--doctor-id` | 只处理指定医生，可重复传入 |
+| `--doctor-id` | 只处理指定医生；可一次传入多个 ID，也可重复传入 |
 | `--limit` | 限制处理条数，`0` 表示不限制 |
 | `--batch-size` | 最大并发病历数 |
 | `--timeout` / `--max-retries` | 单次模型请求超时和重试次数 |
 | `--record-timeout` | 单条病历全部阶段总超时，`0` 表示不额外限制 |
+| `--stage-name` | 只运行指定阶段；可在一个参数后传多个阶段名，也可重复传参 |
 | `--enable-review` | 启用评审 Agent |
 | `--reprocess` | 忽略已有成功结果并重新处理 |
 | `--reprocess-failures` | 只重跑失败记录 |
 | `--reprocess-missing-histories` | 重跑主诉或现病史原始值与 AI 值同时为空的记录 |
+
+只清洗病史和诊断的示例：
+
+```bash
+python medical/data_utils/medical_record_agents.py \
+  --input <input.jsonl> \
+  --output-dir medical/processed_data \
+  --stage-name clinical_cleaning diagnosis_completion
+```
+
+可选阶段为 `diagnosis_normalization`、`image_classification`、`inspection_vlm`、`tongue_face_vlm`、
+`current_visit_history`、`clinical_cleaning`、`diagnosis_completion`、`clinical_extraction` 和
+`treatment_principle`。不传 `--stage-name` 时保持原有行为并运行全部阶段；传入阶段后，输出文件名会记录
+阶段组合，例如 `medical_records_ai__stage_clinical_cleaning__diagnosis_completion.jsonl`，记录内同时写入
+`ai_processing_stages`。选择 `inspection_vlm` 或 `tongue_face_vlm` 时会自动加入其必要依赖
+`image_classification`，文件名和记录中的阶段列表均以实际执行阶段为准。
+
+`clinical_cleaning` 会将 `admin_face_describe`（舌象及面相）、`birth_detail`（生育史）、
+`is_marriage_history`（婚恋史）及三个原始诊断字段一并提供给模型，输出主诉、现病史一致性、五史和三个
+AI 诊断及其修正理由。
 
 诊断标签归一化已经集成在此主流程中。模型结果先经过代码内别名表，再经过 Excel 标准词表：
 
@@ -69,6 +90,13 @@ python medical/data_utils/medical_record_agents.py \
 | `ai_diagnosis_sickness` | `SICKNESS_TERM_ALIASES` | `medical/data/辨病.xlsx` |
 
 Excel 映射在单个进程内缓存，归一化只替换名称，暂不向 AI 字段写入编码。
+
+字段级最终标准名规则优先于 Excel 中的旧名称：西医诊断 `酒渣鼻` / `玫瑰痤疮` 统一为
+`玫瑰痤疮`；中医疾病 `酒槽鼻` / `酒齄鼻` 统一为 `酒齄鼻`。
+
+病史清洗会把同一患者的上一诊时间、主诉和现病史传入下一次复诊。主诉只允许参考本次患者/医生主诉、
+上一诊现病史和上一诊主诉，不补造病程时间；月经史统一从个人史、特殊史移动到现病史；检查报告按
+“上一次就诊—本次就诊”的时间区间区分本次检查与既往检查。
 
 ### `run_six_doctors.sh`
 
@@ -143,6 +171,19 @@ OVERWRITE=1 bash medical/data_utils/normalize_ai_diagnosis_six_doctors.sh
 使用单文件脚本的 `--in-place`。
 
 ## MySQL 数据读写
+
+从 MySQL 导出时可用 `--doctor-id` 指定一个或多个医生。查询会使用 `doctor_id IN (...)` 过滤，结果按医生
+分别写入 `doctor_<doctor_id>_<doctor_name>/records.jsonl`：
+
+```bash
+python medical/data_utils/medical_record_agents.py \
+  --data-source mysql \
+  --export-mode \
+  --output-dir medical/processed_data \
+  --doctor-id 43 52 1314
+```
+
+也可以重复传参，例如 `--doctor-id 43 --doctor-id 52`。不传 `--doctor-id` 时导出表内全部医生。
 
 | 文件 | 作用 |
 |---|---|
@@ -228,6 +269,23 @@ python medical/data_utils/import_one_ai_medical_record.py --input <medical_recor
 | `analysis_v1/analyze_template_prescription_txt.py` | 输出处方模板分析的文本版本 |
 
 `analysis_v1` 属于数据研究脚本，部分路径和参数与具体批次绑定；正式运行前需先检查文件顶部配置。
+
+## 开方 RAG Agent 与评测
+
+| 文件 | 作用 |
+|---|---|
+| `prescription_rag_agents.py` | 定义结构化辨病 Agent 和开方 Agent；开方结果要求逐药提供召回病例证据并支持证据不足拒答 |
+| `evaluate_prescription_rag.py` | 按医生运行患者级隔离的评测数据，连接 ES 检索并输出完整指标和逐病例明细 |
+
+```bash
+python medical/data_utils/evaluate_prescription_rag.py \
+  --doctor-id 43 --doctor-name 朱子奇 \
+  --index alpha_medical_prescription_rag_v1 \
+  --limit 20 --top-k 10
+```
+
+评测数据默认位于 `medical/eval_data/doctor_<id>_<姓名>/prescription_rag_eval.jsonl`，完整格式见
+`medical/eval_data/README.md`。`--limit 0` 表示评测全部 `split=test` 样本。
 
 ## 测试
 

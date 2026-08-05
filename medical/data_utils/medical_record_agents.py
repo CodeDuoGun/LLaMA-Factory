@@ -47,13 +47,15 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import ExitStack
-from datetime import date
+from datetime import date, datetime, time as datetime_time
+from decimal import Decimal
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
 from threading import Lock
 from typing import Any, TextIO
 from urllib.parse import unquote_to_bytes
+from uuid import UUID
 
 import httpx
 from PIL import Image, ImageOps
@@ -74,6 +76,7 @@ from medical.data_utils.medical_record_formatters import (
     format_inspection_result_text,
     format_tongue_face_result_text,
 )
+from medical.utils.tool import perf_counter_timer
 from medical.data_utils.ai_medical_records import AI_FIELDS, DEFAULT_AI_OPERATOR, record_to_row
 from dotenv import load_dotenv
 from medical.schema.clear_record_basemodel import (
@@ -90,7 +93,6 @@ from medical.schema.clear_record_basemodel import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
-load_dotenv(PROJECT_ROOT / ".env.local")
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -100,7 +102,6 @@ from medical.data_utils.normalize_ai_diagnosis_labels import normalize_ai_diagno
 
 DEFAULT_INPUT = Path("medical/data/202301_online")
 DEFAULT_OUTPUT_DIR = Path("medical/processed_data")
-MYSQL_DATABASE_URL = _env("MEDICAL_AGENT_MYSQL_DATABASE_URL") or _env("DATABASE_URL")
 MYSQL_RECORD_TABLE = "mlops_annotation_medical_record"
 MYSQL_ID_COLUMN = "id"
 DOCTOR_RECORD_FILE_NAME = "medical_records_ai.jsonl"
@@ -109,11 +110,24 @@ FILTER_FILE_NAME = "filter.json"
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 DASHSCOPE_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DIAGNOSIS_FIELDS = ("diagnosis_illness", "diagnosis_disease", "diagnosis_sickness")
+STAGE_NAMES = (
+    "diagnosis_normalization",
+    "image_classification",
+    "inspection_vlm",
+    "tongue_face_vlm",
+    "current_visit_history",
+    "clinical_cleaning",
+    "diagnosis_completion",
+    "clinical_extraction",
+    "treatment_principle",
+)
 HISTORY_FIELDS = (
     "old_medical_history",
     "allergic_history",
     "personal_history",
     "special_history",
+    "birth_detail",
+    "marriage_history",
     "family_history",
 )
 IMAGE_FIELDS = ("tongue_face_img", "admin_face_img", "admin_report_img", "inspection_report_img")
@@ -140,10 +154,13 @@ CURRENT_VISIT_HISTORY_SYSTEM_PROMPT = (
     "不得新增原文没有的症状、诊断、时间或检查结果；无法确定本次段落时返回空字符串。"
 )
 TREATMENT_PRINCIPLE_SYSTEM_PROMPT = (
-    "你是中医病历治则治法反推助手。必须只根据输入的最新主诉、本次现病史、清洗后五史、"
-    "诊断上下文、结构化病机字段和处方详情，反推一条简洁的治则治法。"
-    "治则治法应与病史、诊断、病机和处方用药方向一致，不得新增方剂名、药名、检查建议或调理建议。"
-    "资料不足时返回空字符串。必须返回合法 JSON 对象。"
+    "你是中医病历治则治法提取助手。仅根据输入证据生成一条简洁的治则治法。"
+    "证据优先级为：中医证型和中医疾病，结构化病机、病位和病期，关键症状与舌面患处体征，"
+    "最后才是处方用药。西医诊断、既往史和其他病史只作辅助，不得覆盖中医辨证证据。"
+    "处方只能用于校验或补充已有辨证方向，不得仅凭单味药机械推断；内服与外用处方必须分开判断。"
+    "存在内服处方时优先概括全身治法；存在明确外用处方时可在其后补充‘外治’方向；仅有外用处方时"
+    "必须明确写作外治，不得推断全身治法。不得输出方剂名、药名、剂量、检查建议、用药医嘱或调理建议。"
+    "多项证据矛盾时以中医证型及结构化病机为准；资料不足时返回空字符串。必须返回合法 JSON 对象。"
 )
 INVALID_HISTORY_TEXT = (
     "",
@@ -163,7 +180,32 @@ INVALID_HISTORY_TEXT = (
 
 UPWARD_ABNORMAL_SYMBOL_PATTERN = re.compile(r"(?:⬆️|⬆|↑|↗|⇧|▲|△)+")
 DOWNWARD_ABNORMAL_SYMBOL_PATTERN = re.compile(r"(?:⬇️|⬇|↓|↘|⇩|▼|▽)+")
+MENSTRUAL_HISTORY_PATTERN = re.compile(
+    r"月经|经期|经量|经色|经质|经血|经行|痛经|末次月经|初潮|绝经|闭经|带下"
+)
 FILTER_FILE_LOCK = Lock()
+
+
+def resolve_stage_names(stage_names: Iterable[str] | None) -> tuple[str, ...]:
+    """Validate and de-duplicate requested stages while preserving pipeline order."""
+    requested = {_text(name) for name in (stage_names or []) if _text(name)}
+    if not requested:
+        return STAGE_NAMES
+    unknown = requested.difference(STAGE_NAMES)
+    if unknown:
+        raise ValueError(f"未知 stage_name: {', '.join(sorted(unknown))}；可选值: {', '.join(STAGE_NAMES)}")
+    if {"inspection_vlm", "tongue_face_vlm"} & requested:
+        requested.add("image_classification")
+    return tuple(name for name in STAGE_NAMES if name in requested)
+
+
+def _stage_output_file_name(stage_names: Iterable[str] | None, *, failure: bool = False) -> str:
+    selected = list(stage_names or [])
+    if not selected:
+        return FAILURE_FILE_NAME if failure else DOCTOR_RECORD_FILE_NAME
+    label = "__".join(_safe_path_part(name) for name in resolve_stage_names(selected))
+    prefix = "medical_record_agent_failures" if failure else "medical_records_ai"
+    return f"{prefix}__stage_{label}.jsonl"
 
 
 def _text(value: Any) -> str:
@@ -182,6 +224,9 @@ def _env_any(names: tuple[str, ...], default: str = "") -> str:
         if value:
             return value
     return default
+
+
+MYSQL_DATABASE_URL = _env("MEDICAL_AGENT_MYSQL_DATABASE_URL") or _env("DATABASE_URL")
 
 
 def _mask_secret(value: str | None) -> str:
@@ -300,8 +345,27 @@ def _replace_inspection_report_symbols(value: Any) -> Any:
     return value
 
 
+def _json_default(value: Any) -> Any:
+    """Serialize common values returned by SQLAlchemy/MySQL without hiding unknown types."""
+    if isinstance(value, (datetime, date, datetime_time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, (set, frozenset)):
+        return list(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _json_dumps(value: Any, **kwargs: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=_json_default, **kwargs)
+
+
 def _json_for_prompt(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return _json_dumps(value, separators=(",", ":"))
 
 
 def _chief_complaint(record: dict[str, Any]) -> str:
@@ -337,18 +401,92 @@ def _fallback_history_excerpt(value: Any, *, limit: int = 120) -> str:
 
 
 def _fallback_patient_appeal(record: dict[str, Any], present_history: str) -> str:
-    """在模型返回空主诉时，用已有资料生成最小有效主诉."""
+    """模型返回空主诉时，仅使用允许的主诉来源，不从诊断或图片猜测."""
+    previous_context = record.get("__previous_record_context") or {}
+    if not isinstance(previous_context, Mapping):
+        previous_context = {}
     for value in (
         record.get("doc_ass_stu_appeal"),
         record.get("patient_appeal"),
-        present_history,
-        record.get("diagnosis_illness"),
-        record.get("diagnosis_disease"),
-        record.get("diagnosis_sickness"),
+        previous_context.get("chief_complaint"),
     ):
         if _has_effective_history_text(value):
             return _fallback_history_excerpt(value, limit=40)
-    return "本次就诊主要问题待结合资料明确"
+    return ""
+
+
+def _history_segments(value: Any) -> list[str]:
+    return [segment.strip(" \t\r\n；;。") for segment in re.split(r"[；;。\n]+", _text(value)) if segment.strip()]
+
+
+def _deduplicate_history(value: Any) -> str:
+    seen = set()
+    unique = []
+    for segment in _history_segments(value):
+        key = re.sub(r"[\s，,、：:]", "", segment)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(segment)
+    return "；".join(unique) + ("。" if unique else "")
+
+
+def _move_menstrual_history_to_present_history(
+    record: dict[str, Any],
+    values: Mapping[str, Any],
+) -> None:
+    """Move explicit menstrual-history statements out of personal/special history into present history."""
+    menstrual_segments = []
+    for source in (
+        record.get("new_medical_history"),
+        record.get("personal_history"),
+        record.get("special_history"),
+        values.get("new_medical_history"),
+        values.get("personal_history"),
+        values.get("special_history"),
+    ):
+        menstrual_segments.extend(segment for segment in _history_segments(source) if MENSTRUAL_HISTORY_PATTERN.search(segment))
+
+    for field in ("personal_history", "special_history"):
+        current = record.get(f"ai_{field}")
+        kept = [segment for segment in _history_segments(current) if not MENSTRUAL_HISTORY_PATTERN.search(segment)]
+        record[f"ai_{field}"] = "；".join(kept) + ("。" if kept else "")
+
+    present_segments = _history_segments(record.get("ai_new_medical_history"))
+    present_keys = {re.sub(r"[\s，,、：:]", "", segment) for segment in present_segments}
+    for segment in menstrual_segments:
+        key = re.sub(r"[\s，,、：:]", "", segment)
+        if key and key not in present_keys:
+            present_keys.add(key)
+            present_segments.append(segment)
+    record["ai_new_medical_history"] = _deduplicate_history("；".join(present_segments))
+
+
+def _ensure_patient_complaint_in_present_history(record: dict[str, Any]) -> None:
+    complaint = _text(record.get("patient_appeal")) or _text(record.get("doc_ass_stu_appeal"))
+    history = _text(record.get("ai_new_medical_history"))
+    if not complaint:
+        record["ai_new_medical_history"] = _deduplicate_history(history)
+        return
+    history_key = re.sub(r"[\s，,、：:；;。]", "", history)
+    missing_parts = []
+    for part in re.split(r"[，,、；;。]+", complaint):
+        part = part.strip()
+        part_key = re.sub(r"[\s：:]", "", part)
+        if part_key and part_key not in history_key:
+            missing_parts.append(part)
+            history_key += part_key
+    if missing_parts:
+        missing_text = "、".join(missing_parts)
+        history = f"{history.rstrip('。；;')}；患者诉{missing_text}。" if history else f"患者诉{missing_text}。"
+    record["ai_new_medical_history"] = _deduplicate_history(history)
+
+
+def _record_history_context(record: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "visit_time": _visit_time(dict(record)),
+        "chief_complaint": _text(record.get("ai_patient_appeal")) or _chief_complaint(dict(record)),
+        "present_history": _text(record.get("ai_new_medical_history")) or _present_history(dict(record)),
+    }
 
 
 def _fallback_present_history(
@@ -461,8 +599,14 @@ def _patient_key(record: dict[str, Any]) -> str:
 
 
 def _history_payload(record: dict[str, Any], ai: bool = False) -> dict[str, str]:
-    prefix = "ai_" if ai else ""
-    return {field: _text(record.get(f"{prefix}{field}")) for field in HISTORY_FIELDS}
+    histories = {}
+    for field in HISTORY_FIELDS:
+        ai_field = f"ai_{field}"
+        histories[field] = _text(record.get(ai_field)) if ai and ai_field in record else _text(record.get(field))
+    # 原始数据使用 is_marriage_history，统一映射到 HISTORY_FIELDS 中的 marriage_history。
+    if not histories["marriage_history"]:
+        histories["marriage_history"] = _text(record.get("is_marriage_history"))
+    return histories
 
 
 def _diagnosis_payload(record: dict[str, Any], *, prefer_ai: bool = False) -> dict[str, str]:
@@ -540,6 +684,7 @@ def write2filter_json(record: Mapping[str, Any], path: Path | None = None) -> bo
     filtered_record = dict(record)
     filtered_record.pop("__original_diagnoses", None)
     filtered_record.pop("__previous_diagnoses", None)
+    filtered_record.pop("__previous_record_context", None)
     identity = _filtered_record_identity(filtered_record)
 
     with FILTER_FILE_LOCK:
@@ -560,7 +705,7 @@ def write2filter_json(record: Mapping[str, Any], path: Path | None = None) -> bo
                     return False
                 records.append(filtered_record)
                 temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-                temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+                temporary.write_text(_json_dumps(records, indent=2), encoding="utf-8")
                 temporary.replace(target)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -634,6 +779,30 @@ def format_prescription_text(prescriptions: Any) -> str:
             descriptions.append(f"处方{len(descriptions) + 1}：" + "；".join(details) + "。")
 
     return "\n".join(descriptions) or "未见有效处方信息。"
+
+
+def format_treatment_prescription_evidence(prescriptions: Any) -> dict[str, list[str]]:
+    """按内服/外用归并药名，供治则治法判断，排除剂量、医嘱等无关噪声."""
+    evidence: dict[str, list[str]] = {"内服": [], "外用": [], "其他": []}
+    if not isinstance(prescriptions, list):
+        return evidence
+
+    seen: dict[str, set[str]] = {group: set() for group in evidence}
+    for prescription in prescriptions:
+        if not isinstance(prescription, Mapping):
+            continue
+        usage_type = _text(prescription.get("usage_type"))
+        group = "内服" if "内服" in usage_type else "外用" if "外用" in usage_type else "其他"
+        prescription_items = prescription.get("prescription_items")
+        drug_list = prescription_items.get("drugList") if isinstance(prescription_items, Mapping) else []
+        for item in drug_list or []:
+            if not isinstance(item, Mapping):
+                continue
+            name = _text(item.get("show_name") or item.get("drug_name") or item.get("sub_drug_name"))
+            if name and name not in seen[group]:
+                seen[group].add(name)
+                evidence[group].append(name)
+    return evidence
 
 
 def _load_prompt(name: str) -> str:
@@ -1309,11 +1478,14 @@ class MedicalRecordAgents:
 
     async def clean_histories(self, record: dict[str, Any]) -> None:
         histories = _history_payload(record)
+        previous_context = record.get("__previous_record_context") or {}
+        if not isinstance(previous_context, Mapping):
+            previous_context = {}
         inspection_description = format_inspection_result_text(record.get("ai_inspection_report_img"))
         logger.info(f"检查报告分析结果： {inspection_description}")
         tongue_face_description = format_tongue_face_result_text(record.get("ai_tongue_face_img"))
         logger.info(f"舌面分析结果： {tongue_face_description}")
-        system_prompt = _load_prompt("clinical_record_cleaning_prompt.txt")
+        system_prompt = _load_prompt("clinical_record_cleaning_prompt_v2.txt")
         result = await _invoke_structured_agent(
             self.history_agent,
             HumanMessage(
@@ -1321,7 +1493,18 @@ class MedicalRecordAgents:
                     f"医生撰写主诉 doc_ass_stu_appeal：{_text(record.get('doc_ass_stu_appeal')) or '未记录'}\n"
                     f"患者主诉 patient_appeal：{_text(record.get('patient_appeal')) or '未记录'}\n"
                     f"原始本次现病史 new_medical_history：{_present_history(record) or '未记录'}\n"
-                    f"原始五史：{_json_for_prompt(histories)}\n"
+                    f"上一次就诊时间：{_text(previous_context.get('visit_time')) or '无上一次就诊'}\n"
+                    f"上一次看诊主诉：{_text(previous_context.get('chief_complaint')) or '未记录'}\n"
+                    f"上一次病历现病史：{_text(previous_context.get('present_history')) or '未记录'}\n"
+                    f"本次就诊时间：{_visit_time(record) or '未记录'}\n"
+                    f"原始病史：{_json_for_prompt(histories)}\n"
+                    f"医生书写的舌象及面相 admin_face_describe：{_text(record.get('admin_face_describe')) or '未记录'}\n"
+                    f"生育史 birth_detail：{_text(record.get('birth_detail')) or '未记录'}\n"
+                    f"婚恋史 marriage_history（兼容 is_marriage_history）："
+                    f"{histories['marriage_history'] or '未记录'}\n"
+                    f"西医诊断 diagnosis_illness：{_text(record.get('diagnosis_illness')) or '未记录'}\n"
+                    f"中医证型 diagnosis_disease：{_text(record.get('diagnosis_disease')) or '未记录'}\n"
+                    f"中医诊断 diagnosis_sickness：{_text(record.get('diagnosis_sickness')) or '未记录'}\n"
                     f"检查报告图片分析：\n{inspection_description}\n"
                     f"舌面患处图片分析：\n{tongue_face_description}"
                 )
@@ -1355,6 +1538,15 @@ class MedicalRecordAgents:
                 record[f"ai_{field}"] = (
                     "" if original in INVALID_HISTORY_TEXT else _clean_generated_text(values.get(field))
                 )
+        _move_menstrual_history_to_present_history(record, values)
+        _ensure_patient_complaint_in_present_history(record)
+        for field in DIAGNOSIS_FIELDS:
+            cleaned_diagnosis = _clean_generated_text(values.get(field)) or _clean_generated_text(record.get(field))
+            record[f"ai_{field}"] = normalize_ai_diagnosis_to_standard(f"ai_{field}", cleaned_diagnosis)
+            reason = _clean_generated_text(values.get(f"{field}_reason"))
+            if not reason and record[f"ai_{field}"]:
+                reason = "模型未提供修正理由，保留并规范化原诊断。"
+            record[f"ai_{field}_reason"] = reason
 
     def build_illness_knowledge(self, diagnosis_res:dict):
         """根据不同医生--不同疾病--不同病期---不同治则治法—不同配伍用药知识库召回疾病知识."""
@@ -1503,7 +1695,7 @@ class MedicalRecordAgents:
             TongueFaceResult,
             reviewer_agent=self.reviewer_agent,
             agent_name="tongue_face_agent",
-            system_prompt=_load_prompt("tongue_face_analysis_prompt.txt"),
+            system_prompt=_load_prompt("tongue_face_analysis_prompt_v2.txt"),
         )
 
     async def classify_images(self, record: dict[str, Any]) -> dict[str, list[str]]:
@@ -1615,10 +1807,7 @@ class MedicalRecordAgents:
             field: _text(record.get(f"ai_{field}")) or _text(record.get(field))
             for field in DIAGNOSIS_FIELDS
         }
-        histories = {
-            field: _text(record.get(f"ai_{field}")) if f"ai_{field}" in record else _text(record.get(field))
-            for field in HISTORY_FIELDS
-        }
+        histories = _history_payload(record, ai=True)
         illness_knowledge = self.build_illness_knowledge(diagnoses) if use_rag else "无"
         inspection_description = format_inspection_result_text(record.get("ai_inspection_report_img"))
         tongue_face_description = format_tongue_face_result_text(record.get("ai_tongue_face_img"))
@@ -1650,34 +1839,32 @@ class MedicalRecordAgents:
 
     async def infer_treatment_principle(self, record: dict[str, Any]) -> None:
         diagnoses = {
-            field: _text(record.get(f"ai_{field}")) or _text(record.get(field))
-            for field in DIAGNOSIS_FIELDS
+            "中医证型": _text(record.get("ai_diagnosis_disease")) or _text(record.get("diagnosis_disease")),
+            "中医疾病": _text(record.get("ai_diagnosis_sickness")) or _text(record.get("diagnosis_sickness")),
+            "西医诊断（辅助）": _text(record.get("ai_diagnosis_illness")) or _text(record.get("diagnosis_illness")),
         }
-        histories = {
-            field: _text(record.get(f"ai_{field}")) if f"ai_{field}" in record else _text(record.get(field))
-            for field in HISTORY_FIELDS
-        }
+        histories = _history_payload(record, ai=True)
         clinical_fields = {
-            field: record.get(f"ai_{field}")
-            for field in (
-                "etiology",
-                "pathogenesis",
-                "disease_location",
-                "disease_stage",
-                "disease_course",
-                "key_symptoms",
-            )
+            "病因（辅助）": record.get("ai_etiology"),
+            "病机": record.get("ai_pathogenesis"),
+            "病位": record.get("ai_disease_location"),
+            "病期": record.get("ai_disease_stage"),
+            "病程演变": record.get("ai_disease_course"),
+            "关键症状体征": record.get("ai_key_symptoms"),
         }
+        tongue_face_description = format_tongue_face_result_text(record.get("ai_tongue_face_img"))
+        prescription_evidence = format_treatment_prescription_evidence(record.get("ps"))
         result = await _invoke_structured_agent(
             self.treatment_principle_agent,
             HumanMessage(
                 content=(
                     f"最新主诉：{_latest_chief_complaint(record)}\n"
                     f"本次现病史：{_latest_present_history(record)}\n"
-                    f"清洗后五史：{_json_for_prompt(histories)}\n"
-                    f"诊断上下文：{_json_for_prompt(diagnoses)}\n"
-                    f"结构化病机字段：{_json_for_prompt(clinical_fields)}\n"
-                    f"处方详情：\n{format_prescription_text(record.get('ps'))}"
+                    f"中医辨证诊断：{_json_for_prompt(diagnoses)}\n"
+                    f"结构化辨证证据：{_json_for_prompt(clinical_fields)}\n"
+                    f"舌面患处客观体征：\n{tongue_face_description}\n"
+                    f"其他病史（仅辅助）：{_json_for_prompt(histories)}\n"
+                    f"分类处方药物（仅用于校验，禁止输出药名）：{_json_for_prompt(prescription_evidence)}"
                 )
             ),
             TreatmentPrincipleResult,
@@ -1720,7 +1907,9 @@ class MedicalRecordAgents:
         *,
         extract_current_history: bool = False,
         use_rag: bool = False,
+        stage_names: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
+        selected_stages = set(resolve_stage_names(stage_names))
         output = dict(record)
         # 前端保存的是富文本 HTML。先转成纯文本再参与空值过滤和后续 Agent 调用，
         # 避免标签污染提示词，也避免只有 <p><br></p> 的空病史绕过过滤。
@@ -1748,31 +1937,35 @@ class MedicalRecordAgents:
             return output
 
         # 3. 先做不依赖诊断类型的基础归一化，不额外存储 ai_normalized_*。
-        try:
-            await self._run_stage(
-                "diagnosis_normalization",
-                record_id,
-                doctor_name,
-                lambda: self.normalize_diagnoses(output),
-            )
-        except Exception as exc:
-            errors.append({"stage": "diagnosis_normalization", "error": f"{type(exc).__name__}: {exc}"})
+        if "diagnosis_normalization" in selected_stages:
+            try:
+                await self._run_stage(
+                    "diagnosis_normalization",
+                    record_id,
+                    doctor_name,
+                    lambda: self.normalize_diagnoses(output),
+                )
+            except Exception as exc:
+                errors.append({"stage": "diagnosis_normalization", "error": f"{type(exc).__name__}: {exc}"})
         # 4：图片分类与视觉解析管线。
         async def run_image_pipeline() -> list[dict[str, str]]:
             pipeline_errors = []
-            try:
-                classified_images: dict[str, list[str]] = {}
+            classified_images: dict[str, list[str]] = {category: [] for category in IMAGE_CATEGORIES}
+            if "image_classification" in selected_stages or {
+                "inspection_vlm",
+                "tongue_face_vlm",
+            } & selected_stages:
+                try:
 
-                async def classify_image_stage() -> None:
-                    nonlocal classified_images
-                    classified_images = await self.classify_images(output)
+                    async def classify_image_stage() -> None:
+                        nonlocal classified_images
+                        classified_images = await self.classify_images(output)
 
-                await self._run_stage("image_classification", record_id, doctor_name, classify_image_stage)
-            except Exception as exc:
-                pipeline_errors.append(
-                    {"stage": "image_classification", "error": f"{type(exc).__name__}: {exc}"}
-                )
-                classified_images = {category: [] for category in IMAGE_CATEGORIES}
+                    await self._run_stage("image_classification", record_id, doctor_name, classify_image_stage)
+                except Exception as exc:
+                    pipeline_errors.append(
+                        {"stage": "image_classification", "error": f"{type(exc).__name__}: {exc}"}
+                    )
 
             # 报告类与舌/面/患处类图片互不依赖，并行解析。
             tongue_face_images = [
@@ -1785,6 +1978,7 @@ class MedicalRecordAgents:
                 ),
                 "tongue_face_vlm": (self.analyze_tongue_face_images, tongue_face_images),
             }
+            image_stages = {name: value for name, value in image_stages.items() if name in selected_stages}
             tasks = {
                 name: asyncio.create_task(
                     self._run_stage(
@@ -1806,6 +2000,8 @@ class MedicalRecordAgents:
 
         # 5：本次复诊病史只依赖文本字段，可与整条视觉管线并发。
         async def run_current_visit_history() -> list[dict[str, str]]:
+            if "current_visit_history" not in selected_stages:
+                return []
             try:
                 await self._run_stage(
                     "current_visit_history",
@@ -1817,48 +2013,47 @@ class MedicalRecordAgents:
                 return [{"stage": "current_visit_history", "error": f"{type(exc).__name__}: {exc}"}]
             return []
 
-        pipeline_results = await asyncio.gather(
-            run_image_pipeline(),
-            run_current_visit_history(),
-        )
+        pipeline_results = await asyncio.gather(run_image_pipeline(), run_current_visit_history())
         for pipeline_errors in pipeline_results:
             errors.extend(pipeline_errors)
 
         # 6：等待图片和本次病史均完成后，校验主诉/现病史一致性并清洗五史。
-        try:
-            await self._run_stage("clinical_cleaning", record_id, doctor_name, lambda: self.clean_histories(output))
-        except Exception as exc:
-            errors.append({"stage": "clinical_cleaning", "error": f"{type(exc).__name__}: {exc}"})
+        if "clinical_cleaning" in selected_stages:
+            try:
+                await self._run_stage("clinical_cleaning", record_id, doctor_name, lambda: self.clean_histories(output))
+            except Exception as exc:
+                errors.append({"stage": "clinical_cleaning", "error": f"{type(exc).__name__}: {exc}"})
         # 7：用最新病历补全诊断，再提取知识库字段。
-        try:
-            await self._run_stage(
-                "diagnosis_completion",
-                record_id,
-                doctor_name,
-                lambda: self.complete_diagnoses(output),
-            )
-        except Exception as exc:
-            errors.append({"stage": "diagnosis_completion", "error": f"{type(exc).__name__}: {exc}"})
-        try:
-            await self._run_stage(
-                "clinical_extraction",
-                record_id,
-                doctor_name,
-                lambda: self.extract_clinical_fields(output, use_rag),
-            )
-        
-        except Exception as exc:
-            errors.append({"stage": "clinical_extraction", "error": f"{type(exc).__name__}: {exc}"})
-        # TODO 治则治法，加入开关。开启病机
-        try:
-            await self._run_stage(
-                "treatment_principle",
-                record_id,
-                doctor_name,
-                lambda: self.infer_treatment_principle(output),
-            )
-        except Exception as exc:
-            errors.append({"stage": "treatment_principle", "error": f"{type(exc).__name__}: {exc}"})
+        if "diagnosis_completion" in selected_stages:
+            try:
+                await self._run_stage(
+                    "diagnosis_completion",
+                    record_id,
+                    doctor_name,
+                    lambda: self.complete_diagnoses(output),
+                )
+            except Exception as exc:
+                errors.append({"stage": "diagnosis_completion", "error": f"{type(exc).__name__}: {exc}"})
+        if "clinical_extraction" in selected_stages:
+            try:
+                await self._run_stage(
+                    "clinical_extraction",
+                    record_id,
+                    doctor_name,
+                    lambda: self.extract_clinical_fields(output, use_rag),
+                )
+            except Exception as exc:
+                errors.append({"stage": "clinical_extraction", "error": f"{type(exc).__name__}: {exc}"})
+        if "treatment_principle" in selected_stages:
+            try:
+                await self._run_stage(
+                    "treatment_principle",
+                    record_id,
+                    doctor_name,
+                    lambda: self.infer_treatment_principle(output),
+                )
+            except Exception as exc:
+                errors.append({"stage": "treatment_principle", "error": f"{type(exc).__name__}: {exc}"})
 
         if errors:
             output["ai_processing_errors"] = errors
@@ -1866,6 +2061,8 @@ class MedicalRecordAgents:
             output.pop("ai_processing_errors", None)
         output.pop("__original_diagnoses", None)
         output.pop("__previous_diagnoses", None)
+        output.pop("__previous_record_context", None)
+        output["ai_processing_stages"] = list(resolve_stage_names(stage_names))
 
         return output
 
@@ -2142,7 +2339,7 @@ def _replace_jsonl_records_by_order_sn(path: Path, replacements: list[dict[str, 
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with temporary.open("w", encoding="utf-8") as file:
         for record in merged:
-            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            file.write(_json_dumps(record) + "\n")
     temporary.replace(path)
 
 
@@ -2157,7 +2354,7 @@ def _remove_jsonl_records_by_order_sn(path: Path, order_sns: set[str]) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with temporary.open("w", encoding="utf-8") as file:
         for record in kept:
-            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            file.write(_json_dumps(record) + "\n")
     temporary.replace(path)
 
 
@@ -2200,14 +2397,18 @@ def _progress_log_message(
     )
 
 
-def load_processed_record_keys(output_dir: Path) -> tuple[set[str], set[str]]:
+def load_processed_record_keys(
+    output_dir: Path,
+    result_file_name: str | None = None,
+) -> tuple[set[str], set[str]]:
     """Load identities and order numbers already written to result or filter files."""
     processed_ids: set[str] = set()
     processed_order_sns: set[str] = set()
     if not output_dir.is_dir():
         return processed_ids, processed_order_sns
-    # 递归读取新的医生子目录，同时兼容旧版直接存储在 output_dir 根目录的 *_ai.jsonl。
-    for path in output_dir.rglob("*_ai.jsonl"):
+    # 指定阶段运行时只读取该阶段对应的结果文件，避免其他阶段的结果造成误跳过。
+    result_pattern = result_file_name or "*_ai.jsonl"
+    for path in output_dir.rglob(result_pattern):
         if path.name == FAILURE_FILE_NAME:
             continue
         with path.open("r", encoding="utf-8") as file:
@@ -2217,7 +2418,8 @@ def load_processed_record_keys(output_dir: Path) -> tuple[set[str], set[str]]:
                 except json.JSONDecodeError:
                     continue
                 is_result_record = isinstance(record, dict) and (
-                    path.name == DOCTOR_RECORD_FILE_NAME or record.get("ai_processing_complete") is True
+                    path.name in {DOCTOR_RECORD_FILE_NAME, result_file_name}
+                    or record.get("ai_processing_complete") is True
                 )
                 if is_result_record:
                     processed_ids.add(_text(record.get("ai_record_identity")) or _record_identity(record))
@@ -2259,16 +2461,24 @@ def _doctor_output_dir(output_dir: Path, record: dict[str, Any]) -> Path:
     return output_dir / f"doctor_{_safe_path_part(doctor_id)}_{doctor_name}"
 
 
-def _doctor_output_path(output_dir: Path, record: dict[str, Any]) -> Path:
-    return _doctor_output_dir(output_dir, record) / DOCTOR_RECORD_FILE_NAME
+def _doctor_output_path(
+    output_dir: Path,
+    record: dict[str, Any],
+    stage_names: Iterable[str] | None = None,
+) -> Path:
+    return _doctor_output_dir(output_dir, record) / _stage_output_file_name(stage_names)
 
 
-def _doctor_failure_path(output_dir: Path, record: dict[str, Any]) -> Path:
-    return _doctor_output_dir(output_dir, record) / FAILURE_FILE_NAME
+def _doctor_failure_path(
+    output_dir: Path,
+    record: dict[str, Any],
+    stage_names: Iterable[str] | None = None,
+) -> Path:
+    return _doctor_output_dir(output_dir, record) / _stage_output_file_name(stage_names, failure=True)
 
 
 def _write_jsonl(file: TextIO, record: dict[str, Any]) -> None:
-    file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    file.write(_json_dumps(record) + "\n")
     file.flush()
 
 
@@ -2310,7 +2520,7 @@ def _mysql_result_row(record: Mapping[str, Any], columns: set[str], id_column: s
 def _mysql_record_key(record: Mapping[str, Any], id_column: str) -> Any:
     return record.get(id_column) or record.get("medical_record_id") or record.get("id")
 
-
+@perf_counter_timer
 def _load_mysql_records(args: argparse.Namespace) -> list[dict[str, Any]]:
     from medical.data_utils.db_manager import DBManager
 
@@ -2320,6 +2530,76 @@ def _load_mysql_records(args: argparse.Namespace) -> list[dict[str, Any]]:
         return [_mysql_row_to_record(row) for row in rows]
     finally:
         manager.close()
+
+
+def export_mysql_records_to_local(args: argparse.Namespace) -> int:
+    """导出 MySQL 记录到本地 JSONL 文件，按医生分组."""
+    from medical.data_utils.db_manager import DBManager
+
+    output_dir: Path = args.output_dir
+    doctor_ids_filter = {_text(doctor_id) for doctor_id in (args.doctor_id or []) if _text(doctor_id)}
+    limit = getattr(args, "limit", 0) or 0
+
+    manager = DBManager(MYSQL_DATABASE_URL or None)
+    try:
+        columns = _mysql_table_columns(manager, MYSQL_RECORD_TABLE)
+        id_column = MYSQL_ID_COLUMN if MYSQL_ID_COLUMN in columns else "medical_record_id"
+
+        filters = None
+        if doctor_ids_filter:
+            if "doctor_id" not in columns:
+                raise ValueError(f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 doctor_id 字段，无法按医生过滤导出")
+            filters = {"doctor_id": sorted(doctor_ids_filter)}
+
+        rows = manager.select(
+            MYSQL_RECORD_TABLE,
+            filters=filters,
+            limit=limit if limit > 0 else None,
+            order_by=["-id"] if id_column in columns else None,
+        )
+    finally:
+        manager.close()
+
+    doctor_files: dict[str, tuple[TextIO, Path, Path]] = {}
+    count = 0
+
+    def get_doctor_file(doctor_id: str, doctor_name: str | None) -> TextIO:
+        key = doctor_id
+        if key not in doctor_files:
+            doctor_dir = output_dir / f"doctor_{_safe_path_part(doctor_id)}_{_safe_path_part(doctor_name)}"
+            doctor_dir.mkdir(parents=True, exist_ok=True)
+            file_path = doctor_dir / "records.jsonl"
+            temporary_path = doctor_dir / f".{file_path.name}.{os.getpid()}.tmp"
+            doctor_files[key] = (open(temporary_path, "w", encoding="utf-8"), temporary_path, file_path)
+        return doctor_files[key][0]
+
+    export_succeeded = False
+    try:
+        for row in rows:
+            record = _mysql_row_to_record(row)
+            doctor_id = _text(record.get("doctor_id")) or "unknown"
+            # SQL 查询已经按 doctor_id 过滤；这里再次校验，避免自定义数据库适配器忽略 filters 后误导出数据。
+            if doctor_ids_filter and doctor_id not in doctor_ids_filter:
+                continue
+            doctor_name = record.get("doctor_name")
+            file = get_doctor_file(doctor_id, doctor_name)
+            _write_jsonl(file, record)
+            count += 1
+            if count % 1000 == 0:
+                logger.info(f"已导出 {count} 条记录...")
+        export_succeeded = True
+    finally:
+        for file, _, _ in doctor_files.values():
+            file.close()
+        if export_succeeded:
+            for _, temporary_path, file_path in doctor_files.values():
+                temporary_path.replace(file_path)
+        else:
+            for _, temporary_path, _ in doctor_files.values():
+                temporary_path.unlink(missing_ok=True)
+
+    logger.info(f"导出完成：共 {count} 条记录，分布在 {len(doctor_files)} 个医生目录")
+    return count
 
 
 def _load_mysql_processed_record_keys(args: argparse.Namespace) -> tuple[set[str], set[str]]:
@@ -2423,13 +2703,20 @@ async def _process_record_batch(
             working_record = dict(item["record"])
             patient_key = item["patient_key"]
             if patient_key and patient_key in previous_diagnoses_by_patient:
-                working_record["__previous_diagnoses"] = previous_diagnoses_by_patient[patient_key]
+                previous_state = previous_diagnoses_by_patient[patient_key]
+                working_record["__previous_diagnoses"] = {
+                    field: _text(previous_state.get(field)) for field in DIAGNOSIS_FIELDS
+                }
+                previous_context = previous_state.get("__record_context")
+                if isinstance(previous_context, Mapping):
+                    working_record["__previous_record_context"] = dict(previous_context)
 
             try:
                 process_call = agents.process(
                     working_record,
                     extract_current_history=item["extract_current_history"],
                     use_rag=item["use_rag"],
+                    stage_names=item.get("stage_names"),
                 )
                 if record_timeout > 0:
                     enriched = await asyncio.wait_for(process_call, timeout=record_timeout)
@@ -2445,6 +2732,7 @@ async def _process_record_batch(
 
             if error is not None:
                 enriched.pop("__previous_diagnoses", None)
+                enriched.pop("__previous_record_context", None)
                 enriched.pop("__original_diagnoses", None)
                 enriched["ai_processing_errors"] = [{"stage": "record", "error": f"{type(error).__name__}: {error}"}]
                 enriched["ai_processing_complete"] = False
@@ -2453,8 +2741,10 @@ async def _process_record_batch(
             outcomes.append((item, enriched, error))
             if patient_key and enriched.get("ai_processing_filtered") is not True:
                 enriched_diagnoses = _diagnosis_payload(enriched, prefer_ai=True)
-                if _has_any_diagnosis(enriched_diagnoses):
-                    previous_diagnoses_by_patient[patient_key] = enriched_diagnoses
+                previous_diagnoses_by_patient[patient_key] = {
+                    **enriched_diagnoses,
+                    "__record_context": _record_history_context(enriched),
+                }
         return outcomes
 
     grouped_outcomes = await asyncio.gather(
@@ -2479,13 +2769,21 @@ async def _process_record_batch(
 
 async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    requested_stage_names = list(getattr(args, "stage_name", None) or [])
+    stage_names = resolve_stage_names(requested_stage_names)
+    logger.info(f"本次清洗的阶段 {stage_names}")
     if getattr(args, "reprocess_failures", False) or getattr(args, "reprocess_missing_histories", False):
         raise ValueError("mysql 数据源暂不支持 --reprocess-failures 或 --reprocess-missing-histories")
 
     doctor_ids = set(args.doctor_id or [])
     source_records = _load_mysql_records(args)
+    logger.info(f"本次从数据库读取数据{len(source_records)}条")
     patient_visit_counts = count_patient_visits_in_records(source_records, doctor_ids)
-    processed_ids, processed_order_sns = (set(), set()) if args.reprocess else _load_mysql_processed_record_keys(args)
+    processed_ids, processed_order_sns = (
+        (set(), set())
+        if args.reprocess or requested_stage_names
+        else _load_mysql_processed_record_keys(args)
+    )
 
     text_model = build_model(args.model, args, base_url=args.base_url, api_key=args.api_key)
     diagnosis_model = build_model(
@@ -2574,6 +2872,7 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
             record_id = item["record_id"]
             enriched["ai_record_identity"] = identity
             enriched.pop("__previous_diagnoses", None)
+            enriched.pop("__previous_record_context", None)
             enriched.pop("__original_diagnoses", None)
 
             if process_error is not None:
@@ -2596,10 +2895,13 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
                 succeeded += 1
                 enriched["ai_processing_complete"] = True
                 enriched["ai_processing_version"] = "2026-07-28"
+                enriched["ai_processing_stages"] = list(stage_names)
                 processed_ids.add(identity)
                 if order_sn:
                     processed_order_sns.add(order_sn)
-            _save_mysql_record(args, enriched)
+            save_to = getattr(args, "save_to", "mysql")
+            if save_to in ("mysql", "both"):
+                _save_mysql_record(args, enriched)
 
         completed += len(outcomes)
         logger.info(f"[BATCH END] records={len(batch)} elapsed={time.monotonic() - batch_started_at:.1f}s")
@@ -2641,7 +2943,10 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
             await flush_batch()
             skipped_diagnoses = _diagnosis_payload(record, prefer_ai=True)
             if patient_key and _has_any_diagnosis(skipped_diagnoses):
-                previous_diagnoses_by_patient[patient_key] = skipped_diagnoses
+                previous_diagnoses_by_patient[patient_key] = {
+                    **skipped_diagnoses,
+                    "__record_context": _record_history_context(record),
+                }
             skipped += 1
             skipped_existing += 1
             logger.info(f"数据已经处理过，【SKIP】 {order_sn or identity}")
@@ -2666,6 +2971,7 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
                 "patient_key": patient_key,
                 "extract_current_history": extract_current_history,
                 "use_rag": args.use_rag,
+                "stage_names": stage_names,
             }
         )
         if len(pending_batch) >= batch_size:
@@ -2692,6 +2998,9 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         return await process_mysql_records(args)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    requested_stage_names = list(getattr(args, "stage_name", None) or [])
+    stage_names = resolve_stage_names(requested_stage_names)
+    stage_output_names = stage_names if requested_stage_names else None
     doctor_ids = set(args.doctor_id or [])
     reprocess_selected = bool(
         getattr(args, "reprocess_failures", False) or getattr(args, "reprocess_missing_histories", False)
@@ -2708,6 +3017,9 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         else None
     )
 
+    # print(args)
+    # import pdb
+    # pdb.set_trace()
     text_model = build_model(
         args.model,
         args,
@@ -2764,7 +3076,10 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     if args.reprocess or reprocess_selected:
         processed_ids, processed_order_sns = set(), set()
     else:
-        processed_ids, processed_order_sns = load_processed_record_keys(args.output_dir)
+        processed_ids, processed_order_sns = load_processed_record_keys(
+            args.output_dir,
+            _stage_output_file_name(stage_output_names),
+        )
     planned_total = (
         len(source_records)
         if source_records is not None
@@ -2826,10 +3141,11 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 record_id = item["record_id"]
                 enriched["ai_record_identity"] = identity
                 enriched.pop("__previous_diagnoses", None)
+                enriched.pop("__previous_record_context", None)
                 enriched.pop("__original_diagnoses", None)
 
                 if process_error is not None:
-                    failure_path = _doctor_failure_path(args.output_dir, enriched)
+                    failure_path = _doctor_failure_path(args.output_dir, enriched, stage_output_names)
                     if failure_path not in failure_files:
                         failure_path.parent.mkdir(parents=True, exist_ok=True)
                         failure_files[failure_path] = stack.enter_context(failure_path.open("a", encoding="utf-8"))
@@ -2851,7 +3167,7 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 if enriched.get("ai_processing_errors"):
                     failed += 1
                     enriched["ai_processing_complete"] = False
-                    failure_path = _doctor_failure_path(args.output_dir, enriched)
+                    failure_path = _doctor_failure_path(args.output_dir, enriched, stage_output_names)
                     if failure_path not in failure_files:
                         failure_path.parent.mkdir(parents=True, exist_ok=True)
                         failure_files[failure_path] = stack.enter_context(failure_path.open("a", encoding="utf-8"))
@@ -2861,19 +3177,24 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                     continue
 
                 succeeded += 1
+                save_to = getattr(args, "save_to", "local")
                 enriched["ai_processing_complete"] = True
                 enriched["ai_processing_version"] = "2026-07-28"
-                output_path = _doctor_output_path(args.output_dir, enriched)
-                if reprocess_selected:
-                    replacement_records.setdefault(output_path, []).append(enriched)
-                    if order_sn:
-                        failure_path = _doctor_failure_path(args.output_dir, enriched)
-                        successful_reprocess_order_sns.setdefault(failure_path, set()).add(order_sn)
-                else:
+                enriched["ai_processing_stages"] = list(stage_names)
+                if save_to in ("local", "both") and not reprocess_selected:
+                    output_path = _doctor_output_path(args.output_dir, enriched, stage_output_names)
                     if output_path not in output_files:
                         output_path.parent.mkdir(parents=True, exist_ok=True)
                         output_files[output_path] = stack.enter_context(output_path.open("a", encoding="utf-8"))
                     _write_jsonl(output_files[output_path], enriched)
+                if save_to in ("mysql", "both"):
+                    _save_mysql_record(args, enriched)
+                if reprocess_selected:
+                    output_path = _doctor_output_path(args.output_dir, enriched, stage_output_names)
+                    replacement_records.setdefault(output_path, []).append(enriched)
+                    if order_sn:
+                        failure_path = _doctor_failure_path(args.output_dir, enriched, stage_output_names)
+                        successful_reprocess_order_sns.setdefault(failure_path, set()).add(order_sn)
                 processed_ids.add(identity)
                 if order_sn:
                     processed_order_sns.add(order_sn)
@@ -2920,7 +3241,10 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 await flush_batch()
                 skipped_diagnoses = _diagnosis_payload(record, prefer_ai=True)
                 if patient_key and _has_any_diagnosis(skipped_diagnoses):
-                    previous_diagnoses_by_patient[patient_key] = skipped_diagnoses
+                    previous_diagnoses_by_patient[patient_key] = {
+                        **skipped_diagnoses,
+                        "__record_context": _record_history_context(record),
+                    }
                 skipped += 1
                 skipped_existing += 1
                 logger.info(f"数据已经处理过，【SKIP】 {order_sn}")
@@ -2945,6 +3269,7 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                     "patient_key": patient_key,
                     "extract_current_history": extract_current_history,
                     "use_rag": args.use_rag,
+                    "stage_names": stage_names,
                 }
             )
             if len(pending_batch) >= batch_size:
@@ -2976,7 +3301,13 @@ def parse_args() -> argparse.Namespace:
         "--data-source",
         choices=("local", "mysql"),
         default="local",
-        help="数据来源和结果写入位置：local 读写本地文件；mysql 读写 MySQL 表，默认 local",
+        help="数据来源：local 从本地文件读取；mysql 从 MySQL 表读取",
+    )
+    parser.add_argument(
+        "--save-to",
+        choices=("local", "mysql", "both"),
+        default=None,
+        help="处理结果写入位置：local 仅写入本地文件；mysql 仅写入 MySQL 表；both 同时写入，默认跟随 --data-source",
     )
     parser.add_argument(
         "--input",
@@ -3078,7 +3409,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="启用评审 Agent；默认关闭",
     )
-    parser.add_argument("--doctor-id", action="append", help="仅处理指定 doctor_id；可重复传入，默认所有医生")
+    parser.add_argument(
+        "--doctor-id",
+        action="extend",
+        nargs="+",
+        default=[],
+        help="仅处理指定 doctor_id；可一次传入一个或多个 ID，也可重复使用参数，默认所有医生",
+    )
+    parser.add_argument(
+        "--stage-name",
+        action="extend",
+        nargs="+",
+        choices=STAGE_NAMES,
+        default=[],
+        help=(
+            "仅运行指定清洗阶段，可一次传入一个或多个名称，也可重复使用参数；"
+            "不传时运行全部阶段。指定后本地输出文件名会包含 stage 名称"
+        ),
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -3134,6 +3482,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fail-fast", action="store_true", help="任一病历失败时立即退出")
     parser.add_argument("--use-rag", type=bool, default=False, help="是否使用病因提取中医知识库")
+    parser.add_argument(
+        "--export-mode",
+        action="store_true",
+        help="仅导出模式：将 MySQL 数据导出到本地 JSONL，不执行处理",
+    )
     return parser.parse_args()
 
 
@@ -3141,8 +3494,22 @@ def main() -> None:
     args = parse_args()
     if args.data_source == "local" and not args.input.exists():
         raise FileNotFoundError(f"输入路径不存在: {args.input}")
+    # save_to 默认为与 data_source 一致
+    if args.save_to is None:
+        args.save_to = args.data_source
+
+    # 导出模式：直接从 MySQL 导出到本地 JSONL
+    if getattr(args, "export_mode", False):
+        if args.data_source != "mysql":
+            raise ValueError("--export-mode 仅在 --data-source mysql 时有效")
+        count = export_mysql_records_to_local(args)
+        logger.info(f"导出完成，共 {count} 条记录到 {args.output_dir}")
+        return
+
     succeeded, failed, skipped = asyncio.run(process_records(args))
-    output_location = str(args.output_dir) if args.data_source == "local" else f"MySQL 表 {MYSQL_RECORD_TABLE}"
+    output_location = (
+        str(args.output_dir) if args.save_to in ("local", "both") else f"MySQL 表 {MYSQL_RECORD_TABLE}"
+    )
     logger.info(
         f"处理完成: 成功 {succeeded} 条，失败 {failed} 条，跳过已处理或过滤 {skipped} 条，输出位置 {output_location}"
     )
