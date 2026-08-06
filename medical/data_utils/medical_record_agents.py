@@ -130,6 +130,13 @@ HISTORY_FIELDS = (
     "marriage_history",
     "family_history",
 )
+CLEANED_HISTORY_FIELDS = (
+    "old_medical_history",
+    "allergic_history",
+    "personal_history",
+    "special_history",
+    "family_history",
+)
 IMAGE_FIELDS = ("tongue_face_img", "admin_face_img", "admin_report_img", "inspection_report_img")
 IMAGE_CATEGORIES = ("舌", "面", "患处", "检验检查报告类", "其他类")
 TONGUE_FACE_IMAGE_CATEGORIES = ("舌", "面", "患处")
@@ -1530,7 +1537,7 @@ class MedicalRecordAgents:
             )
         record["ai_complaint_history_consistent"] = values.get("complaint_history_consistent")
         record["ai_complaint_history_issues"] = values.get("consistency_issues") or []
-        for field in HISTORY_FIELDS:
+        for field in CLEANED_HISTORY_FIELDS:
             original = histories[field]
             if field == "allergic_history" and original in {"无", "无特殊", "否认", "否认过敏"}:
                 record[f"ai_{field}"] = "无药物及食物过敏史"
@@ -1911,6 +1918,8 @@ class MedicalRecordAgents:
     ) -> dict[str, Any]:
         selected_stages = set(resolve_stage_names(stage_names))
         output = dict(record)
+        original_history_present = "new_medical_history" in output
+        original_history = output.get("new_medical_history")
         # 前端保存的是富文本 HTML。先转成纯文本再参与空值过滤和后续 Agent 调用，
         # 避免标签污染提示词，也避免只有 <p><br></p> 的空病史绕过过滤。
         # 1. 规则清洗现病史字段内容
@@ -1934,6 +1943,10 @@ class MedicalRecordAgents:
                 "patient_appeal、new_medical_history、diagnosis_illness 均为空"
             )
             logger.info(f"[STAGE FILTER] record={record_id} doctor_name={doctor_name}")
+            if original_history_present:
+                output["new_medical_history"] = original_history
+            else:
+                output.pop("new_medical_history", None)
             return output
 
         # 3. 先做不依赖诊断类型的基础归一化，不额外存储 ai_normalized_*。
@@ -2062,7 +2075,10 @@ class MedicalRecordAgents:
         output.pop("__original_diagnoses", None)
         output.pop("__previous_diagnoses", None)
         output.pop("__previous_record_context", None)
-        output["ai_processing_stages"] = list(resolve_stage_names(stage_names))
+        if original_history_present:
+            output["new_medical_history"] = original_history
+        else:
+            output.pop("new_medical_history", None)
 
         return output
 
@@ -2895,7 +2911,6 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
                 succeeded += 1
                 enriched["ai_processing_complete"] = True
                 enriched["ai_processing_version"] = "2026-07-28"
-                enriched["ai_processing_stages"] = list(stage_names)
                 processed_ids.add(identity)
                 if order_sn:
                     processed_order_sns.add(order_sn)
@@ -2936,6 +2951,8 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
             if _all_selected_doctors_reached(doctor_ids, attempted_by_doctor, args.limit):
                 break
             continue
+        if not doctor_ids and args.limit and attempted >= args.limit:
+            break
         identity = _record_identity(record, index)
         order_sn = _text(record.get("order_sn"))
         patient_key = _patient_key(record)
@@ -2951,8 +2968,6 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
             skipped_existing += 1
             logger.info(f"数据已经处理过，【SKIP】 {order_sn or identity}")
             continue
-        if not doctor_ids and args.limit and attempted >= args.limit:
-            break
         attempted += 1
         if doctor_id:
             attempted_by_doctor[doctor_id] += 1
@@ -3180,7 +3195,6 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 save_to = getattr(args, "save_to", "local")
                 enriched["ai_processing_complete"] = True
                 enriched["ai_processing_version"] = "2026-07-28"
-                enriched["ai_processing_stages"] = list(stage_names)
                 if save_to in ("local", "both") and not reprocess_selected:
                     output_path = _doctor_output_path(args.output_dir, enriched, stage_output_names)
                     if output_path not in output_files:
@@ -3233,6 +3247,8 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 if _all_selected_doctors_reached(doctor_ids, attempted_by_doctor, args.limit):
                     break
                 continue
+            if not doctor_ids and args.limit and attempted >= args.limit:
+                break
             identity = _record_identity(record, index)
             order_sn = _text(record.get("order_sn"))
             patient_key = _patient_key(record)
@@ -3249,8 +3265,6 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 skipped_existing += 1
                 logger.info(f"数据已经处理过，【SKIP】 {order_sn}")
                 continue
-            if not doctor_ids and args.limit and attempted >= args.limit:
-                break
             attempted += 1
             if doctor_id:
                 attempted_by_doctor[doctor_id] += 1

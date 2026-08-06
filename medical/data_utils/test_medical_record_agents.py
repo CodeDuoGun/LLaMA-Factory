@@ -1507,7 +1507,7 @@ def test_history_prompt_requires_report_interval_and_no_invented_duration() -> N
     assert "现病史遗漏的症状必须补入" in prompt
 
 
-def test_process_runs_only_selected_stage_and_records_stage_names() -> None:
+def test_process_runs_only_selected_stage_and_upserts_complete_record() -> None:
     agents = object.__new__(medical_record_agents.MedicalRecordAgents)
     agents.stage_timeout = 0
     calls = []
@@ -1522,13 +1522,75 @@ def test_process_runs_only_selected_stage_and_records_stage_names() -> None:
         "patient_appeal": "胃胀3天",
         "new_medical_history": "胃胀3天。",
         "diagnosis_illness": "胃炎",
+        "source_only_field": {"keep": True},
     }
 
     result = asyncio.run(agents.process(record, stage_names=["clinical_cleaning"]))
 
     assert calls == ["clinical_cleaning"]
     assert result["ai_patient_appeal"] == "胃胀3天"
-    assert result["ai_processing_stages"] == ["clinical_cleaning"]
+    assert result["source_only_field"] == {"keep": True}
+    assert "ai_processing_stages" not in result
+
+
+def test_selected_tongue_face_stage_overwrites_only_its_result() -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.stage_timeout = 0
+
+    async def classify_images(record):
+        return {"舌": ["tongue.jpg"], "面": [], "患处": [], "检验检查报告类": [], "其他类": []}
+
+    async def analyze_tongue_face_images(record, images):
+        assert images == ["tongue.jpg"]
+        record["ai_tongue_face_img"] = {"tongue": "new"}
+
+    agents.classify_images = classify_images
+    agents.analyze_tongue_face_images = analyze_tongue_face_images
+    record = {
+        "order_sn": "TONGUE-UPSERT-1",
+        "patient_appeal": "口干",
+        "new_medical_history": "<p>口干2日。</p>",
+        "diagnosis_illness": "口干",
+        "ai_tongue_face_img": {"tongue": "old"},
+        "ai_inspection_report_img": {"reports": ["keep"]},
+        "custom_source_field": "keep",
+    }
+
+    result = asyncio.run(agents.process(record, stage_names=["tongue_face_vlm"]))
+
+    assert result["ai_tongue_face_img"] == {"tongue": "new"}
+    assert result["ai_inspection_report_img"] == {"reports": ["keep"]}
+    assert result["new_medical_history"] == "<p>口干2日。</p>"
+    assert result["custom_source_field"] == "keep"
+    assert "ai_processing_stages" not in result
+
+
+def test_selected_treatment_stage_adds_field_to_complete_record() -> None:
+    agents = object.__new__(medical_record_agents.MedicalRecordAgents)
+    agents.stage_timeout = 0
+
+    async def infer_treatment_principle(record):
+        record["ai_treatment_principle"] = "清热利湿"
+
+    agents.infer_treatment_principle = infer_treatment_principle
+    record = {
+        "order_sn": "TREATMENT-UPSERT-1",
+        "patient_appeal": "口干",
+        "new_medical_history": "口干2日。",
+        "diagnosis_illness": "口干",
+        "original_only": 123,
+    }
+
+    result = asyncio.run(agents.process(record, stage_names=["treatment_principle"]))
+
+    assert result["ai_treatment_principle"] == "清热利湿"
+    assert result["original_only"] == 123
+    assert "ai_processing_stages" not in result
+
+
+def test_history_cleaning_result_excludes_birth_and_marriage_fields() -> None:
+    assert "birth_detail" not in HistoryCleaningResult.model_fields
+    assert "marriage_history" not in HistoryCleaningResult.model_fields
 
 
 def test_stage_output_name_and_image_dependency() -> None:

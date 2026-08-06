@@ -25,6 +25,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     Index,
     Integer,
     MetaData,
@@ -86,6 +87,7 @@ ORIGINAL_STRING_FIELDS = (
     "see_doc_time",
     "doctor_name",
     "sampling_type",
+    "treatment_principle",
 )
 ORIGINAL_BIGINT_FIELDS = (
     "source_record_id",
@@ -207,6 +209,14 @@ def build_ai_medical_records_table(metadata: MetaData | None = None, *, table_na
         Column("diagnosis_disease", Text, comment="中医辨证"),
         Column("diagnosis_sickness", Text, comment="中医病名"),
         Column("disposition", Text, comment="处置或处理意见"),
+        Column(
+            "treatment_principle",
+            String(255),
+            nullable=False,
+            default="",
+            server_default="",
+            comment="治则治法",
+        ),
         Column("see_doc_time", String(19), comment="就诊时间原始文本（保留 MySQL 零日期）"),
         Column("doctor_id", _bigint_type(), comment="医生 ID【xlys_doctor.id】"),
         Column("doctor_name", String(255), comment="医生姓名"),
@@ -230,7 +240,7 @@ def build_ai_medical_records_table(metadata: MetaData | None = None, *, table_na
         ),
         Column("operator", String(100), comment="操作人"),
         Column("label_person", String(100), comment="标注员"),
-        UniqueConstraint("order_sn", "ai_processing_version", name="anno_med_order_version_uk"),
+        UniqueConstraint("order_sn", name="anno_med_order_uk"),
         comment="AI病例标注记录",
     )
     Index("anno_med_doctor_patient_idx", table.c.doctor_id, table.c.patient_id)
@@ -281,6 +291,9 @@ def record_to_row(record: Mapping[str, Any]) -> dict[str, Any]:
             "status": record.get("status") or DEFAULT_STATUS,
             "operator": record.get("operator") or DEFAULT_AI_OPERATOR,
             "label_person": record.get("label_person"),
+            "treatment_principle": (
+                record.get("treatment_principle") or record.get("ai_treatment_principle") or ""
+            ),
         }
     )
     return {
@@ -317,6 +330,78 @@ def _batched(rows: Iterable[dict[str, Any]], batch_size: int) -> Iterator[list[d
             batch = []
     if batch:
         yield batch
+
+
+COLUMN_TYPE_DEFAULTS: dict[str, Any] = {
+    "string": "",
+    "integer": 0,
+    "bigint": 0,
+    "float": 0.0,
+    "boolean": False,
+}
+
+
+def default_value_for_column_type(column_type: str) -> Any:
+    """返回新增列类型对应的非空默认值."""
+    normalized = str(column_type or "").strip().lower()
+    if normalized not in COLUMN_TYPE_DEFAULTS:
+        raise ValueError(f"不支持的列类型: {column_type}；可选值: {', '.join(COLUMN_TYPE_DEFAULTS)}")
+    return COLUMN_TYPE_DEFAULTS[normalized]
+
+
+def _sqlalchemy_column_type(column_type: str, *, string_length: int = 255) -> Any:
+    normalized = str(column_type or "").strip().lower()
+    if normalized == "string":
+        if string_length <= 0:
+            raise ValueError("string_length 必须大于 0")
+        return String(string_length)
+    if normalized == "integer":
+        return Integer()
+    if normalized == "bigint":
+        return BigInteger()
+    if normalized == "float":
+        return Float()
+    if normalized == "boolean":
+        return Boolean()
+    default_value_for_column_type(normalized)
+    raise AssertionError("unreachable")
+
+
+def add_column_with_type_default(
+    manager: "DBManager",
+    table_name: str,
+    column_name: str,
+    column_type: str,
+    *,
+    string_length: int = 255,
+) -> bool:
+    """为已有表新增非空列并设置类型默认值；列已存在时返回 ``False``."""
+    inspector = sqlalchemy_inspect(manager.engine)
+    if not inspector.has_table(table_name):
+        raise ValueError(f"数据表不存在: {table_name}")
+    if column_name in {column["name"] for column in inspector.get_columns(table_name)}:
+        return False
+
+    sql_type = _sqlalchemy_column_type(column_type, string_length=string_length)
+    default_value = default_value_for_column_type(column_type)
+    dialect = manager.engine.dialect
+    preparer = dialect.identifier_preparer
+    quoted_table = preparer.quote(table_name)
+    quoted_column = preparer.quote(column_name)
+    type_sql = sql_type.compile(dialect=dialect)
+    default_sql = str(
+        literal(default_value, type_=sql_type).compile(
+            dialect=dialect,
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    statement = text(
+        f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_column} {type_sql} NOT NULL DEFAULT {default_sql}"
+    )
+    with manager.connection(transactional=True) as connection:
+        connection.execute(statement)
+    manager.refresh_table(table_name)
+    return True
 
 
 class AIMedicalRecordRepository:
@@ -414,7 +499,7 @@ class AIMedicalRecordRepository:
         filters = {"order_sn": order_sn}
         if ai_processing_version:
             filters["ai_processing_version"] = ai_processing_version
-        return self.manager.select_one(self.table.name, filters=filters)
+        return self.manager.select_one(self.table.name, filters=filters, order_by=["-id"])
 
     def get_by_inquiry_id(self, inquiry_id: str) -> dict[str, Any] | None:
         """按咨询单 ID 查询单条病历，兼容旧方法名."""

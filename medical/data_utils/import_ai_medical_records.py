@@ -19,7 +19,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from medical.data_utils.ai_medical_records import DEFAULT_TABLE_NAME, AIMedicalRecordRepository
+from medical.data_utils.ai_medical_records import (
+    DEFAULT_TABLE_NAME,
+    AIMedicalRecordRepository,
+    add_column_with_type_default,
+)
 from medical.data_utils.db_manager import db_manager
 
 
@@ -52,6 +56,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     clear_parser = subparsers.add_parser("clear", help="清空数据表")
     clear_parser.add_argument("--yes", action="store_true", help="确认清空整张表")
+
+    add_column_parser = subparsers.add_parser("add-column", help="向已有表增加带类型默认值的列")
+    add_column_parser.add_argument("column_name")
+    add_column_parser.add_argument(
+        "--type",
+        dest="column_type",
+        choices=("string", "integer", "bigint", "float", "boolean"),
+        default="string",
+    )
+    add_column_parser.add_argument("--string-length", type=int, default=255)
+
+    delete_doctor_parser = subparsers.add_parser("delete-doctor", help="删除指定 doctor_id 的全部数据")
+    delete_doctor_parser.add_argument("doctor_id", type=int)
+    delete_doctor_parser.add_argument("--yes", action="store_true", help="确认删除该医生全部数据")
 
     patient_parser = subparsers.add_parser("patient", help="按患者 ID 查询")
     patient_parser.add_argument("patient_id", type=int)
@@ -102,6 +120,21 @@ def main() -> None:
             raise SystemExit("清空整张表需要显式添加 --yes")
         count = repository.clear()
         print(f"已清空数据表 {repository.table.name}，删除 {count} 行")
+    elif args.command == "add-column":
+        added = add_column_with_type_default(
+            db_manager,
+            repository.table.name,
+            args.column_name,
+            args.column_type,
+            string_length=args.string_length,
+        )
+        action = "已新增" if added else "已存在，未修改"
+        print(f"字段 {args.column_name} {action}；数据表: {repository.table.name}")
+    elif args.command == "delete-doctor":
+        if not args.yes:
+            raise SystemExit("删除指定医生全部数据需要显式添加 --yes")
+        count = repository.delete_by_doctor_id(args.doctor_id)
+        print(f"已删除 doctor_id={args.doctor_id} 的 {count} 行；数据表: {repository.table.name}")
     elif args.command == "patient":
         _print_json(repository.get_by_patient_id(args.patient_id, limit=args.limit, offset=args.offset))
     elif args.command == "inquiry":

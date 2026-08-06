@@ -66,14 +66,10 @@
   【五、个人史 personal_history】
        提取出生地、长期居住地、职业暴露、吸烟、饮酒及其他明确生活习惯。月经史必须移入现病史，不得保留在个人史。不得推断；无有效信息时返回空字符串。
 【六、特殊时期 special_history】
-       提取与当前专科相关的有效特殊时期信息；月经史必须移入现病史，不得保留在特殊史。婚恋史、生育史分别写入 marriage_history、birth_detail，不得在特殊史重复；无有效信息时返回空字符串。
-【七、生育史 birth_detail】
-       仅清洗输入中明确提供的生育信息，不得推断；无有效信息时返回空字符串。
-【八、婚恋史 marriage_history】
-       仅清洗输入中明确提供的婚恋信息，不得推断；无有效信息时返回空字符串。
-【九、家族史 family_history】
+       提取与当前专科相关的有效特殊时期信息；月经史必须移入现病史，不得保留在特殊史。输入中的婚恋史、生育史不属于本次清洗输出，不得混入特殊史；无有效信息时返回空字符串。
+【七、家族史 family_history】
        提取直系亲属重大疾病、遗传性疾病和家族聚集性疾病。没有有效信息时返回空字符串，不得将患者本人疾病写入家族史。
-【十、诊断清洗】
+【八、诊断清洗】
        1. diagnosis_illness 为西医诊断，diagnosis_disease 为中医证型，diagnosis_sickness 为中医诊断，三者不得混淆类别。
        2. 纠正明确错别字、乱码、重复项及放错字段的诊断；仅可依据输入中的主诉、现病史、既往史、检查信息、舌面信息和原始诊断修正，不得凭空新增诊断。
        3. 每个诊断字段同时返回对应 reason，简要说明保留、清洗、重新分类或修正依据；证据不足以修正时保留有效原值并说明原因，无有效依据时返回空字符串。
@@ -95,8 +91,6 @@
 "ai_allergic_history": AI修正后过敏病史,
 "ai_personal_history": AI修正后个人史,
 "ai_special_history": AI修正后特殊史,
-"ai_birth_detail": AI修正后生育史,
-"ai_marriage_history": AI修正后婚恋史,
 "ai_family_history": AI修正后家族史,
 "ai_diagnosis_illness":  AI修正后西医诊断,
 "ai_diagnosis_illness_reason": 修正理由,
