@@ -104,7 +104,7 @@ DEFAULT_INPUT = Path("medical/data/202301_online")
 DEFAULT_OUTPUT_DIR = Path("medical/processed_data")
 MYSQL_RECORD_TABLE = "mlops_annotation_medical_record"
 MYSQL_ID_COLUMN = "id"
-DOCTOR_RECORD_FILE_NAME = "medical_records_ai.jsonl"
+DOCTOR_RECORD_FILE_NAME = "medical_records_ai_clean.jsonl"
 FAILURE_FILE_NAME = "medical_record_agent_failures.jsonl"
 FILTER_FILE_NAME = "filter.json"
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
@@ -207,12 +207,10 @@ def resolve_stage_names(stage_names: Iterable[str] | None) -> tuple[str, ...]:
 
 
 def _stage_output_file_name(stage_names: Iterable[str] | None, *, failure: bool = False) -> str:
-    selected = list(stage_names or [])
-    if not selected:
-        return FAILURE_FILE_NAME if failure else DOCTOR_RECORD_FILE_NAME
-    label = "__".join(_safe_path_part(name) for name in resolve_stage_names(selected))
-    prefix = "medical_record_agent_failures" if failure else "medical_records_ai"
-    return f"{prefix}__stage_{label}.jsonl"
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d")
+    prefix = "medical_record_agent_failures_stage" if failure else "medical_records_ai_stage"
+    return f"{prefix}_{timestamp}.jsonl"
 
 
 def _text(value: Any) -> str:
@@ -426,66 +424,11 @@ def _history_segments(value: Any) -> list[str]:
     return [segment.strip(" \t\r\n；;。") for segment in re.split(r"[；;。\n]+", _text(value)) if segment.strip()]
 
 
-def _deduplicate_history(value: Any) -> str:
-    seen = set()
-    unique = []
-    for segment in _history_segments(value):
-        key = re.sub(r"[\s，,、：:]", "", segment)
-        if key and key not in seen:
-            seen.add(key)
-            unique.append(segment)
-    return "；".join(unique) + ("。" if unique else "")
-
-
-def _move_menstrual_history_to_present_history(
-    record: dict[str, Any],
-    values: Mapping[str, Any],
-) -> None:
-    """Move explicit menstrual-history statements out of personal/special history into present history."""
-    menstrual_segments = []
-    for source in (
-        record.get("new_medical_history"),
-        record.get("personal_history"),
-        record.get("special_history"),
-        values.get("new_medical_history"),
-        values.get("personal_history"),
-        values.get("special_history"),
-    ):
-        menstrual_segments.extend(segment for segment in _history_segments(source) if MENSTRUAL_HISTORY_PATTERN.search(segment))
-
-    for field in ("personal_history", "special_history"):
-        current = record.get(f"ai_{field}")
-        kept = [segment for segment in _history_segments(current) if not MENSTRUAL_HISTORY_PATTERN.search(segment)]
-        record[f"ai_{field}"] = "；".join(kept) + ("。" if kept else "")
-
-    present_segments = _history_segments(record.get("ai_new_medical_history"))
-    present_keys = {re.sub(r"[\s，,、：:]", "", segment) for segment in present_segments}
-    for segment in menstrual_segments:
-        key = re.sub(r"[\s，,、：:]", "", segment)
-        if key and key not in present_keys:
-            present_keys.add(key)
-            present_segments.append(segment)
-    record["ai_new_medical_history"] = _deduplicate_history("；".join(present_segments))
-
-
-def _ensure_patient_complaint_in_present_history(record: dict[str, Any]) -> None:
-    complaint = _text(record.get("patient_appeal")) or _text(record.get("doc_ass_stu_appeal"))
-    history = _text(record.get("ai_new_medical_history"))
-    if not complaint:
-        record["ai_new_medical_history"] = _deduplicate_history(history)
-        return
-    history_key = re.sub(r"[\s，,、：:；;。]", "", history)
-    missing_parts = []
-    for part in re.split(r"[，,、；;。]+", complaint):
-        part = part.strip()
-        part_key = re.sub(r"[\s：:]", "", part)
-        if part_key and part_key not in history_key:
-            missing_parts.append(part)
-            history_key += part_key
-    if missing_parts:
-        missing_text = "、".join(missing_parts)
-        history = f"{history.rstrip('。；;')}；患者诉{missing_text}。" if history else f"患者诉{missing_text}。"
-    record["ai_new_medical_history"] = _deduplicate_history(history)
+def _history_segment_key(value: Any) -> str:
+    """Build a comparison key that ignores harmless punctuation variants."""
+    text = _text(value)
+    text = re.sub(r"末次月经\s*[：:]?\s*", "末次月经", text)
+    return re.sub(r"[\s，,、：:]", "", text)
 
 
 def _record_history_context(record: Mapping[str, Any]) -> dict[str, str]:
@@ -1492,17 +1435,16 @@ class MedicalRecordAgents:
         logger.info(f"检查报告分析结果： {inspection_description}")
         tongue_face_description = format_tongue_face_result_text(record.get("ai_tongue_face_img"))
         logger.info(f"舌面分析结果： {tongue_face_description}")
-        system_prompt = _load_prompt("clinical_record_cleaning_prompt_v2.txt")
+        system_prompt = _load_prompt("clinical_record_cleaning_prompt.txt")
         result = await _invoke_structured_agent(
             self.history_agent,
             HumanMessage(
                 content=(
                     f"医生撰写主诉 doc_ass_stu_appeal：{_text(record.get('doc_ass_stu_appeal')) or '未记录'}\n"
                     f"患者主诉 patient_appeal：{_text(record.get('patient_appeal')) or '未记录'}\n"
-                    f"原始本次现病史 new_medical_history：{_present_history(record) or '未记录'}\n"
+                    f"原始本次就诊现病史 new_medical_history：{_latest_present_history(record) or '未记录'}\n"
                     f"上一次就诊时间：{_text(previous_context.get('visit_time')) or '无上一次就诊'}\n"
                     f"上一次看诊主诉：{_text(previous_context.get('chief_complaint')) or '未记录'}\n"
-                    f"上一次病历现病史：{_text(previous_context.get('present_history')) or '未记录'}\n"
                     f"本次就诊时间：{_visit_time(record) or '未记录'}\n"
                     f"原始病史：{_json_for_prompt(histories)}\n"
                     f"医生书写的舌象及面相 admin_face_describe：{_text(record.get('admin_face_describe')) or '未记录'}\n"
@@ -1545,8 +1487,6 @@ class MedicalRecordAgents:
                 record[f"ai_{field}"] = (
                     "" if original in INVALID_HISTORY_TEXT else _clean_generated_text(values.get(field))
                 )
-        _move_menstrual_history_to_present_history(record, values)
-        _ensure_patient_complaint_in_present_history(record)
         for field in DIAGNOSIS_FIELDS:
             cleaned_diagnosis = _clean_generated_text(values.get(field)) or _clean_generated_text(record.get(field))
             record[f"ai_{field}"] = normalize_ai_diagnosis_to_standard(f"ai_{field}", cleaned_diagnosis)
@@ -2801,7 +2741,7 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
         else _load_mysql_processed_record_keys(args)
     )
 
-    text_model = build_model(args.model, args, base_url=args.base_url, api_key=args.api_key)
+    text_model = build_model(args.model, args, base_url=args.base_url, api_key=args.api_key, temperature=0.1)
     diagnosis_model = build_model(
         args.diagnosis_model,
         args,
@@ -2925,7 +2865,7 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
             or completed >= planned_total
             or completed - last_progress_completed >= progress_every
         ):
-            logger.info(
+            logger.warning(
                 _progress_log_message(
                     completed=completed,
                     total=planned_total,
@@ -2951,8 +2891,6 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
             if _all_selected_doctors_reached(doctor_ids, attempted_by_doctor, args.limit):
                 break
             continue
-        if not doctor_ids and args.limit and attempted >= args.limit:
-            break
         identity = _record_identity(record, index)
         order_sn = _text(record.get("order_sn"))
         patient_key = _patient_key(record)
@@ -2968,6 +2906,8 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
             skipped_existing += 1
             logger.info(f"数据已经处理过，【SKIP】 {order_sn or identity}")
             continue
+        if not doctor_ids and args.limit and attempted >= args.limit:
+            break
         attempted += 1
         if doctor_id:
             attempted_by_doctor[doctor_id] += 1
@@ -2993,7 +2933,7 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
             await flush_batch()
     await flush_batch()
     if planned_total and completed != last_progress_completed:
-        logger.info(
+        logger.warning(
             _progress_log_message(
                 completed=completed,
                 total=planned_total,
@@ -3220,7 +3160,7 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 or completed >= planned_total
                 or completed - last_progress_completed >= progress_every
             ):
-                logger.info(
+                logger.warning(
                     _progress_log_message(
                         completed=completed,
                         total=planned_total,
@@ -3247,8 +3187,6 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 if _all_selected_doctors_reached(doctor_ids, attempted_by_doctor, args.limit):
                     break
                 continue
-            if not doctor_ids and args.limit and attempted >= args.limit:
-                break
             identity = _record_identity(record, index)
             order_sn = _text(record.get("order_sn"))
             patient_key = _patient_key(record)
@@ -3265,6 +3203,8 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 skipped_existing += 1
                 logger.info(f"数据已经处理过，【SKIP】 {order_sn}")
                 continue
+            if not doctor_ids and args.limit and attempted >= args.limit:
+                break
             attempted += 1
             if doctor_id:
                 attempted_by_doctor[doctor_id] += 1
@@ -3294,7 +3234,7 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         for path, order_sns in successful_reprocess_order_sns.items():
             _remove_jsonl_records_by_order_sn(path, order_sns)
         if planned_total and completed != last_progress_completed:
-            logger.info(
+            logger.warning(
                 _progress_log_message(
                     completed=completed,
                     total=planned_total,

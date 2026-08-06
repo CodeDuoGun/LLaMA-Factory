@@ -1481,7 +1481,7 @@ def test_clean_histories_uses_previous_visit_and_moves_menstrual_history() -> No
 
     assert "上一次就诊时间：2026-06-20 09:00:00" in prompt_content
     assert "上一次看诊主诉：反复面红" in prompt_content
-    assert "上一次病历现病史：反复面红伴灼热。" in prompt_content
+    assert "上一次病历现病史" not in prompt_content
     assert "月经" not in record["ai_personal_history"]
     assert "末次月经" not in record["ai_special_history"]
     assert "月经周期28天" in record["ai_new_medical_history"]
@@ -1499,12 +1499,53 @@ def test_complaint_fallback_uses_previous_complaint_or_empty() -> None:
 
 
 def test_history_prompt_requires_report_interval_and_no_invented_duration() -> None:
-    prompt = medical_record_agents._load_prompt("clinical_record_cleaning_prompt_v2.txt")
+    prompt = medical_record_agents._load_prompt("clinical_record_cleaning_prompt.txt")
 
     assert "脸疼3日" in prompt
     assert "禁止写成“脸疼1年余3日”" in prompt
+    assert "本次 patient_appeal、本次 doc_ass_stu_appeal、本次 new_medical_history" in prompt
+    assert "禁止从上一次病历现病史" in prompt
     assert "晚于上一次就诊时间且不晚于本次就诊时间" in prompt
     assert "现病史遗漏的症状必须补入" in prompt
+
+
+def test_history_postprocessing_keeps_menstrual_and_missing_symptoms_before_current_status() -> None:
+    record = {
+        "patient_appeal": "面部灼痛3日、瘙痒",
+        "new_medical_history": "末次月经2026年7月1日",
+        "personal_history": "末次月经：2026年7月1日",
+        "special_history": "月经周期28天",
+        "ai_new_medical_history": "面部灼痛3日；刻下症见入睡困难。",
+        "ai_personal_history": "偶尔饮酒；末次月经：2026年7月1日",
+        "ai_special_history": "月经周期28天",
+    }
+    values = {
+        "new_medical_history": "面部灼痛3日；刻下症见入睡困难。",
+        "personal_history": "偶尔饮酒；末次月经：2026年7月1日",
+        "special_history": "月经周期28天",
+    }
+
+    medical_record_agents._move_menstrual_history_to_present_history(record, values)
+    medical_record_agents._ensure_patient_complaint_in_present_history(record)
+    medical_record_agents._move_current_status_to_present_history_end(record)
+
+    history = record["ai_new_medical_history"]
+    assert history.count("2026年7月1日") == 1
+    assert history.index("月经周期28天") < history.index("刻下症见")
+    assert history.index("瘙痒") < history.index("刻下症见")
+    assert "患者诉" not in history
+    assert "月经" not in record["ai_personal_history"]
+    assert "月经" not in record["ai_special_history"]
+
+
+def test_history_postprocessing_moves_current_status_to_end() -> None:
+    record = {
+        "ai_new_medical_history": "面部灼痛3日；刻下症见入睡困难；本次检查资料：血常规未见异常。"
+    }
+
+    medical_record_agents._move_current_status_to_present_history_end(record)
+
+    assert record["ai_new_medical_history"] == "面部灼痛3日；本次检查资料：血常规未见异常；刻下症见入睡困难。"
 
 
 def test_process_runs_only_selected_stage_and_upserts_complete_record() -> None:

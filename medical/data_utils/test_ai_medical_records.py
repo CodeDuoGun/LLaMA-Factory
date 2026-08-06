@@ -24,6 +24,7 @@ from medical.data_utils.ai_medical_records import (  # noqa: E402
     AIMedicalRecordRepository,
     add_column_with_type_default,
     default_value_for_column_type,
+    drop_column,
     record_to_row,
 )
 from medical.data_utils.db_manager import DBManager  # noqa: E402
@@ -76,6 +77,9 @@ def test_add_column_uses_type_default_for_existing_rows() -> None:
     assert add_column_with_type_default(manager, "records", "treatment_principle", "string") is True
     assert add_column_with_type_default(manager, "records", "treatment_principle", "string") is False
     assert manager.select_one("records", filters={"id": 1})["treatment_principle"] == ""
+
+    assert drop_column(manager, "records", "treatment_principle") is True
+    assert drop_column(manager, "records", "treatment_principle") is False
 
 
 def test_repository_upserts_by_order_sn_and_deletes_doctor_rows() -> None:

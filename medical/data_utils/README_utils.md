@@ -206,10 +206,16 @@ python medical/data_utils/import_ai_medical_records.py record 1001
 ```
 
 已有相同 `order_sn` 的记录会更新，不存在时新增。可为已有表增加带类型默认值的字段；例如新增
-`treatment_principle VARCHAR(255) NOT NULL DEFAULT ''`：
+`ai_treatment_principle VARCHAR(255) NOT NULL DEFAULT ''`：
 
 ```bash
-python medical/data_utils/import_ai_medical_records.py add-column treatment_principle --type string
+python medical/data_utils/import_ai_medical_records.py add-column ai_treatment_principle --type string
+```
+
+删除误增字段前请确认字段名；例如删除 `treatment_principle`：
+
+```bash
+python medical/data_utils/import_ai_medical_records.py drop-column treatment_principle --yes
 ```
 
 删除指定医生的全部数据和清空整表都属于破坏性操作，必须显式确认：

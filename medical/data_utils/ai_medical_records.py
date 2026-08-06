@@ -36,6 +36,7 @@ from sqlalchemy import (
     UniqueConstraint,
     inspect,
     insert,
+    literal,
     text,
     update,
 )
@@ -291,9 +292,7 @@ def record_to_row(record: Mapping[str, Any]) -> dict[str, Any]:
             "status": record.get("status") or DEFAULT_STATUS,
             "operator": record.get("operator") or DEFAULT_AI_OPERATOR,
             "label_person": record.get("label_person"),
-            "treatment_principle": (
-                record.get("treatment_principle") or record.get("ai_treatment_principle") or ""
-            ),
+            "treatment_principle": record.get("ai_treatment_principle", ""),
         }
     )
     return {
@@ -376,7 +375,7 @@ def add_column_with_type_default(
     string_length: int = 255,
 ) -> bool:
     """为已有表新增非空列并设置类型默认值；列已存在时返回 ``False``."""
-    inspector = sqlalchemy_inspect(manager.engine)
+    inspector = inspect(manager.engine)
     if not inspector.has_table(table_name):
         raise ValueError(f"数据表不存在: {table_name}")
     if column_name in {column["name"] for column in inspector.get_columns(table_name)}:
@@ -404,6 +403,25 @@ def add_column_with_type_default(
     return True
 
 
+def drop_column(manager: "DBManager", table_name: str, column_name: str) -> bool:
+    """删除已有表中的列；列不存在时返回 ``False``."""
+    inspector = inspect(manager.engine)
+    if not inspector.has_table(table_name):
+        raise ValueError(f"数据表不存在: {table_name}")
+    column_names = {column["name"] for column in inspector.get_columns(table_name)}
+    if column_name not in column_names:
+        return False
+
+    preparer = manager.engine.dialect.identifier_preparer
+    quoted_table = preparer.quote(table_name)
+    quoted_column = preparer.quote(column_name)
+    statement = text(f"ALTER TABLE {quoted_table} DROP COLUMN {quoted_column}")
+    with manager.connection(transactional=True) as connection:
+        connection.execute(statement)
+    manager.refresh_table(table_name)
+    return True
+
+
 class AIMedicalRecordRepository:
     """AI 病例标注记录的批量写入及索引检索服务."""
 
@@ -416,22 +434,27 @@ class AIMedicalRecordRepository:
         self.manager.create_table(self.table, checkfirst=True)
 
     def add_ai_treatment_principle_column(self) -> bool:
-        """为当前标注表补充 ai_treatment_principle 字段，已存在时跳过."""
+        """为当前标注表补充 ``ai_treatment_principle`` 字符串字段."""
         self.create_table()
-        inspector = inspect(self.manager.engine)
-        column_names = {column["name"] for column in inspector.get_columns(self.table.name, schema=self.table.schema)}
-        if "ai_treatment_principle" in column_names:
-            return False
+        return add_column_with_type_default(
+            self.manager,
+            self.table.name,
+            "ai_treatment_principle",
+            "string",
+        )
 
-        preparer = self.manager.engine.dialect.identifier_preparer
-        table_name = preparer.quote(self.table.name)
-        if self.table.schema:
-            table_name = f"{preparer.quote_schema(self.table.schema)}.{table_name}"
-        column_name = preparer.quote("ai_treatment_principle")
-        with self.manager.connection(transactional=True) as connection:
-            connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} TEXT"))
-        self.manager.refresh_table(self.table.name, schema=self.table.schema)
-        return True
+    def _available_column_names(self) -> set[str]:
+        inspector = inspect(self.manager.engine)
+        return {column["name"] for column in inspector.get_columns(self.table.name, schema=self.table.schema)}
+
+    def _database_table(self) -> Table:
+        """读取数据库当前表结构，避免使用已过时的代码表定义写入已删除列。"""
+        return Table(
+            self.table.name,
+            MetaData(),
+            schema=self.table.schema,
+            autoload_with=self.manager.engine,
+        )
 
     def batch_upsert_by_order_sn(
         self,
@@ -439,15 +462,41 @@ class AIMedicalRecordRepository:
         *,
         batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> int:
-        """分批写入病历；order_sn 已存在时更新该记录，否则插入新记录."""
+        """分批写入病历；order_sn 已存在时更新该记录，否则插入新记录。
+
+        若已存在记录的 operator == "HUMAN" 且 status == "labeled"，则跳过该记录的更新.
+        """
         total = 0
+        available_columns = self._available_column_names()
+        database_table = self._database_table()
         for batch in _batched((record_to_row(record) for record in records), batch_size):
+            batch = [{key: value for key, value in row.items() if key in available_columns} for row in batch]
             rows = self._dedupe_rows_by_order_sn(batch)
             if not rows:
                 continue
             existing_order_sns = self._existing_order_sns(rows)
-            rows_to_update = [row for row in rows if row["order_sn"] in existing_order_sns]
-            rows_to_insert = [row for row in rows if row["order_sn"] not in existing_order_sns]
+            rows_to_update = []
+            rows_to_insert = []
+            if existing_order_sns:
+                existing_records = self.manager.select(
+                    self.table.name,
+                    filters={"order_sn": list(existing_order_sns)},
+                    columns=["order_sn", "operator", "status"],
+                )
+                skip_order_sns = {
+                    rec["order_sn"]
+                    for rec in existing_records
+                    if rec.get("operator") == "HUMAN" and rec.get("status") == "labeled"
+                }
+            else:
+                skip_order_sns = set()
+            for row in rows:
+                if row["order_sn"] in existing_order_sns:
+                    if row["order_sn"] in skip_order_sns:
+                        continue
+                    rows_to_update.append(row)
+                else:
+                    rows_to_insert.append(row)
             with self.manager.connection(transactional=True) as connection:
                 for row in rows_to_update:
                     connection.execute(
@@ -456,7 +505,8 @@ class AIMedicalRecordRepository:
                         .values(**row)
                     )
                 if rows_to_insert:
-                    connection.execute(insert(self.table), rows_to_insert)
+                    statement = insert(database_table).values(**rows_to_insert[0])
+                    connection.execute(statement, rows_to_insert)
             total += len(rows_to_update) + len(rows_to_insert)
         return total
 

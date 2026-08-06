@@ -139,9 +139,9 @@ def format_inspection_result_text(result: InspectionResult | Mapping[str, Any] |
             continue
         valid_index += 1
         report_time = (
-            _inspection_field(report, "report_time", "报告时间")
+            _inspection_field(report, "relative_to_visit_time", "相对就诊时间")
+            or _inspection_field(report, "report_time", "报告时间")
             or _inspection_field(report, "report_date", "报告日期")
-            or _inspection_field(report, "relative_to_visit_time", "相对就诊时间")
         )
         report_name = _format_tongue_face_value(_inspection_field(report, "report_name", "报告名称")) or "未识别"
         abnormal_indicators = (
