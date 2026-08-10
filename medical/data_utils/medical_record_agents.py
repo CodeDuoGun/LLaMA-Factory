@@ -1283,7 +1283,7 @@ class MedicalRecordAgents:
             system_prompt=_load_prompt("inspection_report_analysis_prompt.txt"),
             name="inspection_report_agent",
         )
-        self.tongue_face_agent = StructuredAgent(
+        self.tongue_face_agent = StructuredAgent[TongueFaceResult](
             vlm_model,
             TongueFaceResult,
             system_prompt=_load_prompt("tongue_face_analysis_prompt.txt"),
@@ -2850,7 +2850,7 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
             else:
                 succeeded += 1
                 enriched["ai_processing_complete"] = True
-                enriched["ai_processing_version"] = "2026-07-28"
+                enriched["ai_processing_version"] = date.today().isoformat()
                 processed_ids.add(identity)
                 if order_sn:
                     processed_order_sns.add(order_sn)
@@ -3134,7 +3134,7 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                 succeeded += 1
                 save_to = getattr(args, "save_to", "local")
                 enriched["ai_processing_complete"] = True
-                enriched["ai_processing_version"] = "2026-07-28"
+                enriched["ai_processing_version"] = date.today().isoformat()
                 if save_to in ("local", "both") and not reprocess_selected:
                     output_path = _doctor_output_path(args.output_dir, enriched, stage_output_names)
                     if output_path not in output_files:
