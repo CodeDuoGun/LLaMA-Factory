@@ -9,7 +9,7 @@ INPUT_DIR="${REPO_ROOT}/medical/data/202301_online"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/medical/processed_data}"
 
 LOG_DIR="${LOG_DIR:-${OUTPUT_DIR}/logs/six_doctors}"
-LIMIT_PER_DOCTOR="${LIMIT_PER_DOCTOR:-4000}"
+LIMIT_PER_DOCTOR="${LIMIT_PER_DOCTOR:-200}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 RECORD_TIMEOUT="${RECORD_TIMEOUT:-0}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
@@ -86,7 +86,6 @@ for doctor in "${DOCTORS[@]}"; do
   nohup "${RUNNER[@]}" "${AGENT_SCRIPT}" \
     --data-source local \
     --save-to local \
-    --stage-name "${STAGES[@]}" \
     --input "${input_path}" \
     --output-dir "${OUTPUT_DIR}" \
     --doctor-id "${doctor_id}" \

@@ -183,8 +183,8 @@ def build_ai_medical_records_table(metadata: MetaData | None = None, *, table_na
         Column("patient_age", String(50), comment="就诊人年龄"),
         Column("patient_idcard", String(50), comment="就诊人身份证号"),
         Column("patient_mobile", String(50), comment="就诊人手机号"),
-        Column("patient_height", Numeric(10, 2), comment="就诊人身高"),
-        Column("patient_weight", Numeric(10, 2), comment="就诊人体重"),
+        Column("patient_height", Numeric(10, 2), nullable=True, comment="就诊人身高"),
+        Column("patient_weight", Numeric(10, 2), nullable=True, comment="就诊人体重"),
         Column("patient_appeal", Text, comment="就诊人主诉"),
         Column("doc_ass_stu_appeal", Text, comment="医生、医助或学生撰写的主诉"),
         Column("new_medical_history", Text, comment="现病史"),
@@ -491,12 +491,18 @@ class AIMedicalRecordRepository:
             else:
                 skip_order_sns = set()
             for row in rows:
+                # 针对类型与数据库不一致字段修正
+                if not row["patient_height"]:
+                    row["patient_height"] = 0
+                if not row["patient_weight"]:
+                    row["patient_weight"] = 0
                 if row["order_sn"] in existing_order_sns:
                     if row["order_sn"] in skip_order_sns:
                         continue
                     rows_to_update.append(row)
                 else:
                     rows_to_insert.append(row)
+
             with self.manager.connection(transactional=True) as connection:
                 for row in rows_to_update:
                     connection.execute(

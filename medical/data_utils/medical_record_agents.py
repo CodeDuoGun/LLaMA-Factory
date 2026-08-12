@@ -149,8 +149,8 @@ CLASSIFICATION_MODEL_NAME = "qwen3.7-flash"
 CLASSIFICATION_MODEL_MAX_TOKENS = 512
 DEFAULT_AGENT_TEMPERATURE = 0.0
 DEFAULT_AGENT_MAX_TOKENS = 3600
-IMAGE_DEDUP_DOWNLOAD_CONCURRENCY = 8
-IMAGE_DEDUP_DOWNLOAD_TIMEOUT = 10.0
+IMAGE_DEDUP_DOWNLOAD_CONCURRENCY = 6
+IMAGE_DEDUP_DOWNLOAD_TIMEOUT = 15.0
 CURRENT_VISIT_HISTORY_SYSTEM_PROMPT = (
     "你是临床病历现病史整理助手。输入可能包含同一患者按日期累积的多次就诊记录。"
     "必须以本次就诊时间为锚点，仅提取与本次复诊对应的现病史，不得混入既往就诊段落。"
@@ -661,6 +661,7 @@ def write2filter_json(record: Mapping[str, Any], path: Path | None = None) -> bo
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     return True
 
+HAS_DRUGNAME_PROCESS_NAME = ["饮片","颗粒","水丸","蜜丸", "膏方", "粉剂","浓缩丸","水蜜丸","糊丸"]
 
 def _model_dump(model: BaseModel, *, by_alias: bool = False) -> dict[str, Any]:
     """兼容 Pydantic v1/v2 的序列化接口."""
@@ -697,7 +698,10 @@ def format_prescription_text(prescriptions: Any) -> str:
         for item in drug_list or []:
             if not isinstance(item, Mapping):
                 continue
-            name = _text(item.get("show_name") or item.get("drug_name") or item.get("sub_drug_name"))
+            if item.get("drug_process_name") in HAS_DRUGNAME_PROCESS_NAME:
+                name = _text(item.get("drug_name"))
+            else:
+                name = _text(item.get("drug_name") or item.get("sub_drug_name") or item.get("show_name"))
             drug_id = _text(item.get("drug_id"))
             if not name and not drug_id:
                 continue
@@ -748,7 +752,7 @@ def format_treatment_prescription_evidence(prescriptions: Any) -> dict[str, list
         for item in drug_list or []:
             if not isinstance(item, Mapping):
                 continue
-            name = _text(item.get("show_name") or item.get("drug_name") or item.get("sub_drug_name"))
+            name = _text(item.get("drug_name") or item.get("sub_drug_name") or item.get("show_name") )
             if name and name not in seen[group]:
                 seen[group].add(name)
                 evidence[group].append(name)
@@ -1864,6 +1868,7 @@ class MedicalRecordAgents:
         # 避免标签污染提示词，也避免只有 <p><br></p> 的空病史绕过过滤。
         # 1. 规则清洗现病史字段内容
         self.normalize_medical_history(output)
+        
         record_id = (
             _text(record.get("order_sn"))
             or _text(record.get("id"))
@@ -1909,7 +1914,6 @@ class MedicalRecordAgents:
                 "tongue_face_vlm",
             } & selected_stages:
                 try:
-
                     async def classify_image_stage() -> None:
                         nonlocal classified_images
                         classified_images = await self.classify_images(output)
