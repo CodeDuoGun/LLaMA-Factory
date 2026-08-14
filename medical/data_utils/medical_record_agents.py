@@ -111,7 +111,6 @@ PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 DASHSCOPE_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DIAGNOSIS_FIELDS = ("diagnosis_illness", "diagnosis_disease", "diagnosis_sickness")
 STAGE_NAMES = (
-    "diagnosis_normalization",
     "image_classification",
     "inspection_vlm",
     "tongue_face_vlm",
@@ -120,6 +119,7 @@ STAGE_NAMES = (
     "diagnosis_completion",
     "clinical_extraction",
     "treatment_principle",
+    "diagnosis_normalization",
 )
 HISTORY_FIELDS = (
     "old_medical_history",
@@ -1341,7 +1341,7 @@ class MedicalRecordAgents:
     def normalize_diagnoses(record: dict[str, Any]) -> None:
         record["diagnosis_illness"] = normalize_diagnosis_value(record.get("diagnosis_illness"))
         record["diagnosis_sickness"] = normalize_sickness_value(record.get("diagnosis_sickness"))
-        # 此时尚未完成诊断类型纠错，不能按字段位置直接追加“证”，否则会把错填在
+        # AI 补全不会回写原始诊断字段，不能按字段位置直接追加“证”，否则会把错填在
         # diagnosis_disease 中的西医诊断（如“高血压”）误改为“高血压证”。
         record["diagnosis_disease"] = normalize_diagnosis_value(record.get("diagnosis_disease"))
 
@@ -1868,7 +1868,7 @@ class MedicalRecordAgents:
         # 避免标签污染提示词，也避免只有 <p><br></p> 的空病史绕过过滤。
         # 1. 规则清洗现病史字段内容
         self.normalize_medical_history(output)
-        
+
         record_id = (
             _text(record.get("order_sn"))
             or _text(record.get("id"))
@@ -1894,18 +1894,7 @@ class MedicalRecordAgents:
                 output.pop("new_medical_history", None)
             return output
 
-        # 3. 先做不依赖诊断类型的基础归一化，不额外存储 ai_normalized_*。
-        if "diagnosis_normalization" in selected_stages:
-            try:
-                await self._run_stage(
-                    "diagnosis_normalization",
-                    record_id,
-                    doctor_name,
-                    lambda: self.normalize_diagnoses(output),
-                )
-            except Exception as exc:
-                errors.append({"stage": "diagnosis_normalization", "error": f"{type(exc).__name__}: {exc}"})
-        # 4：图片分类与视觉解析管线。
+        # 3：图片分类与视觉解析管线。
         async def run_image_pipeline() -> list[dict[str, str]]:
             pipeline_errors = []
             classified_images: dict[str, list[str]] = {category: [] for category in IMAGE_CATEGORIES}
@@ -1955,7 +1944,7 @@ class MedicalRecordAgents:
                     )
             return pipeline_errors
 
-        # 5：本次复诊病史只依赖文本字段，可与整条视觉管线并发。
+        # 4：本次复诊病史只依赖文本字段，可与整条视觉管线并发。
         async def run_current_visit_history() -> list[dict[str, str]]:
             if "current_visit_history" not in selected_stages:
                 return []
@@ -1974,13 +1963,13 @@ class MedicalRecordAgents:
         for pipeline_errors in pipeline_results:
             errors.extend(pipeline_errors)
 
-        # 6：等待图片和本次病史均完成后，校验主诉/现病史一致性并清洗五史。
+        # 5：等待图片和本次病史均完成后，校验主诉/现病史一致性并清洗五史。
         if "clinical_cleaning" in selected_stages:
             try:
                 await self._run_stage("clinical_cleaning", record_id, doctor_name, lambda: self.clean_histories(output))
             except Exception as exc:
                 errors.append({"stage": "clinical_cleaning", "error": f"{type(exc).__name__}: {exc}"})
-        # 7：用最新病历补全诊断，再提取知识库字段。
+        # 6：用最新病历补全诊断，再提取知识库字段。
         if "diagnosis_completion" in selected_stages:
             try:
                 await self._run_stage(
@@ -2011,6 +2000,18 @@ class MedicalRecordAgents:
                 )
             except Exception as exc:
                 errors.append({"stage": "treatment_principle", "error": f"{type(exc).__name__}: {exc}"})
+
+        # 7：所有 Agent 阶段完成后，最后归一化原始诊断字段。
+        if "diagnosis_normalization" in selected_stages:
+            try:
+                await self._run_stage(
+                    "diagnosis_normalization",
+                    record_id,
+                    doctor_name,
+                    lambda: self.normalize_diagnoses(output),
+                )
+            except Exception as exc:
+                errors.append({"stage": "diagnosis_normalization", "error": f"{type(exc).__name__}: {exc}"})
 
         if errors:
             output["ai_processing_errors"] = errors

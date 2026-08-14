@@ -422,6 +422,20 @@ def drop_column(manager: "DBManager", table_name: str, column_name: str) -> bool
     return True
 
 
+def format_ps(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """格式化处方列表,用于es存储.
+    不同drug_process_name , 获取药品明细的字段不同
+
+
+    """
+    if ps.get("drug_process_name") == "西药":
+        pass
+
+
+
+    return ps
+
+
 class AIMedicalRecordRepository:
     """AI 病例标注记录的批量写入及索引检索服务."""
 
@@ -496,6 +510,8 @@ class AIMedicalRecordRepository:
                     row["patient_height"] = 0
                 if not row["patient_weight"]:
                     row["patient_weight"] = 0
+                # 特殊处理处方列表
+                row["ps"] = format_ps(row["ps"])
                 if row["order_sn"] in existing_order_sns:
                     if row["order_sn"] in skip_order_sns:
                         continue

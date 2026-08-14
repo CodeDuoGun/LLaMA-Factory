@@ -1148,12 +1148,12 @@ def test_process_runs_current_history_and_image_pipeline_concurrently() -> None:
     assert image_started.is_set()
 
 
-def test_process_runs_treatment_principle_after_clinical_extraction() -> None:
+def test_process_runs_diagnosis_normalization_last() -> None:
     agents = object.__new__(medical_record_agents.MedicalRecordAgents)
     agents.stage_timeout = 0
     calls = []
 
-    agents.normalize_diagnoses = lambda record: None
+    agents.normalize_diagnoses = lambda record: calls.append("diagnosis_normalization")
     agents.classify_images = lambda record: {category: [] for category in medical_record_agents.IMAGE_CATEGORIES}
     agents.analyze_inspection_images = lambda record, images=None: None
     agents.analyze_tongue_face_images = lambda record, images=None: None
@@ -1165,7 +1165,7 @@ def test_process_runs_treatment_principle_after_clinical_extraction() -> None:
 
     asyncio.run(agents.process({"new_medical_history": "腹胀"}))
 
-    assert calls == ["clinical_extraction", "treatment_principle"]
+    assert calls == ["clinical_extraction", "treatment_principle", "diagnosis_normalization"]
 
 
 @pytest.mark.parametrize(
@@ -1635,6 +1635,7 @@ def test_history_cleaning_result_excludes_birth_and_marriage_fields() -> None:
 
 
 def test_stage_output_name_and_image_dependency() -> None:
+    assert medical_record_agents.STAGE_NAMES[-1] == "diagnosis_normalization"
     assert medical_record_agents.resolve_stage_names(["inspection_vlm"]) == (
         "image_classification",
         "inspection_vlm",

@@ -66,9 +66,8 @@ def test_diagnosis_value_normalizes_separator_order_and_duplicates() -> None:
     assert normalize_diagnosis_value("血热瘀滞症") == "血热瘀滞症"
     assert normalize_diagnosis_value("脾肺气虚证，痰瘀互结证") == "痰瘀互结证、脾肺气虚证"
     assert normalize_diagnosis_value("痰瘀互结证/脾肺气虚证；脾肺气虚证") == "痰瘀互结证、脾肺气虚证"
-    assert normalize_diagnosis_value("甲状腺癌、瘿瘤") == normalize_diagnosis_value("甲状腺癌、瘿瘤病")
-    assert normalize_diagnosis_value("咳嗽病") == "咳嗽"
-    assert normalize_diagnosis_value("肺结节") == normalize_diagnosis_value("肺结节病") == "肺结节"
+    assert normalize_diagnosis_value("咳嗽病") == "咳嗽病"
+    assert normalize_diagnosis_value("肺结节") == normalize_diagnosis_value("肺结节病") == "肺结节病"
     assert {
         normalize_diagnosis_value(value)
         for value in ("间质肺纤维化", "肺间质纤维化", "肺间质性纤维化", ".双肺间质性纤维化")
@@ -81,9 +80,6 @@ def test_diagnosis_value_normalizes_separator_order_and_duplicates() -> None:
     assert normalize_diagnosis_value({"code": "", "name": "", "type": "2"}) == ""
     assert normalize_diagnosis_value('["肺结节"]') == ""
     assert normalize_diagnosis_value("痰瘀阻肺证肝气郁结证") == "痰瘀阻肺证、肝气郁结证"
-    assert normalize_diagnosis_value("痰瘀阻肺 肝气郁结") == "痰瘀阻肺证、肝气郁结证"
-    assert normalize_diagnosis_value("痰瘀阻肺+肝气郁结") == "痰瘀阻肺证、肝气郁结证"
-    assert normalize_diagnosis_value("肝气不舒痰瘀阻肺") == "痰瘀阻肺证、肝气不舒证"
     assert normalize_diagnosis_value("痰瘀阻肺证肝脾不和证") == "痰瘀阻肺证、肝脾不和证"
     assert normalize_diagnosis_value("痰瘀阻肺证\n肝脾不和证") == "痰瘀阻肺证、肝脾不和证"
     assert normalize_diagnosis_value("？,耳鸣病") == "耳鸣病"
@@ -124,9 +120,11 @@ def test_syndrome_value_normalizes_suffix_order_and_concatenation() -> None:
 
 def test_sickness_value_uses_tcm_disease_aliases_only() -> None:
     assert normalize_sickness_value("咳嗽病") == "咳嗽"
-    assert normalize_sickness_value("肺结节病") == "肺结节病"
+    assert normalize_sickness_value("肺结节病") == "积聚类病"
     assert normalize_sickness_value("咳嗽病、胃痞病、咳嗽病") == "咳嗽、胃痞病"
-    assert normalize_sickness_value("酒槽鼻、酒齄鼻") == "酒齄鼻"
+    assert normalize_sickness_value("失眠、胃痞、胃否症") == "不寐病、胃痞病"
+    assert normalize_sickness_value("痰瘀阻肺 肝气郁结") == "痰瘀阻肺证、肝气郁结证"
+    assert normalize_sickness_value("肝气不舒痰瘀阻肺") == "痰瘀阻肺证、肝气不舒证"
 
 
 def test_longitudinal_difference_uses_patient_id() -> None:

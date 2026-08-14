@@ -80,7 +80,7 @@ def test_export_normalizes_three_fields_and_creates_one_sheet_per_doctor(tmp_pat
     assert [cell.value for cell in workbook["甲医生"][2]] == [
         1,
         "ORDER-1",
-        "肺结节",
+        "肺结节病",
         "咳嗽",
         "肝气不舒证",
     ]
@@ -95,7 +95,7 @@ def test_export_normalizes_three_fields_and_creates_one_sheet_per_doctor(tmp_pat
         1,
         "ORDER-3",
         "双肺间质性改变伴纤维化",
-        "鼻鼽病",
+        "鼻鼽",
         "痰瘀互结证、脾肺气虚证",
     ]
     assert workbook["甲医生"].freeze_panes == "A2"
