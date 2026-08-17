@@ -53,6 +53,23 @@ DEFAULT_HUMAN_OPERATOR = "HUMAN"
 DEFAULT_AI_PROCESSING_VERSION = "2026-07-28"
 DEFAULT_STATUS = "unprocessed"
 
+NAME_USE_LIMIT_ID_MAPPING = {
+    "饮片": 1,
+    "颗粒": 1,
+    "中成药": 1,
+    "西药": 1,
+    "水丸": 5,
+    "膏方": 4,
+    "粉剂": 4,
+    "蜜丸": 5,
+    "小蜜丸": 5,
+    "保健品": 0,
+    "经验方": 0,
+    "浓缩丸": 5,
+    "水蜜丸": 5,
+    "糊丸": 0,
+}
+
 ORIGINAL_TEXT_FIELDS = (
     "patient_appeal",
     "doc_ass_stu_appeal",
@@ -422,18 +439,68 @@ def drop_column(manager: "DBManager", table_name: str, column_name: str) -> bool
     return True
 
 
-def format_ps(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """格式化处方列表,用于es存储.
-    不同drug_process_name , 获取药品明细的字段不同
 
-
+def format_drugs(drugs: list[dict[str, Any]], usage_type: str) -> list[dict[str, Any]]:
+    """格式化药品明细,用于es存储.
     """
-    if ps.get("drug_process_name") == "西药":
-        pass
+    if not drugs:
+        return []
+    result = []
+    
+    for drug in drugs:
+        # 不在这些类别中的药，不需要进行单位转化
+        if usage_type not in ("西药","保健品", "中成药", "经验方"):
+            result.append(
+                {
+                    "drug_name": drug.get("drug_name",""), 
+                    "drug_num": drug.get("drug_num", 0), 
+                    "unit": drug.get("unit_name", ""), 
+                    "max_use": drug.get("max_use", ""), 
+                    "min_use": drug.get("min_use", "")
+                },
+            )
+        else:
+            result.append({
+                "drug_name": drug.get("drug_name", ""),
+                "drug_num": drug.get("spec_number",1) * drug.get("drug_num", 0), # 规格转化系数
+                "unit": "g", 
+                "max_use": drug.get("max_use", ""),
+                "min_use": drug.get("min_use", ""),
+            })
+    return result
 
+def format_ps(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """格式化处方列表,用于es存储. 这个用于
+    不同drug_process_name , 获取药品明细的字段不同
+    """
+    if not ps:
+        return []
+    result = []
+    for p in ps:
+        format_p = {
+            "usage_type": p.get("usage_type"),
+            "drug_process_name": p.get("drug_process_name", ""),
+            "dosage": p.get("dosage", ""),
+            "doctor_advice": p.get("doctor_advice", ""),
+            "produce_merchant": p.get("prescription_items", {}).get("drugList", [])[-1].get("produce_merchant", "")
+        }
+        # 解析西药结构
+        if p.get("drug_process_name") == ("西药","保健品", "中成药"):
+            format_p["usage_desc"] = p.get("prescription_items", {}).get("drugList", [])[-1].get("use_limit_text", "")
+            format_p["drugs"] = format_drugs(p.get("prescription_items", {}).get("drugList", []))
+        # 解析经验方结构
+        elif p.get("drug_process_name") == "经验方":
+            format_p["usage_desc"] = p.get("prescription_items", {}).get("drugList", [])[-1].get("use_limit_text", "")
+            format_p["drugs"] = format_drugs(p.get("prescription_items", {}).get("drugList", [])[-1].get("formula", []))
+        # 解析饮片颗粒结构
+        elif p.get("drug_process_name") in ("颗粒", "饮片","膏方", "蜜丸","水蜜丸","粉剂","浓缩丸","水丸","糊丸", "小蜜丸"):
+            format_p["usage_desc"] = p.get("usage_desc", "")
+            format_p["drugs"] = format_drugs(p.get("prescription_items", {}).get("drugList", []))
+        else:
+            raise ValueError(f"不支持的药品类型: {p.get('drug_process_name')}")
+        result.append(format_p)
 
-
-    return ps
+    return result
 
 
 class AIMedicalRecordRepository:
@@ -515,7 +582,7 @@ class AIMedicalRecordRepository:
                 if not row["patient_weight"]:
                     row["patient_weight"] = 0
                 # 特殊处理处方列表
-                # row["ps"] = format_ps(row["ps"])
+                row["ps"] = format_ps(row["ps"])
                 if row["order_sn"] in existing_order_sns:
                     rows_to_update.append(row)
                 else:
