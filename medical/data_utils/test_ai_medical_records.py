@@ -103,6 +103,30 @@ def test_repository_upserts_by_order_sn_and_deletes_doctor_rows() -> None:
     assert repository.get_by_order_sn("A00013036") is not None
 
 
+def test_repository_does_not_update_human_labeled_record() -> None:
+    manager = DBManager("sqlite+pysqlite:///:memory:")
+    repository = AIMedicalRecordRepository(manager)
+    repository.create_table()
+    manager.insert(
+        repository.table.name,
+        {
+            "order_sn": "A00013035",
+            "ai_processing_version": "v1",
+            "patient_appeal": "人工标注的主诉",
+            "treatment_principle": "",
+            "status": "labeled",
+            "operator": "HUMAN",
+        },
+    )
+
+    assert repository.batch_upsert_by_order_sn([_record(appeal="AI 更新的主诉")]) == 0
+    row = repository.get_by_order_sn("A00013035")
+
+    assert row["patient_appeal"] == "人工标注的主诉"
+    assert row["status"] == "labeled"
+    assert row["operator"] == "HUMAN"
+
+
 def test_repository_updates_field_and_marks_operator_as_human() -> None:
     manager = DBManager("sqlite+pysqlite:///:memory:")
     repository = AIMedicalRecordRepository(manager)

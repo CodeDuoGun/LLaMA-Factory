@@ -207,10 +207,10 @@ def resolve_stage_names(stage_names: Iterable[str] | None) -> tuple[str, ...]:
 
 
 def _stage_output_file_name(stage_names: Iterable[str] | None, *, failure: bool = False) -> str:
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%Y%m%d")
+    # from datetime import datetime
+    # timestamp = datetime.now().strftime("%Y%m%d")
     prefix = "medical_record_agent_failures_stage" if failure else "medical_records_ai_stage"
-    return f"{prefix}_{timestamp}.jsonl"
+    return f"{prefix}.jsonl"
 
 
 def _text(value: Any) -> str:

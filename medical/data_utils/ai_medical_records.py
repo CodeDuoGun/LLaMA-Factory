@@ -505,16 +505,18 @@ class AIMedicalRecordRepository:
             else:
                 skip_order_sns = set()
             for row in rows:
+                if row["order_sn"] in skip_order_sns:
+                    print(f"[SKIP] order_sns: {row['order_sn']}")
+                    continue
+
                 # 针对类型与数据库不一致字段修正
                 if not row["patient_height"]:
                     row["patient_height"] = 0
                 if not row["patient_weight"]:
                     row["patient_weight"] = 0
                 # 特殊处理处方列表
-                row["ps"] = format_ps(row["ps"])
+                # row["ps"] = format_ps(row["ps"])
                 if row["order_sn"] in existing_order_sns:
-                    if row["order_sn"] in skip_order_sns:
-                        continue
                     rows_to_update.append(row)
                 else:
                     rows_to_insert.append(row)
