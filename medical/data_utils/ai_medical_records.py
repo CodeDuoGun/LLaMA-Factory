@@ -19,6 +19,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from langchain_core.callbacks import usage
 from sqlalchemy import (
     JSON,
     BigInteger,
@@ -448,6 +449,9 @@ def format_drugs(drugs: list[dict[str, Any]], usage_type: str) -> list[dict[str,
     result = []
     
     for drug in drugs:
+        # if not isinstance(drug, dict):
+            # print(f"drug: {drugs}")
+            # import pdb; pdb.set_trace()
         # 不在这些类别中的药，不需要进行单位转化
         if usage_type not in ("西药","保健品", "中成药", "经验方"):
             result.append(
@@ -477,25 +481,29 @@ def format_ps(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return []
     result = []
     for p in ps:
+        usage_type = p.get("usage_type", "")
         format_p = {
-            "usage_type": p.get("usage_type"),
+            "usage_type": usage_type,
             "drug_process_name": p.get("drug_process_name", ""),
             "dosage": p.get("dosage", ""),
             "doctor_advice": p.get("doctor_advice", ""),
             "produce_merchant": p.get("prescription_items", {}).get("drugList", [])[-1].get("produce_merchant", "")
         }
         # 解析西药结构
-        if p.get("drug_process_name") == ("西药","保健品", "中成药"):
+        if p.get("drug_process_name") in ("西药","保健品", "中成药"):
             format_p["usage_desc"] = p.get("prescription_items", {}).get("drugList", [])[-1].get("use_limit_text", "")
-            format_p["drugs"] = format_drugs(p.get("prescription_items", {}).get("drugList", []))
+            format_p["drugs"] = format_drugs(p.get("prescription_items", {}).get("drugList", []), usage_type)
         # 解析经验方结构
         elif p.get("drug_process_name") == "经验方":
             format_p["usage_desc"] = p.get("prescription_items", {}).get("drugList", [])[-1].get("use_limit_text", "")
-            format_p["drugs"] = format_drugs(p.get("prescription_items", {}).get("drugList", [])[-1].get("formula", []))
+            drugs = p.get("prescription_items", {}).get("drugList", [])[-1].get("formula", [])
+            if "drugList" in drugs:
+                drugs = drugs["drugList"]
+            format_p["drugs"] = format_drugs(drugs, usage_type)
         # 解析饮片颗粒结构
         elif p.get("drug_process_name") in ("颗粒", "饮片","膏方", "蜜丸","水蜜丸","粉剂","浓缩丸","水丸","糊丸", "小蜜丸"):
             format_p["usage_desc"] = p.get("usage_desc", "")
-            format_p["drugs"] = format_drugs(p.get("prescription_items", {}).get("drugList", []))
+            format_p["drugs"] = format_drugs(p.get("prescription_items", {}).get("drugList", []), usage_type)
         else:
             raise ValueError(f"不支持的药品类型: {p.get('drug_process_name')}")
         result.append(format_p)
@@ -582,6 +590,7 @@ class AIMedicalRecordRepository:
                 if not row["patient_weight"]:
                     row["patient_weight"] = 0
                 # 特殊处理处方列表
+                print(f"dealing ordersn: {row['order_sn']}")
                 row["ps"] = format_ps(row["ps"])
                 if row["order_sn"] in existing_order_sns:
                     rows_to_update.append(row)

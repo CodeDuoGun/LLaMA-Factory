@@ -9,7 +9,7 @@ INPUT_DIR="${REPO_ROOT}/medical/data/202301_online"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/medical/processed_data}"
 
 LOG_DIR="${LOG_DIR:-${OUTPUT_DIR}/logs/six_doctors}"
-LIMIT_PER_DOCTOR="${LIMIT_PER_DOCTOR:-1000}"
+LIMIT_PER_DOCTOR="${LIMIT_PER_DOCTOR:-2600}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 RECORD_TIMEOUT="${RECORD_TIMEOUT:-0}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
@@ -115,9 +115,6 @@ done
 echo
 echo "===================================="
 echo "所有医生任务已启动"
-echo "每个任务执行:"
-echo "  diagnosis_normalization"
-echo "  diagnosis_completion"
 echo "===================================="
 
 echo
