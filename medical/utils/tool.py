@@ -3,7 +3,6 @@ import base64
 import os
 import shutil
 import pandas as pd
-import docx 
 import markdown
 from medical.utils.log import logger
 import uuid
@@ -23,13 +22,12 @@ from langchain_community.document_loaders import (
     MHTMLLoader,
     UnstructuredMarkdownLoader,
 )
-from concurrent.futures import ProcessPoolExecutor
-import PyPDF2
+from concurrent.futures import ProcessPoolExecutory
 from langchain_core.documents import Document
-from selectolax.parser import HTMLParser  # 超快的HTML解析
+# from selectolax.parser import HTMLParser  # 超快的HTML解析
 import requests
-import fitz
-from pdf2image import convert_from_bytes
+# import fitz
+# from pdf2image import convert_from_bytes
 from medical.config import config
 from medical.llm_v2.doubao import DoubaoAIClient
 import pytz
@@ -178,6 +176,7 @@ def reset_folder(folder_path: str):
 
 
 def fast_pdf_loader(f):
+    import PyPDF2
     docs = []
     try:
         llm = DoubaoAIClient(base_url=config.ARK_API_URL, api_key=config.ARK_API_KEY)
@@ -208,6 +207,7 @@ def fast_pdf_loader(f):
     return docs
 
 def fast_docx_loader(f):
+    import docx
     docs = []
     try:
         doc = docx.Document(f)

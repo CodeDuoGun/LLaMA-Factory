@@ -76,7 +76,6 @@ from medical.data_utils.medical_record_formatters import (
     format_inspection_result_text,
     format_tongue_face_result_text,
 )
-from medical.utils.tool import perf_counter_timer
 from medical.data_utils.ai_medical_records import AI_FIELDS, DEFAULT_AI_OPERATOR, record_to_row
 from dotenv import load_dotenv
 from medical.schema.clear_record_basemodel import (
@@ -102,9 +101,18 @@ DEFAULT_INPUT = Path("medical/data/202301_online")
 DEFAULT_OUTPUT_DIR = Path("medical/processed_data")
 MYSQL_RECORD_TABLE = "mlops_annotation_medical_record"
 MYSQL_ID_COLUMN = "id"
+MYSQL_NON_STAGE_AI_FIELDS = {
+    "ai_processing_errors",
+    "ai_processing_complete",
+    "ai_processing_filtered",
+    "ai_filter_reason",
+    "ai_record_identity",
+    "ai_processing_version",
+}
 DOCTOR_RECORD_FILE_NAME = "medical_records_ai_clean.jsonl"
 FAILURE_FILE_NAME = "medical_record_agent_failures.jsonl"
 FILTER_FILE_NAME = "filter.json"
+MYSQL_UPDATE_PROGRESS_FILE_NAME = "mysql_stage_update_progress.json"
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 DASHSCOPE_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DIAGNOSIS_FIELDS = ("diagnosis_illness", "diagnosis_disease", "diagnosis_sickness")
@@ -193,9 +201,6 @@ EXAMINATION_REPORT_TYPES = {
 DISCHARGE_REPORT_TYPES = {"住院/出院报告"}
 OUTPATIENT_RECORD_TYPES = {"门诊病历"}
 INVALID_INSPECTION_TYPES = {"非目标医学文档", "非检查报告", "其他/无法识别", "无法识别"}
-MENSTRUAL_HISTORY_PATTERN = re.compile(
-    r"月经|经期|经量|经色|经质|经血|经行|痛经|末次月经|初潮|绝经|闭经|带下"
-)
 FILTER_FILE_LOCK = Lock()
 
 
@@ -2394,72 +2399,234 @@ def _mysql_result_row(record: Mapping[str, Any], columns: set[str], id_column: s
 def _mysql_record_key(record: Mapping[str, Any], id_column: str) -> Any:
     return record.get(id_column) or record.get("medical_record_id") or record.get("id")
 
-@perf_counter_timer
+def _mysql_update_progress_path(args: argparse.Namespace) -> Path:
+    """Return the shared local progress JSON used by all MySQL workers."""
+    configured = getattr(args, "mysql_progress_file", None)
+    if configured:
+        return Path(configured)
+    return args.output_dir / MYSQL_UPDATE_PROGRESS_FILE_NAME
+
+
+def _load_mysql_update_progress(path: Path) -> dict[str, set[str]]:
+    """Load doctor_id -> processed order_sn set from the shared JSON file.
+
+    A separate lock file is used so four doctor processes can safely read while
+    another process is atomically replacing the JSON file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
+        try:
+            if not path.is_file():
+                return {}
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"MySQL 清洗进度文件不是合法 JSON: {path}") from exc
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"MySQL 清洗进度文件必须是 JSON 对象: {path}")
+
+    progress: dict[str, set[str]] = {}
+    for doctor_id, order_sns in raw.items():
+        if not isinstance(order_sns, list):
+            raise ValueError(
+                f"MySQL 清洗进度文件中 doctor_id={doctor_id} 的值必须是 order_sn 数组"
+            )
+        progress[_text(doctor_id)] = {
+            _text(order_sn) for order_sn in order_sns if _text(order_sn)
+        }
+    return progress
+
+
+def _append_mysql_update_progress(path: Path, doctor_id: Any, order_sn: Any) -> bool:
+    """Atomically add one successful doctor_id/order_sn to the shared JSON.
+
+    Returns True when a new order_sn was added, False when it already existed.
+    The exclusive file lock makes this safe for the four concurrent workers.
+    """
+    doctor_key = _text(doctor_id)
+    order_key = _text(order_sn)
+    if not doctor_key or not order_key:
+        raise ValueError("写入 MySQL 清洗进度时 doctor_id/order_sn 不能为空")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            current: dict[str, list[str]] = {}
+            if path.is_file():
+                try:
+                    loaded = json.loads(path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"MySQL 清洗进度文件不是合法 JSON: {path}") from exc
+                if not isinstance(loaded, dict):
+                    raise ValueError(f"MySQL 清洗进度文件必须是 JSON 对象: {path}")
+                for key, values in loaded.items():
+                    if not isinstance(values, list):
+                        raise ValueError(
+                            f"MySQL 清洗进度文件中 doctor_id={key} 的值必须是 order_sn 数组"
+                        )
+                    current[_text(key)] = [
+                        _text(value) for value in values if _text(value)
+                    ]
+
+            values = current.setdefault(doctor_key, [])
+            if order_key in values:
+                return False
+            values.append(order_key)
+
+            # Keep deterministic output while preserving uniqueness.
+            current = {
+                key: list(dict.fromkeys(values))
+                for key, values in sorted(current.items(), key=lambda item: item[0])
+            }
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            temporary.write_text(_json_dumps(current, indent=2), encoding="utf-8")
+            temporary.replace(path)
+            return True
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _filter_mysql_records_by_progress(
+    records: Iterable[Mapping[str, Any]],
+    progress: Mapping[str, set[str]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Remove doctor_id/order_sn pairs that have already completed successfully."""
+    pending: list[dict[str, Any]] = []
+    skipped = 0
+    for record in records:
+        doctor_id = _text(record.get("doctor_id"))
+        order_sn = _text(record.get("order_sn"))
+        if doctor_id and order_sn and order_sn in progress.get(doctor_id, set()):
+            skipped += 1
+            logger.info(f"[MYSQL PROGRESS SKIP] doctor_id={doctor_id} order_sn={order_sn}")
+            continue
+        pending.append(dict(record))
+    return pending, skipped
+
+
+def _mysql_record_filters(args: argparse.Namespace) -> dict[str, Any]:
+    doctor_ids = [
+        int(value)
+        for value in (getattr(args, "doctor_id", None) or [])
+        if _text(value)
+    ]
+
+    if not doctor_ids:
+        raise ValueError("MySQL 清洗模式必须指定 --doctor-id")
+
+    return {
+        "doctor_id": doctor_ids,
+        "status": ["unprocessed", "problem"],
+    }
+
+
 def _load_mysql_records(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Load the complete fixed MySQL worklist before batch processing."""
     from medical.data_utils.db_manager import DBManager
 
     manager = DBManager(MYSQL_DATABASE_URL or None)
     try:
         columns = _mysql_table_columns(manager, MYSQL_RECORD_TABLE)
-        filters: dict[str, Any] = {}
-        doctor_ids = [_text(value) for value in (getattr(args, "doctor_id", None) or []) if _text(value)]
-        record_statuses = [
-            _text(value) for value in (getattr(args, "record_status", None) or []) if _text(value)
-        ]
-        if doctor_ids:
-            if "doctor_id" not in columns:
-                raise ValueError(f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 doctor_id 字段")
-            filters["doctor_id"] = doctor_ids
-        if record_statuses:
-            if "status" not in columns:
-                raise ValueError(f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 status 字段")
-            filters["status"] = record_statuses
-        rows = manager.select(MYSQL_RECORD_TABLE, filters=filters or None)
+        filters = _mysql_record_filters(args)
+        for required_column in filters:
+            if required_column not in columns:
+                raise ValueError(
+                    f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 {required_column} 字段"
+                )
+
+        logger.info(
+            f"[MYSQL SELECT] table={MYSQL_RECORD_TABLE} filters={_json_for_prompt(filters)}"
+        )
+        rows = manager.select(MYSQL_RECORD_TABLE, filters=filters)
         return [_mysql_row_to_record(row) for row in rows]
     finally:
         manager.close()
 
 
-def _match_mysql_records_with_jsonl(
+def _mysql_source_key(record: Mapping[str, Any]) -> tuple[str, str]:
+    return _text(record.get("doctor_id")), _text(record.get("order_sn"))
+
+
+def _load_original_records_for_mysql(
     mysql_records: Iterable[Mapping[str, Any]],
-    jsonl_path: Path,
+    input_root: Path = DEFAULT_INPUT,
 ) -> list[dict[str, Any]]:
-    """Use MySQL query results as the allowlist and load matching full JSONL records."""
-    if not jsonl_path.is_file():
-        raise FileNotFoundError(f"用于重跑的 JSONL 文件不存在: {jsonl_path}")
+    """Resolve each selected MySQL row to its raw source record by doctor_id + order_sn.
 
-    mysql_by_order_sn: dict[str, dict[str, Any]] = {}
-    for record in mysql_records:
-        order_sn = _text(record.get("order_sn"))
-        if not order_sn:
-            logger.warning("忽略 MySQL 查询结果中缺少 order_sn 的记录")
-            continue
-        if order_sn in mysql_by_order_sn:
-            raise ValueError(f"MySQL 查询结果存在重复 order_sn: {order_sn}")
-        mysql_by_order_sn[order_sn] = dict(record)
+    Raw/non-AI fields come from ``medical/data/202301_online``. Existing ``ai_*``
+    values and the database primary key come from the current MySQL row so a
+    selected downstream stage can still consume upstream AI context without
+    allowing stale MySQL raw fields to replace the original source data.
+    """
+    mysql_rows = [dict(record) for record in mysql_records]
+    requested: dict[tuple[str, str], dict[str, Any]] = {}
+    ordered_keys: list[tuple[str, str]] = []
+    for position, mysql_record in enumerate(mysql_rows, 1):
+        key = _mysql_source_key(mysql_record)
+        doctor_id, order_sn = key
+        if not doctor_id or not order_sn:
+            raise ValueError(
+                f"MySQL 查询结果第 {position} 行缺少 doctor_id/order_sn，无法回源原始病历"
+            )
+        if key in requested:
+            raise ValueError(f"MySQL 查询结果存在重复 doctor_id/order_sn: {doctor_id}/{order_sn}")
+        requested[key] = mysql_record
+        ordered_keys.append(key)
 
-    local_by_order_sn: dict[str, dict[str, Any]] = {}
-    for record in _iter_jsonl_records(jsonl_path):
-        order_sn = _text(record.get("order_sn"))
-        if order_sn not in mysql_by_order_sn:
-            continue
-        if order_sn in local_by_order_sn:
-            raise ValueError(f"JSONL 文件存在重复 order_sn: {order_sn}")
-        local_by_order_sn[order_sn] = dict(record)
+    if not requested:
+        return []
+    if not input_root.exists():
+        raise FileNotFoundError(f"原始病历目录不存在: {input_root}")
 
-    matched = []
-    for order_sn, mysql_record in mysql_by_order_sn.items():
-        local_record = local_by_order_sn.get(order_sn)
-        if local_record is None:
-            logger.warning(f"MySQL 查询结果在 JSONL 中没有匹配记录，跳过: order_sn={order_sn}")
+    matched_originals: dict[tuple[str, str], dict[str, Any]] = {}
+    for original_record in iter_records(input_root):
+        key = _mysql_source_key(original_record)
+        if key not in requested:
             continue
-        # JSONL 保留完整的原始及历史 AI 上下文；数据库当前行覆盖主键、status 等最新列。
-        matched.append({**local_record, **mysql_record})
+        if key in matched_originals:
+            raise ValueError(f"原始病历存在重复 doctor_id/order_sn: {key[0]}/{key[1]}")
+        matched_originals[key] = dict(original_record)
+        if len(matched_originals) == len(requested):
+            break
+
+    missing = [key for key in ordered_keys if key not in matched_originals]
+    if missing:
+        preview = ", ".join(f"doctor_id={doctor_id},order_sn={order_sn}" for doctor_id, order_sn in missing[:20])
+        raise ValueError(
+            f"MySQL 命中 {len(requested)} 条，但在 {input_root} 仅找到 {len(matched_originals)} 条同医生同 order_sn 原始病历；"
+            f"缺失 {len(missing)} 条：{preview}"
+        )
+
+    resolved: list[dict[str, Any]] = []
+    for key in ordered_keys:
+        mysql_record = requested[key]
+        original_record = matched_originals[key]
+        processing_record = dict(original_record)
+
+        # Preserve current upstream AI context from MySQL, but never let MySQL raw
+        # clinical fields overwrite the original source record used for cleaning.
+        processing_record.update(
+            {name: value for name, value in mysql_record.items() if name.startswith("ai_")}
+        )
+        for name in (MYSQL_ID_COLUMN, "medical_record_id", "id", "status"):
+            if name in mysql_record:
+                processing_record[name] = mysql_record[name]
+
+        processing_record["__mysql_current_row"] = mysql_record
+        resolved.append(processing_record)
+
     logger.info(
-        f"MySQL 查询 {len(mysql_by_order_sn)} 条，JSONL 匹配 {len(matched)} 条，"
-        f"未匹配 {len(mysql_by_order_sn) - len(matched)} 条"
+        f"[MYSQL SOURCE MATCH] mysql={len(requested)} original={len(resolved)} root={input_root}"
     )
-    return matched
+    return resolved
+
 
 
 def export_mysql_records_to_local(args: argparse.Namespace) -> int:
@@ -2467,9 +2634,7 @@ def export_mysql_records_to_local(args: argparse.Namespace) -> int:
     from medical.data_utils.db_manager import DBManager
 
     output_dir: Path = args.output_dir
-    doctor_ids_filter = {_text(doctor_id) for doctor_id in (args.doctor_id or []) if _text(doctor_id)}
-    status_filter = _text(getattr(args, "export_status", ""))
-    export_doctor_name = _text(getattr(args, "export_doctor_name", ""))
+    filters = _mysql_record_filters(args)
     export_file_name = _text(getattr(args, "export_file_name", "records.jsonl")) or "records.jsonl"
     if Path(export_file_name).name != export_file_name or export_file_name in {".", ".."}:
         raise ValueError("--export-file-name 只能是文件名，不能包含目录")
@@ -2480,19 +2645,15 @@ def export_mysql_records_to_local(args: argparse.Namespace) -> int:
         columns = _mysql_table_columns(manager, MYSQL_RECORD_TABLE)
         id_column = MYSQL_ID_COLUMN if MYSQL_ID_COLUMN in columns else "medical_record_id"
 
-        filters: dict[str, Any] = {}
-        if doctor_ids_filter:
-            if "doctor_id" not in columns:
-                raise ValueError(f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 doctor_id 字段，无法按医生过滤导出")
-            filters["doctor_id"] = sorted(doctor_ids_filter)
-        if status_filter:
-            if "status" not in columns:
-                raise ValueError(f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 status 字段，无法按标注状态过滤导出")
-            filters["status"] = status_filter
+        for required_column in filters:
+            if required_column not in columns:
+                raise ValueError(
+                    f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 {required_column} 字段，无法按固定条件导出"
+                )
 
         rows = manager.select(
             MYSQL_RECORD_TABLE,
-            filters=filters or None,
+            filters=filters,
             limit=limit if limit > 0 else None,
             order_by=["-id"] if id_column in columns else None,
         )
@@ -2517,12 +2678,8 @@ def export_mysql_records_to_local(args: argparse.Namespace) -> int:
         for row in rows:
             record = _mysql_row_to_record(row)
             doctor_id = _text(record.get("doctor_id")) or "unknown"
-            # SQL 查询已经按 doctor_id 过滤；这里再次校验，避免自定义数据库适配器忽略 filters 后误导出数据。
-            if doctor_ids_filter and doctor_id not in doctor_ids_filter:
-                continue
-            if status_filter and _text(record.get("status")) != status_filter:
-                continue
-            doctor_name = export_doctor_name or record.get("doctor_name")
+            # SQL 已使用统一固定 filter；目录名直接使用记录中的医生姓名。
+            doctor_name = record.get("doctor_name")
             file = get_doctor_file(doctor_id, doctor_name)
             _write_jsonl(file, record)
             count += 1
@@ -2543,33 +2700,6 @@ def export_mysql_records_to_local(args: argparse.Namespace) -> int:
     return count
 
 
-def _load_mysql_processed_record_keys(args: argparse.Namespace) -> tuple[set[str], set[str]]:
-    from medical.data_utils.db_manager import DBManager
-
-    manager = DBManager(MYSQL_DATABASE_URL or None)
-    try:
-        columns = _mysql_table_columns(manager, MYSQL_RECORD_TABLE)
-        id_column = MYSQL_ID_COLUMN if MYSQL_ID_COLUMN in columns else "medical_record_id"
-        selected = [name for name in ("ai_record_identity", "order_sn", id_column) if name in columns]
-        if not selected:
-            return set(), set()
-        filters = {"ai_processing_complete": True} if "ai_processing_complete" in columns else None
-        rows = manager.select(MYSQL_RECORD_TABLE, filters=filters, columns=selected)
-    finally:
-        manager.close()
-
-    processed_ids: set[str] = set()
-    processed_order_sns: set[str] = set()
-    for row in rows:
-        identity = _text(row.get("ai_record_identity"))
-        if not identity and row.get(id_column) is not None:
-            identity = str(row[id_column])
-        if identity:
-            processed_ids.add(identity)
-        order_sn = _text(row.get("order_sn"))
-        if order_sn:
-            processed_order_sns.add(order_sn)
-    return processed_ids, processed_order_sns
 
 
 def _save_mysql_record(args: argparse.Namespace, record: Mapping[str, Any]) -> None:
@@ -2593,28 +2723,62 @@ def _save_mysql_record(args: argparse.Namespace, record: Mapping[str, Any]) -> N
         manager.close()
 
 
-def _update_mysql_ai_fields(record: Mapping[str, Any]) -> None:
-    """Update only fields produced by the image and clinical-cleaning stages."""
+def _mysql_stage_ai_updates(
+    before_record: Mapping[str, Any],
+    after_record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return only stage-produced AI fields whose values changed.
+
+    ``before_record`` is the exact record sent to the selected stages. Because
+    MedicalRecordAgents.process only mutates outputs belonging to selected stages,
+    this diff naturally limits the UPDATE to those stage outputs. Processing
+    metadata is intentionally excluded.
+    """
+    updates: dict[str, Any] = {}
+    names = {
+        name
+        for name in after_record
+        if name.startswith("ai_") and name not in MYSQL_NON_STAGE_AI_FIELDS
+    }
+    for name in names:
+        if after_record.get(name) != before_record.get(name):
+            updates[name] = after_record.get(name)
+    return updates
+
+
+def _update_mysql_stage_ai_fields(
+    mysql_record: Mapping[str, Any],
+    before_record: Mapping[str, Any],
+    after_record: Mapping[str, Any],
+) -> int:
+    """Update only AI fields changed by the selected stages on one existing row."""
     from medical.data_utils.db_manager import DBManager
 
     manager = DBManager(MYSQL_DATABASE_URL or None)
     try:
         columns = _mysql_table_columns(manager, MYSQL_RECORD_TABLE)
         id_column = MYSQL_ID_COLUMN if MYSQL_ID_COLUMN in columns else "medical_record_id"
-        key = _mysql_record_key(record, id_column)
+        key = _mysql_record_key(mysql_record, id_column)
         if key is None:
             raise ValueError(f"无法更新 MySQL：记录缺少主键字段 {id_column}/id/medical_record_id")
         filters = {id_column: key}
         if not manager.count(MYSQL_RECORD_TABLE, filters=filters):
             raise ValueError(f"无法更新 MySQL：原表中不存在 {id_column}={key} 的记录")
-        ai_values = {
+
+        updates = {
             name: value
-            for name, value in record.items()
-            if name in IMAGE_CLEANING_AI_FIELDS and name in columns
+            for name, value in _mysql_stage_ai_updates(before_record, after_record).items()
+            if name in columns
         }
-        if not ai_values:
-            raise ValueError(f"无法更新 MySQL：{id_column}={key} 没有可回写的 ai_ 字段")
-        manager.update(MYSQL_RECORD_TABLE, ai_values, filters=filters)
+        if not updates:
+            logger.info(f"[MYSQL NOOP] {id_column}={key} 本次 stage 没有产生变化的 ai_ 字段")
+            return 0
+
+        manager.update(MYSQL_RECORD_TABLE, updates, filters=filters)
+        logger.info(
+            f"[MYSQL UPDATE] {id_column}={key} fields={','.join(sorted(updates))}"
+        )
+        return len(updates)
     finally:
         manager.close()
 
@@ -2735,33 +2899,55 @@ async def _process_record_batch(
 
 
 async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int]:
+    """Process the full MySQL filter result in batches using raw source records.
+
+    Flow:
+      1. SELECT every row matching the fixed MySQL worklist filter.
+      2. Match each row to medical/data/202301_online by doctor_id + order_sn.
+      3. Process matched source records in --batch-size batches.
+      4. UPDATE only ai_* fields actually changed by the selected stages.
+
+    No whole-row UPDATE and no ai_processing_complete based skip is performed.
+    """
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    reprocess_jsonl = getattr(args, "reprocess_image_cleaning_from_jsonl", None)
     requested_stage_names = list(getattr(args, "stage_name", None) or [])
-    if reprocess_jsonl:
-        if requested_stage_names:
-            raise ValueError("--reprocess-image-cleaning-from-jsonl 已固定重跑图片管线和 clinical_cleaning，不能同时传 --stage-name")
-        if getattr(args, "save_to", "mysql") not in ("mysql", "both"):
-            raise ValueError("--reprocess-image-cleaning-from-jsonl 必须将结果写回 mysql")
-        if not getattr(args, "record_status", None):
-            args.record_status = ["unprocessed", "problem"]
-        stage_names = IMAGE_CLEANING_STAGES
-    else:
-        stage_names = resolve_stage_names(requested_stage_names)
+    stage_names = resolve_stage_names(requested_stage_names)
     logger.info(f"本次清洗的阶段 {stage_names}")
+
     if getattr(args, "reprocess_failures", False) or getattr(args, "reprocess_missing_histories", False):
         raise ValueError("mysql 数据源暂不支持 --reprocess-failures 或 --reprocess-missing-histories")
+    if getattr(args, "save_to", "mysql") not in ("mysql", "both"):
+        raise ValueError("mysql 数据源处理结果必须写回 mysql（--save-to mysql/both）")
 
-    doctor_ids = set(args.doctor_id or [])
-    source_records = _load_mysql_records(args)
-    logger.info(f"本次从数据库读取数据{len(source_records)}条")
-    if reprocess_jsonl:
-        source_records = _match_mysql_records_with_jsonl(source_records, reprocess_jsonl)
-    processed_ids, processed_order_sns = (
-        (set(), set())
-        if args.reprocess or requested_stage_names or reprocess_jsonl
-        else _load_mysql_processed_record_keys(args)
+    # 1) Read the complete fixed MySQL worklist first.
+    #    SELECT * FROM mlops_annotation_medical_record
+    #    WHERE doctor_id = 97 AND status IN ('unprocessed', 'problem');
+    mysql_records = _load_mysql_records(args)
+    logger.info(f"本次从数据库按 filter 条件读取 {len(mysql_records)} 条")
+    if not mysql_records:
+        return 0, 0, 0
+
+    # Skip records that were successfully handled by an earlier run. This is
+    # intentionally done before --limit, so --limit N means N new records.
+    progress_path = _mysql_update_progress_path(args)
+    completed_progress = _load_mysql_update_progress(progress_path)
+    mysql_records, skipped_by_progress = _filter_mysql_records_by_progress(
+        mysql_records, completed_progress
     )
+    logger.info(
+        f"[MYSQL PROGRESS] file={progress_path} skipped={skipped_by_progress} pending={len(mysql_records)}"
+    )
+    if not mysql_records:
+        logger.info("MySQL filter 命中的记录均已存在于本地清洗进度文件，本次无需处理")
+        return 0, 0, skipped_by_progress
+
+    # Optional limit is applied after progress skipping.
+    if args.limit and args.limit > 0:
+        mysql_records = mysql_records[: args.limit]
+        logger.info(f"应用 --limit 后待处理 {len(mysql_records)} 条新记录")
+
+    # 2) Raw clinical fields always come from the original dataset.
+    source_records = _load_original_records_for_mysql(mysql_records, DEFAULT_INPUT)
 
     text_model = build_model(args.model, args, base_url=args.base_url, api_key=args.api_key, temperature=0.1)
     diagnosis_model = build_model(
@@ -2793,10 +2979,11 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
             base_url=getattr(args, "reviewer_base_url", ""),
             api_key=getattr(args, "reviewer_api_key", ""),
         )
+
     agents = MedicalRecordAgents(
         text_model,
         vlm_model,
-        reprocess_jsonl.parent if reprocess_jsonl else args.output_dir,
+        DEFAULT_INPUT,
         diagnosis_model=diagnosis_model,
         image_classification_model=image_classification_model,
         reviewer_model=reviewer_model,
@@ -2805,50 +2992,68 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
         stage_timeout=getattr(args, "timeout", 120.0),
     )
 
-    planned_total = count_planned_records_in_records(
-        source_records,
-        doctor_ids,
-        args.limit,
-        processed_ids,
-        processed_order_sns,
-    )
     succeeded = 0
     failed = 0
-    skipped = 0
+    skipped = skipped_by_progress
     filtered = 0
-    skipped_existing = 0
     completed = 0
-    attempted = 0
-    attempted_by_doctor: Counter[str] = Counter()
-    previous_diagnoses_by_patient: dict[str, dict[str, str]] = {}
-    pending_batch: list[dict[str, Any]] = []
     batch_size = max(1, int(getattr(args, "batch_size", 8)))
     record_timeout = max(0.0, float(getattr(args, "record_timeout", 0.0)))
     progress_every = max(1, int(getattr(args, "progress_every", 10)))
-    progress_scope = ",".join(sorted(doctor_ids)) or "all"
+    progress_scope = (
+        f"doctor_id={','.join(_text(value) for value in (getattr(args, 'doctor_id', None) or [])) or 'unknown'},"
+        "status=unprocessed|problem"
+    )
     progress_started_at = time.monotonic()
     last_progress_completed = 0
-    if planned_total:
-        logger.info(
-            f"[PROGRESS START] data_source=mysql doctor={progress_scope} target={planned_total} "
-            f"batch_size={batch_size} progress_every={progress_every}"
-        )
+    previous_diagnoses_by_patient: dict[str, dict[str, str]] = {}
 
-    async def flush_batch() -> None:
-        nonlocal completed, failed, filtered, last_progress_completed, skipped, succeeded
-        if not pending_batch:
-            return
-        batch = list(pending_batch)
-        pending_batch.clear()
-        logger.info(f"[BATCH START] records={len(batch)} concurrency={len(batch)}")
+    logger.info(
+        f"[PROGRESS START] data_source=mysql doctor={progress_scope} target={len(source_records)} "
+        f"batch_size={batch_size} progress_every={progress_every}"
+    )
+
+    for batch_start in range(0, len(source_records), batch_size):
+        records_batch = source_records[batch_start : batch_start + batch_size]
+        batch_items: list[dict[str, Any]] = []
+        for offset, processing_record in enumerate(records_batch, 1):
+            absolute_index = batch_start + offset
+            mysql_record = processing_record.get("__mysql_current_row")
+            if not isinstance(mysql_record, Mapping):
+                raise ValueError("内部错误：处理记录缺少 __mysql_current_row")
+
+            clean_record = dict(processing_record)
+            clean_record.pop("__mysql_current_row", None)
+            identity = _record_identity(clean_record, absolute_index)
+            order_sn = _text(clean_record.get("order_sn"))
+            batch_items.append(
+                {
+                    "record": clean_record,
+                    "before_record": dict(clean_record),
+                    "mysql_record": dict(mysql_record),
+                    "record_id": _record_key(clean_record, absolute_index),
+                    "identity": identity,
+                    "order_sn": order_sn,
+                    "patient_key": _patient_key(clean_record),
+                    "use_rag": args.use_rag,
+                    "stage_names": stage_names,
+                    "skip_record_filter": False,
+                }
+            )
+
+        logger.info(f"[BATCH START] records={len(batch_items)} concurrency={len(batch_items)}")
         batch_started_at = time.monotonic()
-        outcomes = await _process_record_batch(agents, batch, previous_diagnoses_by_patient, record_timeout)
+        outcomes = await _process_record_batch(
+            agents,
+            batch_items,
+            previous_diagnoses_by_patient,
+            record_timeout,
+        )
         first_failure: RuntimeError | None = None
+
         for item, enriched, process_error in outcomes:
-            identity = item["identity"]
-            order_sn = item["order_sn"]
             record_id = item["record_id"]
-            enriched["ai_record_identity"] = identity
+            order_sn = item["order_sn"]
             enriched.pop("__previous_diagnoses", None)
             enriched.pop("__previous_record_context", None)
             enriched.pop("__original_diagnoses", None)
@@ -2857,119 +3062,66 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
                 failed += 1
                 logger.error(f"[ERROR] record={record_id}: {type(process_error).__name__}: {process_error}")
                 first_failure = first_failure or RuntimeError(f"病历 {record_id} 处理失败")
-            elif enriched.get("ai_processing_filtered") is True:
+                continue
+
+            if enriched.get("ai_processing_filtered") is True:
                 skipped += 1
                 filtered += 1
-                processed_ids.add(identity)
-                if order_sn:
-                    processed_order_sns.add(order_sn)
                 logger.info(f"数据关键字段均为空，【FILTER】 {order_sn or record_id}")
-            elif enriched.get("ai_processing_errors"):
+                continue
+
+            if enriched.get("ai_processing_errors"):
                 failed += 1
-                enriched["ai_processing_complete"] = False
                 logger.error(f"[ERROR] record={record_id}: {_json_for_prompt(enriched['ai_processing_errors'])}")
                 first_failure = first_failure or RuntimeError(f"病历 {record_id} 存在处理失败阶段")
-            else:
-                succeeded += 1
-                enriched["ai_processing_complete"] = True
-                enriched["ai_processing_version"] = date.today().isoformat()
-                processed_ids.add(identity)
-                if order_sn:
-                    processed_order_sns.add(order_sn)
-            save_to = getattr(args, "save_to", "mysql")
-            if save_to in ("mysql", "both"):
-                if reprocess_jsonl:
-                    if (
-                        process_error is None
-                        and enriched.get("ai_processing_filtered") is not True
-                        and not enriched.get("ai_processing_errors")
-                    ):
-                        _update_mysql_ai_fields(enriched)
-                else:
-                    _save_mysql_record(args, enriched)
+                continue
+
+            # 3/4) Never save the whole enriched record. Only changed stage ai_* fields.
+            logger.info(f"本次更新病历表内容{enriched.keys()}")
+            updated_field_count = _update_mysql_stage_ai_fields(
+                item["mysql_record"],
+                item["before_record"],
+                enriched,
+            )
+            mysql_record = item["mysql_record"]
+            progress_added = _append_mysql_update_progress(
+                progress_path,
+                mysql_record.get("doctor_id"),
+                order_sn,
+            )
+            logger.info(
+                f"[MYSQL PROGRESS SAVE] doctor_id={_text(mysql_record.get('doctor_id'))} "
+                f"order_sn={order_sn} updated_fields={updated_field_count} added={progress_added}"
+            )
+            succeeded += 1
 
         completed += len(outcomes)
-        logger.info(f"[BATCH END] records={len(batch)} elapsed={time.monotonic() - batch_started_at:.1f}s")
+        logger.info(
+            f"[BATCH END] records={len(batch_items)} elapsed={time.monotonic() - batch_started_at:.1f}s"
+        )
         if (
-            completed == len(outcomes)
-            or completed >= planned_total
+            completed >= len(source_records)
             or completed - last_progress_completed >= progress_every
         ):
             logger.warning(
                 _progress_log_message(
                     completed=completed,
-                    total=planned_total,
+                    total=len(source_records),
                     succeeded=succeeded,
                     failed=failed,
                     filtered=filtered,
-                    skipped_existing=skipped_existing,
+                    skipped_existing=0,
                     elapsed=time.monotonic() - progress_started_at,
                     scope=progress_scope,
                 )
             )
             last_progress_completed = completed
+
         if getattr(args, "interval", 0) > 0:
             await asyncio.sleep(args.interval)
         if first_failure is not None and args.fail_fast:
             raise first_failure
 
-    for index, record in enumerate(source_records, 1):
-        if not _doctor_matches(record, doctor_ids):
-            continue
-        doctor_id = _text(record.get("doctor_id"))
-        if _selected_doctor_quota_reached(doctor_id, doctor_ids, attempted_by_doctor, args.limit):
-            if _all_selected_doctors_reached(doctor_ids, attempted_by_doctor, args.limit):
-                break
-            continue
-        identity = _record_identity(record, index)
-        order_sn = _text(record.get("order_sn"))
-        patient_key = _patient_key(record)
-        if identity in processed_ids or (order_sn and order_sn in processed_order_sns):
-            await flush_batch()
-            skipped_diagnoses = _diagnosis_payload(record, prefer_ai=True)
-            if patient_key and _has_any_diagnosis(skipped_diagnoses):
-                previous_diagnoses_by_patient[patient_key] = {
-                    **skipped_diagnoses,
-                    "__record_context": _record_history_context(record),
-                }
-            skipped += 1
-            skipped_existing += 1
-            logger.info(f"数据已经处理过，【SKIP】 {order_sn or identity}")
-            continue
-        if not doctor_ids and args.limit and attempted >= args.limit:
-            break
-        attempted += 1
-        if doctor_id:
-            attempted_by_doctor[doctor_id] += 1
-        record_id = _record_key(record, index)
-        pending_batch.append(
-            {
-                "record": record,
-                "record_id": record_id,
-                "identity": identity,
-                "order_sn": order_sn,
-                "patient_key": patient_key,
-                "use_rag": args.use_rag,
-                "stage_names": stage_names,
-                "skip_record_filter": bool(reprocess_jsonl),
-            }
-        )
-        if len(pending_batch) >= batch_size:
-            await flush_batch()
-    await flush_batch()
-    if planned_total and completed != last_progress_completed:
-        logger.warning(
-            _progress_log_message(
-                completed=completed,
-                total=planned_total,
-                succeeded=succeeded,
-                failed=failed,
-                filtered=filtered,
-                skipped_existing=skipped_existing,
-                elapsed=time.monotonic() - progress_started_at,
-                scope=progress_scope,
-            )
-        )
     return succeeded, failed, skipped
 
 
@@ -3289,6 +3441,15 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_DIR,
         help=f"分医生 JSONL 输出目录；默认 {DEFAULT_OUTPUT_DIR}",
     )
+    parser.add_argument(
+        "--mysql-progress-file",
+        type=Path,
+        default=None,
+        help=(
+            "MySQL 清洗成功 order_sn 的共享进度 JSON；"
+            f"默认 <output-dir>/{MYSQL_UPDATE_PROGRESS_FILE_NAME}，支持多进程并发安全写入"
+        ),
+    )
     default_model = _env("MEDICAL_AGENT_MODEL", "gpt-4.1-mini")
     parser.add_argument("--model", default=default_model, help="文本模型")
     parser.add_argument(
@@ -3380,24 +3541,7 @@ def parse_args() -> argparse.Namespace:
         action="extend",
         nargs="+",
         default=[],
-        help="仅处理指定 doctor_id；可一次传入一个或多个 ID，也可重复使用参数，默认所有医生",
-    )
-    parser.add_argument(
-        "--record-status",
-        action="extend",
-        nargs="+",
-        default=[],
-        help="MySQL 数据源按 status 过滤；多个值使用 IN 查询",
-    )
-    parser.add_argument(
-        "--reprocess-image-cleaning-from-jsonl",
-        type=Path,
-        default=None,
-        help=(
-            "以 MySQL doctor_id/status 查询结果为白名单，从指定 JSONL 按 order_sn 取完整记录，"
-            "只重跑图片管线和 clinical_cleaning，并仅回写原表 ai_ 字段；"
-            "未传 --record-status 时默认 unprocessed problem"
-        ),
+        help="仅处理指定 doctor_id；MySQL 模式用于构造 doctor_id 过滤条件",
     )
     parser.add_argument(
         "--stage-name",
@@ -3471,16 +3615,6 @@ def parse_args() -> argparse.Namespace:
         help="仅导出模式：将 MySQL 数据导出到本地 JSONL，不执行处理",
     )
     parser.add_argument(
-        "--export-status",
-        default="",
-        help="仅导出指定 status 的记录；例如 labeled。仅与 --export-mode 一起使用",
-    )
-    parser.add_argument(
-        "--export-doctor-name",
-        default="",
-        help="指定导出目录中的医生姓名，只用于文件命名，不参与查询过滤",
-    )
-    parser.add_argument(
         "--export-file-name",
         default="records.jsonl",
         help="导出的 JSONL 文件名，默认 records.jsonl。仅与 --export-mode 一起使用",
@@ -3490,8 +3624,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.reprocess_image_cleaning_from_jsonl and args.data_source != "mysql":
-        raise ValueError("--reprocess-image-cleaning-from-jsonl 仅支持 --data-source mysql")
     if args.data_source == "local" and not args.input.exists():
         raise FileNotFoundError(f"输入路径不存在: {args.input}")
     # save_to 默认为与 data_source 一致
