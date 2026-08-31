@@ -82,12 +82,10 @@ from dotenv import load_dotenv
 from medical.schema.clear_record_basemodel import (
     AgentReviewResult,
     ClinicalExtractionResult,
-    CurrentVisitHistoryResult,
     DiagnosisResult,
     HistoryCleaningResult,
     ImageClassificationResult,
     InspectionResult,
-    TreatmentPrincipleResult,
     TongueFaceResult,
 )
 
@@ -114,12 +112,16 @@ STAGE_NAMES = (
     "image_classification",
     "inspection_vlm",
     "tongue_face_vlm",
-    "current_visit_history",
     "clinical_cleaning",
     "diagnosis_completion",
     "clinical_extraction",
-    "treatment_principle",
     "diagnosis_normalization",
+)
+IMAGE_CLEANING_STAGES = (
+    "image_classification",
+    "inspection_vlm",
+    "tongue_face_vlm",
+    "clinical_cleaning",
 )
 HISTORY_FIELDS = (
     "old_medical_history",
@@ -137,6 +139,17 @@ CLEANED_HISTORY_FIELDS = (
     "special_history",
     "family_history",
 )
+IMAGE_CLEANING_AI_FIELDS = {
+    "ai_inspection_report_img",
+    "ai_tongue_face_img",
+    "ai_patient_appeal",
+    "ai_new_medical_history",
+    "ai_complaint_history_consistent",
+    "ai_complaint_history_issues",
+    *(f"ai_{field}" for field in CLEANED_HISTORY_FIELDS),
+    *(f"ai_{field}" for field in DIAGNOSIS_FIELDS),
+    *(f"ai_{field}_reason" for field in DIAGNOSIS_FIELDS),
+}
 IMAGE_FIELDS = ("tongue_face_img", "admin_face_img", "admin_report_img", "inspection_report_img")
 IMAGE_CATEGORIES = ("舌", "面", "患处", "检验检查报告类", "其他类")
 TONGUE_FACE_IMAGE_CATEGORIES = ("舌", "面", "患处")
@@ -151,24 +164,6 @@ DEFAULT_AGENT_TEMPERATURE = 0.0
 DEFAULT_AGENT_MAX_TOKENS = 3600
 IMAGE_DEDUP_DOWNLOAD_CONCURRENCY = 6
 IMAGE_DEDUP_DOWNLOAD_TIMEOUT = 15.0
-CURRENT_VISIT_HISTORY_SYSTEM_PROMPT = (
-    "你是临床病历现病史整理助手。输入可能包含同一患者按日期累积的多次就诊记录。"
-    "必须以本次就诊时间为锚点，仅提取与本次复诊对应的现病史，不得混入既往就诊段落。"
-    "若存在括号日期、初诊/复诊序号等标记，选择与本次时间相同或最近且不晚于本次时间的段落。"
-    "整理为规范现病史：保留本次症状、变化、持续时间、相关治疗反应、重要阴性表现及"
-    "与本次相关的检查；纠正明确错别字，删除乱码、重复符号和无意义文本。"
-    "检查报告中的异常方向符号必须转换为中文文本描述，例如 ↑、⬆️ 写作“升高”，↓、⬇️ 写作“下降”。"
-    "不得新增原文没有的症状、诊断、时间或检查结果；无法确定本次段落时返回空字符串。"
-)
-TREATMENT_PRINCIPLE_SYSTEM_PROMPT = (
-    "你是中医病历治则治法提取助手。仅根据输入证据生成一条简洁的治则治法。"
-    "证据优先级为：中医证型和中医疾病，结构化病机、病位和病期，关键症状与舌面患处体征，"
-    "最后才是处方用药。西医诊断、既往史和其他病史只作辅助，不得覆盖中医辨证证据。"
-    "处方只能用于校验或补充已有辨证方向，不得仅凭单味药机械推断；内服与外用处方必须分开判断。"
-    "存在内服处方时优先概括全身治法；存在明确外用处方时可在其后补充‘外治’方向；仅有外用处方时"
-    "必须明确写作外治，不得推断全身治法。不得输出方剂名、药名、剂量、检查建议、用药医嘱或调理建议。"
-    "多项证据矛盾时以中医证型及结构化病机为准；资料不足时返回空字符串。必须返回合法 JSON 对象。"
-)
 INVALID_HISTORY_TEXT = (
     "",
     "-",
@@ -187,6 +182,17 @@ INVALID_HISTORY_TEXT = (
 
 UPWARD_ABNORMAL_SYMBOL_PATTERN = re.compile(r"(?:⬆️|⬆|↑|↗|⇧|▲|△)+")
 DOWNWARD_ABNORMAL_SYMBOL_PATTERN = re.compile(r"(?:⬇️|⬇|↓|↘|⇩|▼|▽)+")
+LAB_REPORT_TYPES = {"检验检测报告", "检验报告"}
+EXAMINATION_REPORT_TYPES = {
+    "检查报告",
+    "CT诊断报告",
+    "影像检查报告",
+    "病理报告",
+    "其他检查报告",
+}
+DISCHARGE_REPORT_TYPES = {"住院/出院报告"}
+OUTPATIENT_RECORD_TYPES = {"门诊病历"}
+INVALID_INSPECTION_TYPES = {"非目标医学文档", "非检查报告", "其他/无法识别", "无法识别"}
 MENSTRUAL_HISTORY_PATTERN = re.compile(
     r"月经|经期|经量|经色|经质|经血|经行|痛经|末次月经|初潮|绝经|闭经|带下"
 )
@@ -350,6 +356,52 @@ def _replace_inspection_report_symbols(value: Any) -> Any:
     return value
 
 
+def _normalize_inspection_finding(report: Any) -> None:
+    """Enforce category-specific fields after VLM extraction."""
+    image_type = _clean_generated_text(report.image_type)
+    report.image_type = image_type
+    if image_type in INVALID_INSPECTION_TYPES:
+        report.is_valid_report = False
+        report.report_name = ""
+        report.report_date = ""
+        report.relative_to_visit_time = ""
+        report.content = ""
+        report.abnormal_indicators = []
+        report.abnormal_results = []
+        report.conclusion = ""
+        report.discharge_diagnosis = ""
+        report.discharge_condition = ""
+        return
+
+    valid_types = LAB_REPORT_TYPES | EXAMINATION_REPORT_TYPES | DISCHARGE_REPORT_TYPES | OUTPATIENT_RECORD_TYPES
+    if image_type in valid_types:
+        report.is_valid_report = True
+
+    if image_type in LAB_REPORT_TYPES:
+        report.abnormal_results = []
+        report.discharge_diagnosis = ""
+        report.discharge_condition = ""
+    elif image_type in EXAMINATION_REPORT_TYPES:
+        report.abnormal_indicators = []
+        report.discharge_diagnosis = ""
+        report.discharge_condition = ""
+    elif image_type in DISCHARGE_REPORT_TYPES:
+        report.content = ""
+        report.abnormal_indicators = []
+        report.abnormal_results = []
+        report.conclusion = ""
+    elif image_type in OUTPATIENT_RECORD_TYPES:
+        report.content = ""
+        report.abnormal_indicators = []
+        report.discharge_diagnosis = ""
+        report.discharge_condition = ""
+
+    report.abnormal_indicators = _clean_generated_value(report.abnormal_indicators)
+    report.abnormal_results = _clean_generated_value(report.abnormal_results)
+    report.discharge_diagnosis = _clean_generated_text(report.discharge_diagnosis)
+    report.discharge_condition = _clean_generated_text(report.discharge_condition)
+
+
 def _json_default(value: Any) -> Any:
     """Serialize common values returned by SQLAlchemy/MySQL without hiding unknown types."""
     if isinstance(value, (datetime, date, datetime_time)):
@@ -375,11 +427,6 @@ def _json_for_prompt(value: Any) -> str:
 
 def _chief_complaint(record: dict[str, Any]) -> str:
     return _text(record.get("patient_appeal") or record.get("doc_ass_stu_appeal"))
-
-def _chief_patient_complaint(record: dict[str, Any]) -> str:
-    return _text(record.get("doc_ass_stu_appeal"))
-
-
 
 def _present_history(record: dict[str, Any]) -> str:
     return _text(record.get("new_medical_history") or record.get("present_history"))
@@ -418,17 +465,6 @@ def _fallback_patient_appeal(record: dict[str, Any], present_history: str) -> st
         if _has_effective_history_text(value):
             return _fallback_history_excerpt(value, limit=40)
     return ""
-
-
-def _history_segments(value: Any) -> list[str]:
-    return [segment.strip(" \t\r\n；;。") for segment in re.split(r"[；;。\n]+", _text(value)) if segment.strip()]
-
-
-def _history_segment_key(value: Any) -> str:
-    """Build a comparison key that ignores harmless punctuation variants."""
-    text = _text(value)
-    text = re.sub(r"末次月经\s*[：:]?\s*", "末次月经", text)
-    return re.sub(r"[\s，,、：:]", "", text)
 
 
 def _record_history_context(record: Mapping[str, Any]) -> dict[str, str]:
@@ -733,30 +769,6 @@ def format_prescription_text(prescriptions: Any) -> str:
             descriptions.append(f"处方{len(descriptions) + 1}：" + "；".join(details) + "。")
 
     return "\n".join(descriptions) or "未见有效处方信息。"
-
-
-def format_treatment_prescription_evidence(prescriptions: Any) -> dict[str, list[str]]:
-    """按内服/外用归并药名，供治则治法判断，排除剂量、医嘱等无关噪声."""
-    evidence: dict[str, list[str]] = {"内服": [], "外用": [], "其他": []}
-    if not isinstance(prescriptions, list):
-        return evidence
-
-    seen: dict[str, set[str]] = {group: set() for group in evidence}
-    for prescription in prescriptions:
-        if not isinstance(prescription, Mapping):
-            continue
-        usage_type = _text(prescription.get("usage_type"))
-        group = "内服" if "内服" in usage_type else "外用" if "外用" in usage_type else "其他"
-        prescription_items = prescription.get("prescription_items")
-        drug_list = prescription_items.get("drugList") if isinstance(prescription_items, Mapping) else []
-        for item in drug_list or []:
-            if not isinstance(item, Mapping):
-                continue
-            name = _text(item.get("drug_name") or item.get("sub_drug_name") or item.get("show_name") )
-            if name and name not in seen[group]:
-                seen[group].add(name)
-                evidence[group].append(name)
-    return evidence
 
 
 def _load_prompt(name: str) -> str:
@@ -1260,7 +1272,6 @@ class MedicalRecordAgents:
         self.diagnosis_agent = self._build_diagnosis_agent(diagnosis_model or text_model)
         self.history_agent = self._build_history_agent(text_model)
         self.extract_agent = self._build_extract_agent(text_model)
-        self.treatment_principle_agent = self._build_treatment_principle_agent(text_model)
         self.reviewer_agent = None
         if enable_review:
             self.reviewer_agent = StructuredAgent(
@@ -1269,12 +1280,6 @@ class MedicalRecordAgents:
                 system_prompt=_load_prompt("agent_review_prompt.txt"),
                 name="medical_agent_reviewer",
             )
-        self.current_visit_history_agent = StructuredAgent(
-            text_model,
-            CurrentVisitHistoryResult,
-            system_prompt=CURRENT_VISIT_HISTORY_SYSTEM_PROMPT,
-            name="current_visit_history_agent",
-        )
         self.image_classifier_agent = StructuredAgent(
             image_classification_model or vlm_model,
             ImageClassificationResult,
@@ -1322,15 +1327,6 @@ class MedicalRecordAgents:
             ClinicalExtractionResult,
             system_prompt=_load_prompt("extract_prompt.txt"),
             name="clinical_extraction_agent",
-        )
-
-    @staticmethod
-    def _build_treatment_principle_agent(model: ChatOpenAI) -> Any:
-        return StructuredAgent(
-            model,
-            TreatmentPrincipleResult,
-            system_prompt=TREATMENT_PRINCIPLE_SYSTEM_PROMPT,
-            name="treatment_principle_agent",
         )
 
     @staticmethod
@@ -1405,31 +1401,6 @@ class MedicalRecordAgents:
                 )
             record[f"ai_{field}_reason"] = reason
 
-    async def extract_current_visit_history(self, record: dict[str, Any], enabled: bool) -> None:
-        record["ai_new_medical_history"] = ""
-        history = _present_history(record)
-        if not enabled or not history:
-            return
-        result = await _invoke_structured_agent(
-            self.current_visit_history_agent,
-            HumanMessage(
-                content=(
-                    f"本次就诊时间：{_visit_time(record) or '未记录'}\n"
-                    f"就诊类型：{_text(record.get('is_first')) or '未记录'}\n"
-                    f"患者主诉：{_chief_patient_complaint(record) or '未记录'}\n"
-                    f"医生撰写主诉：{_chief_complaint(record) or '未记录'}\n"
-                    f"累积现病史原文：\n{history}"
-                )
-            ),
-            CurrentVisitHistoryResult,
-            reviewer_agent=self.reviewer_agent,
-            agent_name="current_visit_history_agent",
-            system_prompt=CURRENT_VISIT_HISTORY_SYSTEM_PROMPT,
-        )
-        record["ai_new_medical_history"] = _replace_inspection_report_symbols(
-            _clean_generated_text(result.new_medical_history)
-        )
-
     async def clean_histories(self, record: dict[str, Any]) -> None:
         histories = _history_payload(record)
         previous_context = record.get("__previous_record_context") or {}
@@ -1446,14 +1417,16 @@ class MedicalRecordAgents:
                 content=(
                     f"医生撰写主诉 doc_ass_stu_appeal：{_text(record.get('doc_ass_stu_appeal')) or '未记录'}\n"
                     f"患者主诉 patient_appeal：{_text(record.get('patient_appeal')) or '未记录'}\n"
-                    f"原始本次就诊现病史 new_medical_history：{_latest_present_history(record) or '未记录'}\n"
+                    f"就诊类型 is_first：{_text(record.get('is_first')) or '未记录'}\n"
+                    f"原始本次现病史 new_medical_history：{_present_history(record) or '未记录'}\n"
+                    "说明：该字段可能包含按日期累积的多次就诊记录，须按本次就诊时间和类型定位。\n"
                     f"上一次就诊时间：{_text(previous_context.get('visit_time')) or '无上一次就诊'}\n"
                     f"上一次看诊主诉：{_text(previous_context.get('chief_complaint')) or '未记录'}\n"
                     f"本次就诊时间：{_visit_time(record) or '未记录'}\n"
                     f"原始病史：{_json_for_prompt(histories)}\n"
                     f"医生书写的舌象及面相 admin_face_describe：{_text(record.get('admin_face_describe')) or '未记录'}\n"
                     f"生育史 birth_detail：{_text(record.get('birth_detail')) or '未记录'}\n"
-                    f"婚恋史 marriage_history（兼容 is_marriage_history）："
+                    f"婚恋史 is_marriage_history（统一映射为 marriage_history）："
                     f"{histories['marriage_history'] or '未记录'}\n"
                     f"西医诊断 diagnosis_illness：{_text(record.get('diagnosis_illness')) or '未记录'}\n"
                     f"中医证型 diagnosis_disease：{_text(record.get('diagnosis_disease')) or '未记录'}\n"
@@ -1576,8 +1549,10 @@ class MedicalRecordAgents:
                 "为控制耗时和上下文，每张有效报告只保留：报告名称、报告日期、指标名称、"
                 "指标结果、单位、异常标记和报告原有结论。content 仅用简短的“指标：结果 单位”"
                 "格式记录，不得全文转写、不得重复参考范围、患者信息、医院信息和无关页眉页脚。"
-                "abnormal_indicators 只保留报告明确标记的异常指标；conclusion 只保留报告原有结论。"
-                "非检查报告或无法识别时只返回图片类别和 is_valid_report=false，其余字段留空。"
+                "检验检测报告的 abnormal_indicators 只保留明确异常指标；检查/CT 报告和门诊病历中的"
+                "检查项目将明确异常结果写入 abnormal_results；住院/出院报告只提取非空的"
+                "discharge_diagnosis 和 discharge_condition。conclusion 只保留原文结论。"
+                "非医学文档或无法识别时只返回图片类别和 is_valid_report=false，其余字段留空。"
             )
             started = time.perf_counter()
             logger.info(
@@ -1698,6 +1673,7 @@ class MedicalRecordAgents:
         )
         result = await self._analyze_inspection_batches(images, visit_time)
         for report in result.reports:
+            _normalize_inspection_finding(report)
             relative_time = _relative_report_time(report.report_date, visit_time)
             if relative_time:
                 report.relative_to_visit_time = relative_time
@@ -1776,7 +1752,9 @@ class MedicalRecordAgents:
                     f"舌面患处图片分析：\n{tongue_face_description}\n"
                     f"处方详情：\n{prescription_description}\n"
                     f"疾病的知识库信息 {illness_knowledge}\n"
-                    f"严格根据知识库知识，提取患者在中医层面的病因、病机、病期、病位、病程、临床症状。若知识库无知识，根据患者病史信息完成上述内容提取。必须返回合法的 JSON 对象，不要输出 Markdown，不要输出额外解释"
+                    "严格根据知识库和本次病历证据，一次性提取患者在中医层面的病因、病机、病期、"
+                    "病位、病程、临床症状及治则治法。若知识库无知识，根据患者病史保守完成提取。"
+                    "必须返回合法的 JSON 对象，不要输出 Markdown，不要输出额外解释"
                 )
             ),
             ClinicalExtractionResult,
@@ -1787,43 +1765,6 @@ class MedicalRecordAgents:
         values = _model_dump(result)
         for field, value in values.items():
             record[f"ai_{field}"] = _clean_generated_value(value)
-
-    async def infer_treatment_principle(self, record: dict[str, Any]) -> None:
-        diagnoses = {
-            "中医证型": _text(record.get("ai_diagnosis_disease")) or _text(record.get("diagnosis_disease")),
-            "中医疾病": _text(record.get("ai_diagnosis_sickness")) or _text(record.get("diagnosis_sickness")),
-            "西医诊断（辅助）": _text(record.get("ai_diagnosis_illness")) or _text(record.get("diagnosis_illness")),
-        }
-        histories = _history_payload(record, ai=True)
-        clinical_fields = {
-            "病因（辅助）": record.get("ai_etiology"),
-            "病机": record.get("ai_pathogenesis"),
-            "病位": record.get("ai_disease_location"),
-            "病期": record.get("ai_disease_stage"),
-            "病程演变": record.get("ai_disease_course"),
-            "关键症状体征": record.get("ai_key_symptoms"),
-        }
-        tongue_face_description = format_tongue_face_result_text(record.get("ai_tongue_face_img"))
-        prescription_evidence = format_treatment_prescription_evidence(record.get("ps"))
-        result = await _invoke_structured_agent(
-            self.treatment_principle_agent,
-            HumanMessage(
-                content=(
-                    f"最新主诉：{_latest_chief_complaint(record)}\n"
-                    f"本次现病史：{_latest_present_history(record)}\n"
-                    f"中医辨证诊断：{_json_for_prompt(diagnoses)}\n"
-                    f"结构化辨证证据：{_json_for_prompt(clinical_fields)}\n"
-                    f"舌面患处客观体征：\n{tongue_face_description}\n"
-                    f"其他病史（仅辅助）：{_json_for_prompt(histories)}\n"
-                    f"分类处方药物（仅用于校验，禁止输出药名）：{_json_for_prompt(prescription_evidence)}"
-                )
-            ),
-            TreatmentPrincipleResult,
-            reviewer_agent=self.reviewer_agent,
-            agent_name="treatment_principle_agent",
-            system_prompt=TREATMENT_PRINCIPLE_SYSTEM_PROMPT,
-        )
-        record["ai_treatment_principle"] = _clean_generated_text(result.treatment_principle)
 
     async def _run_stage(
         self,
@@ -1856,9 +1797,9 @@ class MedicalRecordAgents:
         self,
         record: dict[str, Any],
         *,
-        extract_current_history: bool = False,
         use_rag: bool = False,
         stage_names: list[str] | tuple[str, ...] | None = None,
+        skip_record_filter: bool = False,
     ) -> dict[str, Any]:
         selected_stages = set(resolve_stage_names(stage_names))
         output = dict(record)
@@ -1880,7 +1821,7 @@ class MedicalRecordAgents:
         errors = []
 
         # 2. 主诉、现病史和西医诊断全部缺失时，不调用任何 Agent，过滤
-        if _should_filter_record(output):
+        if not skip_record_filter and _should_filter_record(output):
             write2filter_json(output, self.filter_path)
             output["ai_processing_filtered"] = True
             output["ai_processing_complete"] = False
@@ -1944,32 +1885,15 @@ class MedicalRecordAgents:
                     )
             return pipeline_errors
 
-        # 4：本次复诊病史只依赖文本字段，可与整条视觉管线并发。
-        async def run_current_visit_history() -> list[dict[str, str]]:
-            if "current_visit_history" not in selected_stages:
-                return []
-            try:
-                await self._run_stage(
-                    "current_visit_history",
-                    record_id,
-                    doctor_name,
-                    lambda: self.extract_current_visit_history(output, extract_current_history),
-                )
-            except Exception as exc:
-                return [{"stage": "current_visit_history", "error": f"{type(exc).__name__}: {exc}"}]
-            return []
+        errors.extend(await run_image_pipeline())
 
-        pipeline_results = await asyncio.gather(run_image_pipeline(), run_current_visit_history())
-        for pipeline_errors in pipeline_results:
-            errors.extend(pipeline_errors)
-
-        # 5：等待图片和本次病史均完成后，校验主诉/现病史一致性并清洗五史。
+        # 4：等待图片完成后，在同一阶段提取本次现病史并完成主诉、现病史和五史清洗。
         if "clinical_cleaning" in selected_stages:
             try:
                 await self._run_stage("clinical_cleaning", record_id, doctor_name, lambda: self.clean_histories(output))
             except Exception as exc:
                 errors.append({"stage": "clinical_cleaning", "error": f"{type(exc).__name__}: {exc}"})
-        # 6：用最新病历补全诊断，再提取知识库字段。
+        # 5：用最新病历补全诊断，再一次性提取知识库字段和治则治法。
         if "diagnosis_completion" in selected_stages:
             try:
                 await self._run_stage(
@@ -1990,18 +1914,7 @@ class MedicalRecordAgents:
                 )
             except Exception as exc:
                 errors.append({"stage": "clinical_extraction", "error": f"{type(exc).__name__}: {exc}"})
-        if "treatment_principle" in selected_stages:
-            try:
-                await self._run_stage(
-                    "treatment_principle",
-                    record_id,
-                    doctor_name,
-                    lambda: self.infer_treatment_principle(output),
-                )
-            except Exception as exc:
-                errors.append({"stage": "treatment_principle", "error": f"{type(exc).__name__}: {exc}"})
-
-        # 7：所有 Agent 阶段完成后，最后归一化原始诊断字段。
+        # 6：所有 Agent 阶段完成后，最后归一化原始诊断字段。
         if "diagnosis_normalization" in selected_stages:
             try:
                 await self._run_stage(
@@ -2487,10 +2400,66 @@ def _load_mysql_records(args: argparse.Namespace) -> list[dict[str, Any]]:
 
     manager = DBManager(MYSQL_DATABASE_URL or None)
     try:
-        rows = manager.select(MYSQL_RECORD_TABLE)
+        columns = _mysql_table_columns(manager, MYSQL_RECORD_TABLE)
+        filters: dict[str, Any] = {}
+        doctor_ids = [_text(value) for value in (getattr(args, "doctor_id", None) or []) if _text(value)]
+        record_statuses = [
+            _text(value) for value in (getattr(args, "record_status", None) or []) if _text(value)
+        ]
+        if doctor_ids:
+            if "doctor_id" not in columns:
+                raise ValueError(f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 doctor_id 字段")
+            filters["doctor_id"] = doctor_ids
+        if record_statuses:
+            if "status" not in columns:
+                raise ValueError(f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 status 字段")
+            filters["status"] = record_statuses
+        rows = manager.select(MYSQL_RECORD_TABLE, filters=filters or None)
         return [_mysql_row_to_record(row) for row in rows]
     finally:
         manager.close()
+
+
+def _match_mysql_records_with_jsonl(
+    mysql_records: Iterable[Mapping[str, Any]],
+    jsonl_path: Path,
+) -> list[dict[str, Any]]:
+    """Use MySQL query results as the allowlist and load matching full JSONL records."""
+    if not jsonl_path.is_file():
+        raise FileNotFoundError(f"用于重跑的 JSONL 文件不存在: {jsonl_path}")
+
+    mysql_by_order_sn: dict[str, dict[str, Any]] = {}
+    for record in mysql_records:
+        order_sn = _text(record.get("order_sn"))
+        if not order_sn:
+            logger.warning("忽略 MySQL 查询结果中缺少 order_sn 的记录")
+            continue
+        if order_sn in mysql_by_order_sn:
+            raise ValueError(f"MySQL 查询结果存在重复 order_sn: {order_sn}")
+        mysql_by_order_sn[order_sn] = dict(record)
+
+    local_by_order_sn: dict[str, dict[str, Any]] = {}
+    for record in _iter_jsonl_records(jsonl_path):
+        order_sn = _text(record.get("order_sn"))
+        if order_sn not in mysql_by_order_sn:
+            continue
+        if order_sn in local_by_order_sn:
+            raise ValueError(f"JSONL 文件存在重复 order_sn: {order_sn}")
+        local_by_order_sn[order_sn] = dict(record)
+
+    matched = []
+    for order_sn, mysql_record in mysql_by_order_sn.items():
+        local_record = local_by_order_sn.get(order_sn)
+        if local_record is None:
+            logger.warning(f"MySQL 查询结果在 JSONL 中没有匹配记录，跳过: order_sn={order_sn}")
+            continue
+        # JSONL 保留完整的原始及历史 AI 上下文；数据库当前行覆盖主键、status 等最新列。
+        matched.append({**local_record, **mysql_record})
+    logger.info(
+        f"MySQL 查询 {len(mysql_by_order_sn)} 条，JSONL 匹配 {len(matched)} 条，"
+        f"未匹配 {len(mysql_by_order_sn) - len(matched)} 条"
+    )
+    return matched
 
 
 def export_mysql_records_to_local(args: argparse.Namespace) -> int:
@@ -2499,6 +2468,11 @@ def export_mysql_records_to_local(args: argparse.Namespace) -> int:
 
     output_dir: Path = args.output_dir
     doctor_ids_filter = {_text(doctor_id) for doctor_id in (args.doctor_id or []) if _text(doctor_id)}
+    status_filter = _text(getattr(args, "export_status", ""))
+    export_doctor_name = _text(getattr(args, "export_doctor_name", ""))
+    export_file_name = _text(getattr(args, "export_file_name", "records.jsonl")) or "records.jsonl"
+    if Path(export_file_name).name != export_file_name or export_file_name in {".", ".."}:
+        raise ValueError("--export-file-name 只能是文件名，不能包含目录")
     limit = getattr(args, "limit", 0) or 0
 
     manager = DBManager(MYSQL_DATABASE_URL or None)
@@ -2506,15 +2480,19 @@ def export_mysql_records_to_local(args: argparse.Namespace) -> int:
         columns = _mysql_table_columns(manager, MYSQL_RECORD_TABLE)
         id_column = MYSQL_ID_COLUMN if MYSQL_ID_COLUMN in columns else "medical_record_id"
 
-        filters = None
+        filters: dict[str, Any] = {}
         if doctor_ids_filter:
             if "doctor_id" not in columns:
                 raise ValueError(f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 doctor_id 字段，无法按医生过滤导出")
-            filters = {"doctor_id": sorted(doctor_ids_filter)}
+            filters["doctor_id"] = sorted(doctor_ids_filter)
+        if status_filter:
+            if "status" not in columns:
+                raise ValueError(f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 status 字段，无法按标注状态过滤导出")
+            filters["status"] = status_filter
 
         rows = manager.select(
             MYSQL_RECORD_TABLE,
-            filters=filters,
+            filters=filters or None,
             limit=limit if limit > 0 else None,
             order_by=["-id"] if id_column in columns else None,
         )
@@ -2529,7 +2507,7 @@ def export_mysql_records_to_local(args: argparse.Namespace) -> int:
         if key not in doctor_files:
             doctor_dir = output_dir / f"doctor_{_safe_path_part(doctor_id)}_{_safe_path_part(doctor_name)}"
             doctor_dir.mkdir(parents=True, exist_ok=True)
-            file_path = doctor_dir / "records.jsonl"
+            file_path = doctor_dir / export_file_name
             temporary_path = doctor_dir / f".{file_path.name}.{os.getpid()}.tmp"
             doctor_files[key] = (open(temporary_path, "w", encoding="utf-8"), temporary_path, file_path)
         return doctor_files[key][0]
@@ -2542,7 +2520,9 @@ def export_mysql_records_to_local(args: argparse.Namespace) -> int:
             # SQL 查询已经按 doctor_id 过滤；这里再次校验，避免自定义数据库适配器忽略 filters 后误导出数据。
             if doctor_ids_filter and doctor_id not in doctor_ids_filter:
                 continue
-            doctor_name = record.get("doctor_name")
+            if status_filter and _text(record.get("status")) != status_filter:
+                continue
+            doctor_name = export_doctor_name or record.get("doctor_name")
             file = get_doctor_file(doctor_id, doctor_name)
             _write_jsonl(file, record)
             count += 1
@@ -2613,6 +2593,32 @@ def _save_mysql_record(args: argparse.Namespace, record: Mapping[str, Any]) -> N
         manager.close()
 
 
+def _update_mysql_ai_fields(record: Mapping[str, Any]) -> None:
+    """Update only fields produced by the image and clinical-cleaning stages."""
+    from medical.data_utils.db_manager import DBManager
+
+    manager = DBManager(MYSQL_DATABASE_URL or None)
+    try:
+        columns = _mysql_table_columns(manager, MYSQL_RECORD_TABLE)
+        id_column = MYSQL_ID_COLUMN if MYSQL_ID_COLUMN in columns else "medical_record_id"
+        key = _mysql_record_key(record, id_column)
+        if key is None:
+            raise ValueError(f"无法更新 MySQL：记录缺少主键字段 {id_column}/id/medical_record_id")
+        filters = {id_column: key}
+        if not manager.count(MYSQL_RECORD_TABLE, filters=filters):
+            raise ValueError(f"无法更新 MySQL：原表中不存在 {id_column}={key} 的记录")
+        ai_values = {
+            name: value
+            for name, value in record.items()
+            if name in IMAGE_CLEANING_AI_FIELDS and name in columns
+        }
+        if not ai_values:
+            raise ValueError(f"无法更新 MySQL：{id_column}={key} 没有可回写的 ai_ 字段")
+        manager.update(MYSQL_RECORD_TABLE, ai_values, filters=filters)
+    finally:
+        manager.close()
+
+
 def build_model(
     model_name: str,
     args: argparse.Namespace,
@@ -2675,9 +2681,9 @@ async def _process_record_batch(
             try:
                 process_call = agents.process(
                     working_record,
-                    extract_current_history=item["extract_current_history"],
                     use_rag=item["use_rag"],
                     stage_names=item.get("stage_names"),
+                    skip_record_filter=bool(item.get("skip_record_filter", False)),
                 )
                 if record_timeout > 0:
                     enriched = await asyncio.wait_for(process_call, timeout=record_timeout)
@@ -2730,8 +2736,18 @@ async def _process_record_batch(
 
 async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    reprocess_jsonl = getattr(args, "reprocess_image_cleaning_from_jsonl", None)
     requested_stage_names = list(getattr(args, "stage_name", None) or [])
-    stage_names = resolve_stage_names(requested_stage_names)
+    if reprocess_jsonl:
+        if requested_stage_names:
+            raise ValueError("--reprocess-image-cleaning-from-jsonl 已固定重跑图片管线和 clinical_cleaning，不能同时传 --stage-name")
+        if getattr(args, "save_to", "mysql") not in ("mysql", "both"):
+            raise ValueError("--reprocess-image-cleaning-from-jsonl 必须将结果写回 mysql")
+        if not getattr(args, "record_status", None):
+            args.record_status = ["unprocessed", "problem"]
+        stage_names = IMAGE_CLEANING_STAGES
+    else:
+        stage_names = resolve_stage_names(requested_stage_names)
     logger.info(f"本次清洗的阶段 {stage_names}")
     if getattr(args, "reprocess_failures", False) or getattr(args, "reprocess_missing_histories", False):
         raise ValueError("mysql 数据源暂不支持 --reprocess-failures 或 --reprocess-missing-histories")
@@ -2739,10 +2755,11 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
     doctor_ids = set(args.doctor_id or [])
     source_records = _load_mysql_records(args)
     logger.info(f"本次从数据库读取数据{len(source_records)}条")
-    patient_visit_counts = count_patient_visits_in_records(source_records, doctor_ids)
+    if reprocess_jsonl:
+        source_records = _match_mysql_records_with_jsonl(source_records, reprocess_jsonl)
     processed_ids, processed_order_sns = (
         (set(), set())
-        if args.reprocess or requested_stage_names
+        if args.reprocess or requested_stage_names or reprocess_jsonl
         else _load_mysql_processed_record_keys(args)
     )
 
@@ -2779,7 +2796,7 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
     agents = MedicalRecordAgents(
         text_model,
         vlm_model,
-        args.output_dir,
+        reprocess_jsonl.parent if reprocess_jsonl else args.output_dir,
         diagnosis_model=diagnosis_model,
         image_classification_model=image_classification_model,
         reviewer_model=reviewer_model,
@@ -2861,7 +2878,15 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
                     processed_order_sns.add(order_sn)
             save_to = getattr(args, "save_to", "mysql")
             if save_to in ("mysql", "both"):
-                _save_mysql_record(args, enriched)
+                if reprocess_jsonl:
+                    if (
+                        process_error is None
+                        and enriched.get("ai_processing_filtered") is not True
+                        and not enriched.get("ai_processing_errors")
+                    ):
+                        _update_mysql_ai_fields(enriched)
+                else:
+                    _save_mysql_record(args, enriched)
 
         completed += len(outcomes)
         logger.info(f"[BATCH END] records={len(batch)} elapsed={time.monotonic() - batch_started_at:.1f}s")
@@ -2917,11 +2942,6 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
         if doctor_id:
             attempted_by_doctor[doctor_id] += 1
         record_id = _record_key(record, index)
-        extract_current_history = (
-            _text(record.get("is_first")) == "复诊"
-            and bool(patient_key)
-            and patient_visit_counts[patient_key] > 1
-        )
         pending_batch.append(
             {
                 "record": record,
@@ -2929,9 +2949,9 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
                 "identity": identity,
                 "order_sn": order_sn,
                 "patient_key": patient_key,
-                "extract_current_history": extract_current_history,
                 "use_rag": args.use_rag,
                 "stage_names": stage_names,
+                "skip_record_filter": bool(reprocess_jsonl),
             }
         )
         if len(pending_batch) >= batch_size:
@@ -2977,9 +2997,7 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         else None
     )
 
-    # print(args)
-    # import pdb
-    # pdb.set_trace()
+
     text_model = build_model(
         args.model,
         args,
@@ -3027,11 +3045,6 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         enable_review=enable_review,
         filter_path=args.output_dir / FILTER_FILE_NAME,
         stage_timeout=getattr(args, "timeout", 120.0),
-    )
-    patient_visit_counts = (
-        count_patient_visits_in_records(source_records, doctor_ids)
-        if source_records is not None
-        else count_patient_visits(args.input, doctor_ids)
     )
     if args.reprocess or reprocess_selected:
         processed_ids, processed_order_sns = set(), set()
@@ -3214,11 +3227,6 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
             if doctor_id:
                 attempted_by_doctor[doctor_id] += 1
             record_id = _record_key(record, index)
-            extract_current_history = (
-                _text(record.get("is_first")) == "复诊"
-                and bool(patient_key)
-                and patient_visit_counts[patient_key] > 1
-            )
             pending_batch.append(
                 {
                     "record": record,
@@ -3226,7 +3234,6 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
                     "identity": identity,
                     "order_sn": order_sn,
                     "patient_key": patient_key,
-                    "extract_current_history": extract_current_history,
                     "use_rag": args.use_rag,
                     "stage_names": stage_names,
                 }
@@ -3376,6 +3383,23 @@ def parse_args() -> argparse.Namespace:
         help="仅处理指定 doctor_id；可一次传入一个或多个 ID，也可重复使用参数，默认所有医生",
     )
     parser.add_argument(
+        "--record-status",
+        action="extend",
+        nargs="+",
+        default=[],
+        help="MySQL 数据源按 status 过滤；多个值使用 IN 查询",
+    )
+    parser.add_argument(
+        "--reprocess-image-cleaning-from-jsonl",
+        type=Path,
+        default=None,
+        help=(
+            "以 MySQL doctor_id/status 查询结果为白名单，从指定 JSONL 按 order_sn 取完整记录，"
+            "只重跑图片管线和 clinical_cleaning，并仅回写原表 ai_ 字段；"
+            "未传 --record-status 时默认 unprocessed problem"
+        ),
+    )
+    parser.add_argument(
         "--stage-name",
         action="extend",
         nargs="+",
@@ -3446,11 +3470,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="仅导出模式：将 MySQL 数据导出到本地 JSONL，不执行处理",
     )
+    parser.add_argument(
+        "--export-status",
+        default="",
+        help="仅导出指定 status 的记录；例如 labeled。仅与 --export-mode 一起使用",
+    )
+    parser.add_argument(
+        "--export-doctor-name",
+        default="",
+        help="指定导出目录中的医生姓名，只用于文件命名，不参与查询过滤",
+    )
+    parser.add_argument(
+        "--export-file-name",
+        default="records.jsonl",
+        help="导出的 JSONL 文件名，默认 records.jsonl。仅与 --export-mode 一起使用",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.reprocess_image_cleaning_from_jsonl and args.data_source != "mysql":
+        raise ValueError("--reprocess-image-cleaning-from-jsonl 仅支持 --data-source mysql")
     if args.data_source == "local" and not args.input.exists():
         raise FileNotFoundError(f"输入路径不存在: {args.input}")
     # save_to 默认为与 data_source 一致

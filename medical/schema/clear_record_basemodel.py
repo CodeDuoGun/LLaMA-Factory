@@ -111,7 +111,14 @@ class InspectionFinding(BaseModel):
     )
     content: str = Field(default="", serialization_alias="解析结果")
     abnormal_indicators: list[str] = Field(default_factory=list, serialization_alias="异常指标")
+    abnormal_results: list[str] = Field(
+        default_factory=list,
+        serialization_alias="异常结果",
+        description="检查、影像或门诊病历中原文明确记载的异常检查结果",
+    )
     conclusion: str = Field(default="", serialization_alias="报告结论")
+    discharge_diagnosis: str = Field(default="", serialization_alias="出院诊断")
+    discharge_condition: str = Field(default="", serialization_alias="出院情况")
 
 
 class InspectionResult(BaseModel):
@@ -305,7 +312,7 @@ TONGUE_FACE_RESULT_FIELD_CN_MAPPING: dict[str, str] = {
 
 
 class ClinicalExtractionResult(BaseModel):
-    """供后续知识库存储的病机结构化字段."""
+    """供后续知识库存储的病机结构化字段及治则治法."""
 
     etiology: list[str] = Field(default_factory=list, description="病因")
     pathogenesis: list[str] = Field(default_factory=list, description="病机")
@@ -313,6 +320,7 @@ class ClinicalExtractionResult(BaseModel):
     disease_stage: str = Field(default="", description="病期")
     disease_course: str = Field(default="", description="病程及演变")
     key_symptoms: list[str] = Field(default_factory=list, description="关键症状和体征")
+    treatment_principle: str = Field(default="", description="治则治法")
 
 
 class TreatmentPrincipleResult(BaseModel):

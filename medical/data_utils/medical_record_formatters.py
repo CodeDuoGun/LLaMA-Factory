@@ -119,7 +119,7 @@ def _inspection_field(report: Mapping[str, Any], field: str, alias: str) -> Any:
 
 
 def format_inspection_result_text(result: InspectionResult | Mapping[str, Any] | None) -> str:
-    """将有效检查报告精简为报告时间、名称和异常指标."""
+    """按文档类型保留异常检查事实或非空的出院信息."""
     if result is None:
         data: dict[str, Any] = {}
     elif isinstance(result, BaseModel):
@@ -137,20 +137,50 @@ def format_inspection_result_text(result: InspectionResult | Mapping[str, Any] |
         is_valid = _inspection_field(report, "is_valid_report", "是否有效检查报告")
         if is_valid is not True:
             continue
-        valid_index += 1
         report_time = (
             _inspection_field(report, "relative_to_visit_time", "相对就诊时间")
             or _inspection_field(report, "report_time", "报告时间")
             or _inspection_field(report, "report_date", "报告日期")
         )
         report_name = _format_tongue_face_value(_inspection_field(report, "report_name", "报告名称")) or "未识别"
-        abnormal_indicators = (
-            _format_tongue_face_value(_inspection_field(report, "abnormal_indicators", "异常指标")) or "无异常指标"
+        image_type = _format_tongue_face_value(_inspection_field(report, "image_type", "图片类别"))
+        abnormal_indicators = _format_tongue_face_value(
+            _inspection_field(report, "abnormal_indicators", "异常指标")
         )
+        abnormal_results = _format_tongue_face_value(
+            _inspection_field(report, "abnormal_results", "异常结果")
+        )
+        # 兼容新增“异常结果”字段前已落库的影像/检查解析结果。
+        if not abnormal_results and "abnormal_results" not in report and "异常结果" not in report:
+            if image_type in {"检查报告", "CT诊断报告", "影像检查报告", "病理报告", "门诊病历"}:
+                abnormal_results = _format_tongue_face_value(
+                    _inspection_field(report, "conclusion", "报告结论")
+                )
+        discharge_diagnosis = _format_tongue_face_value(
+            _inspection_field(report, "discharge_diagnosis", "出院诊断")
+        )
+        discharge_condition = _format_tongue_face_value(
+            _inspection_field(report, "discharge_condition", "出院情况")
+        )
+
+        details = []
+        if abnormal_indicators:
+            details.append(f"异常指标：{abnormal_indicators}")
+        if abnormal_results:
+            details.append(f"异常结果：{abnormal_results}")
+        if discharge_diagnosis:
+            details.append(f"出院诊断：{discharge_diagnosis}")
+        if discharge_condition:
+            details.append(f"出院情况：{discharge_condition}")
+        if not details:
+            continue
+
+        valid_index += 1
+        prefix = "有效医学文档" if image_type in {"住院/出院报告", "门诊病历"} else "有效检查报告"
         descriptions.append(
-            f"有效检查报告{valid_index}："
+            f"{prefix}{valid_index}："
             f"报告时间：{_format_tongue_face_value(report_time) or '未识别'}；"
             f"报告名称：{report_name}；"
-            f"报告异常指标：{abnormal_indicators}。"
+            f"{'；'.join(details)}。"
         )
     return "\n".join(descriptions) or "未见有效检查报告信息。"

@@ -32,6 +32,7 @@ from medical.data_utils import medical_record_agents
 from medical.data_utils.db_manager import DBManager
 from medical.schema.clear_record_basemodel import (
     AgentReviewResult,
+    ClinicalExtractionResult,
     CurrentVisitHistoryResult,
     HistoryCleaningResult,
     ImageClassification,
@@ -39,7 +40,6 @@ from medical.schema.clear_record_basemodel import (
     InspectionFinding,
     InspectionResult,
     TongueFaceResult,
-    TreatmentPrincipleResult,
 )
 
 
@@ -103,30 +103,19 @@ def test_history_fields_include_birth_and_normalized_marriage_history() -> None:
     )["birth_detail"] == "育有1女"
 
 
-def test_format_treatment_prescription_evidence_separates_internal_and_external() -> None:
-    prescriptions = [
-        {
-            "usage_type": "内服",
-            "prescription_items": {"drugList": [{"show_name": "黄芩"}, {"show_name": "黄芩"}]},
-        },
-        {
-            "usage_type": "外用",
-            "prescription_items": {"drugList": [{"show_name": "苦参"}]},
-        },
-    ]
-
-    assert medical_record_agents.format_treatment_prescription_evidence(prescriptions) == {
-        "内服": ["黄芩"],
-        "外用": ["苦参"],
-        "其他": [],
-    }
-
-
-def test_infer_treatment_principle_prioritizes_syndrome_evidence_and_splits_prescriptions() -> None:
+def test_clinical_extraction_also_outputs_treatment_principle() -> None:
     agents = object.__new__(medical_record_agents.MedicalRecordAgents)
-    treatment_agent = FakeStructuredAgent([TreatmentPrincipleResult(treatment_principle="清热利湿解毒，兼活血")])
-    agents.treatment_principle_agent = treatment_agent
+    extract_agent = FakeStructuredAgent(
+        [
+            ClinicalExtractionResult(
+                pathogenesis=["湿毒蕴肤"],
+                treatment_principle="清热利湿解毒，兼活血",
+            )
+        ]
+    )
+    agents.extract_agent = extract_agent
     agents.reviewer_agent = None
+    agents.build_illness_knowledge = lambda diagnoses: "无"
     record = {
         "ai_patient_appeal": "面部红斑丘疹",
         "ai_new_medical_history": "面部红斑丘疹，舌红苔黄腻。",
@@ -144,14 +133,13 @@ def test_infer_treatment_principle_prioritizes_syndrome_evidence_and_splits_pres
         ],
     }
 
-    asyncio.run(agents.infer_treatment_principle(record))
+    asyncio.run(agents.extract_clinical_fields(record))
 
-    prompt = treatment_agent.calls[0]["messages"][0].content
-    assert '"中医证型":"湿毒蕴肤证"' in prompt
-    assert '"病机":["湿毒蕴肤"]' in prompt
-    assert '"内服":["黄芩"]' in prompt
-    assert '"外用":["苦参"]' in prompt
-    assert "剂量" not in prompt
+    prompt = extract_agent.calls[0]["messages"][0].content
+    assert '"diagnosis_disease":"湿毒蕴肤证"' in prompt
+    assert "处方详情" in prompt
+    assert "黄芩" in prompt
+    assert record["ai_pathogenesis"] == ["湿毒蕴肤"]
     assert record["ai_treatment_principle"] == "清热利湿解毒，兼活血"
 
 
@@ -227,6 +215,46 @@ def test_export_mysql_records_filters_multiple_doctors_and_splits_directories(tm
     assert not (tmp_path / "doctor_99_未选择医生").exists()
 
 
+def test_export_mysql_records_filters_labeled_status_and_uses_stage_file_name(tmp_path, monkeypatch) -> None:
+    select_calls = []
+
+    class FakeManager:
+        def __init__(self, database_url):
+            self.database_url = database_url
+
+        def refresh_table(self, table_name):
+            return SimpleNamespace(
+                c={"id": object(), "doctor_id": object(), "doctor_name": object(), "status": object()}
+            )
+
+        def select(self, *args, **kwargs):
+            select_calls.append((args, kwargs))
+            return [
+                {"id": 1, "doctor_id": "43", "doctor_name": "朱子奇", "status": "labeled"},
+                {"id": 2, "doctor_id": "43", "doctor_name": "朱子奇", "status": "pending"},
+            ]
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("medical.data_utils.db_manager.DBManager", FakeManager)
+    args = SimpleNamespace(
+        output_dir=tmp_path,
+        doctor_id=["43"],
+        export_status="labeled",
+        export_doctor_name="指定姓名",
+        export_file_name="medical_records_ai_stage.jsonl",
+        limit=0,
+    )
+
+    assert medical_record_agents.export_mysql_records_to_local(args) == 1
+    assert select_calls[0][1]["filters"] == {"doctor_id": ["43"], "status": "labeled"}
+    output_path = tmp_path / "doctor_43_指定姓名" / "medical_records_ai_stage.jsonl"
+    assert [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()] == [
+        {"id": 1, "doctor_id": "43", "doctor_name": "朱子奇", "status": "labeled"}
+    ]
+
+
 def test_export_mysql_records_rejects_doctor_filter_without_doctor_column(tmp_path, monkeypatch) -> None:
     class FakeManager:
         def __init__(self, database_url):
@@ -243,6 +271,104 @@ def test_export_mysql_records_rejects_doctor_filter_without_doctor_column(tmp_pa
 
     with pytest.raises(ValueError, match="不存在 doctor_id 字段"):
         medical_record_agents.export_mysql_records_to_local(args)
+
+
+def test_load_mysql_records_filters_doctor_and_multiple_statuses(monkeypatch) -> None:
+    select_calls = []
+
+    class FakeManager:
+        def __init__(self, database_url):
+            pass
+
+        def refresh_table(self, table_name):
+            return SimpleNamespace(c={"id": object(), "doctor_id": object(), "status": object()})
+
+        def select(self, *args, **kwargs):
+            select_calls.append((args, kwargs))
+            return [{"id": 1, "doctor_id": 97, "status": "problem", "order_sn": "ORDER-1"}]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("medical.data_utils.db_manager.DBManager", FakeManager)
+    args = SimpleNamespace(doctor_id=["97"], record_status=["unprocessed", "problem"])
+
+    records = medical_record_agents._load_mysql_records(args)
+
+    assert records[0]["order_sn"] == "ORDER-1"
+    assert select_calls[0][1]["filters"] == {
+        "doctor_id": ["97"],
+        "status": ["unprocessed", "problem"],
+    }
+
+
+def test_match_mysql_records_with_jsonl_uses_query_as_allowlist(tmp_path) -> None:
+    path = tmp_path / "medical_records_ai_stage.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": 100, "order_sn": "ORDER-1", "ai_patient_appeal": "旧值"}),
+                json.dumps({"id": 200, "order_sn": "ORDER-2", "ai_patient_appeal": "不应处理"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    matched = medical_record_agents._match_mysql_records_with_jsonl(
+        [{"id": 1, "order_sn": "ORDER-1", "status": "problem"}, {"id": 3, "order_sn": "ORDER-3"}],
+        path,
+    )
+
+    assert matched == [{"id": 1, "order_sn": "ORDER-1", "ai_patient_appeal": "旧值", "status": "problem"}]
+
+
+def test_update_mysql_ai_fields_does_not_change_status_or_raw_fields(monkeypatch) -> None:
+    updates = []
+
+    class FakeManager:
+        def __init__(self, database_url):
+            pass
+
+        def refresh_table(self, table_name):
+            return SimpleNamespace(
+                c={
+                    "id": object(),
+                    "status": object(),
+                    "new_medical_history": object(),
+                    "ai_new_medical_history": object(),
+                    "ai_tongue_face_img": object(),
+                }
+            )
+
+        def count(self, table_name, filters):
+            return 1
+
+        def update(self, table_name, data, filters):
+            updates.append((table_name, data, filters))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("medical.data_utils.db_manager.DBManager", FakeManager)
+
+    medical_record_agents._update_mysql_ai_fields(
+        {
+            "id": 7,
+            "status": "problem",
+            "new_medical_history": "原始值",
+            "ai_new_medical_history": "清洗值",
+            "ai_tongue_face_img": {"tongue": "淡红舌"},
+        }
+    )
+
+    assert updates == [
+        (
+            medical_record_agents.MYSQL_RECORD_TABLE,
+            {"ai_new_medical_history": "清洗值", "ai_tongue_face_img": {"tongue": "淡红舌"}},
+            {"id": 7},
+        )
+    ]
 
 
 def test_normalize_medical_history_removes_frontend_tags() -> None:
@@ -1003,7 +1129,6 @@ def test_process_record_batch_isolates_errors_and_timeouts() -> None:
             "identity": f"43:{record_id}",
             "order_sn": "",
             "patient_key": f"43:patient-{record_id}",
-            "extract_current_history": False,
             "use_rag": False,
         }
 
@@ -1052,7 +1177,6 @@ def test_process_record_batch_keeps_same_patient_visits_sequential() -> None:
             "identity": f"43:{record_id}",
             "order_sn": "",
             "patient_key": "43:patient-1",
-            "extract_current_history": False,
             "use_rag": False,
         }
 
@@ -1104,48 +1228,33 @@ def test_run_stage_logs_doctor_name(monkeypatch) -> None:
     )
 
 
-def test_process_runs_current_history_and_image_pipeline_concurrently() -> None:
+def test_process_runs_clinical_cleaning_after_image_pipeline() -> None:
     agents = object.__new__(medical_record_agents.MedicalRecordAgents)
     agents.stage_timeout = 0
-    history_started = asyncio.Event()
-    image_started = asyncio.Event()
-
-    agents.normalize_diagnoses = lambda record: None
+    calls = []
 
     async def classify(record):
-        await asyncio.wait_for(history_started.wait(), timeout=0.2)
-        image_started.set()
+        calls.append("image_classification")
         return {category: [] for category in medical_record_agents.IMAGE_CATEGORIES}
 
-    async def extract_current_history(record, enabled):
-        history_started.set()
-        await asyncio.wait_for(image_started.wait(), timeout=0.2)
+    async def clean_histories(record):
+        calls.append("clinical_cleaning")
 
     agents.classify_images = classify
-    agents.extract_current_visit_history = extract_current_history
-    agents.analyze_inspection_images = lambda record, images=None: None
-    agents.analyze_tongue_face_images = lambda record, images=None: None
-    agents.clean_histories = lambda record: None
-    agents.complete_diagnoses = lambda record: None
-    agents.extract_clinical_fields = lambda record, use_rag: None
-    agents.infer_treatment_principle = lambda record: None
+    agents.clean_histories = clean_histories
 
     asyncio.run(
-        asyncio.wait_for(
-            agents.process(
-                {
-                    "order_sn": "ORDER-1",
-                    "doctor_name": "张医生",
-                    "new_medical_history": "复诊病史",
-                },
-                extract_current_history=True,
-            ),
-            timeout=1,
+        agents.process(
+            {
+                "order_sn": "ORDER-1",
+                "doctor_name": "张医生",
+                "new_medical_history": "复诊病史",
+            },
+            stage_names=["image_classification", "clinical_cleaning"],
         )
     )
 
-    assert history_started.is_set()
-    assert image_started.is_set()
+    assert calls == ["image_classification", "clinical_cleaning"]
 
 
 def test_process_runs_diagnosis_normalization_last() -> None:
@@ -1157,15 +1266,13 @@ def test_process_runs_diagnosis_normalization_last() -> None:
     agents.classify_images = lambda record: {category: [] for category in medical_record_agents.IMAGE_CATEGORIES}
     agents.analyze_inspection_images = lambda record, images=None: None
     agents.analyze_tongue_face_images = lambda record, images=None: None
-    agents.extract_current_visit_history = lambda record, enabled: None
     agents.clean_histories = lambda record: None
     agents.complete_diagnoses = lambda record: None
     agents.extract_clinical_fields = lambda record, use_rag: calls.append("clinical_extraction")
-    agents.infer_treatment_principle = lambda record: calls.append("treatment_principle")
 
     asyncio.run(agents.process({"new_medical_history": "腹胀"}))
 
-    assert calls == ["clinical_extraction", "treatment_principle", "diagnosis_normalization"]
+    assert calls == ["clinical_extraction", "diagnosis_normalization"]
 
 
 @pytest.mark.parametrize(
@@ -1220,7 +1327,7 @@ def test_format_inspection_result_text_keeps_valid_reports_only() -> None:
     }
 
     assert medical_record_agents.format_inspection_result_text(result) == (
-        "有效检查报告1：报告时间：2021-03-10；报告名称：胸部CT；报告异常指标：无异常指标。"
+        "有效检查报告1：报告时间：3个月前；报告名称：胸部CT；异常结果：右肺结节。"
     )
 
 
@@ -1246,6 +1353,123 @@ def test_format_inspection_result_text_only_keeps_abnormal_indicators() -> None:
     )
     assert "其他解析内容" not in text
     assert "考虑炎症" not in text
+
+
+def test_format_inspection_result_text_keeps_ct_abnormal_results() -> None:
+    result = InspectionResult(
+        reports=[
+            InspectionFinding(
+                image_type="CT诊断报告",
+                is_valid_report=True,
+                report_name="胸部CT",
+                report_date="2025-04-24",
+                abnormal_results=[
+                    "右肺中下叶及左肺下叶间质性炎症改变，建议抗炎治疗后复查",
+                    "两肺气肿伴慢性支气管炎",
+                    "升主动脉扩张，主动脉硬化，冠脉病变",
+                    "双侧基底节区侧脑室旁腔隙性脑梗塞",
+                    "大脑镰前纵隔钙化灶",
+                ],
+            )
+        ]
+    )
+
+    text = medical_record_agents.format_inspection_result_text(result)
+
+    assert "报告名称：胸部CT" in text
+    assert "右肺中下叶及左肺下叶间质性炎症改变" in text
+    assert "两肺气肿伴慢性支气管炎" in text
+    assert "升主动脉扩张，主动脉硬化，冠脉病变" in text
+    assert "双侧基底节区侧脑室旁腔隙性脑梗塞" in text
+    assert "大脑镰前纵隔钙化灶" in text
+
+
+def test_format_inspection_result_text_keeps_discharge_fields_only_when_non_empty() -> None:
+    result = InspectionResult(
+        reports=[
+            InspectionFinding(
+                image_type="住院/出院报告",
+                is_valid_report=True,
+                report_name="出院记录",
+                discharge_diagnosis="社区获得性肺炎",
+                discharge_condition="症状好转，生命体征平稳",
+            ),
+            InspectionFinding(
+                image_type="住院/出院报告",
+                is_valid_report=True,
+                report_name="空白出院记录",
+            ),
+        ]
+    )
+
+    text = medical_record_agents.format_inspection_result_text(result)
+
+    assert "出院诊断：社区获得性肺炎" in text
+    assert "出院情况：症状好转，生命体征平稳" in text
+    assert "空白出院记录" not in text
+
+
+def test_format_inspection_result_text_keeps_outpatient_examination_name_time_and_result() -> None:
+    result = InspectionResult(
+        reports=[
+            InspectionFinding(
+                image_type="门诊病历",
+                is_valid_report=True,
+                report_name="彩超（肝胆脾胰超声）",
+                report_date="2025-01-23",
+                abnormal_results=["胆囊泥沙样结石"],
+            )
+        ]
+    )
+
+    assert medical_record_agents.format_inspection_result_text(result) == (
+        "有效医学文档1：报告时间：2025-01-23；报告名称：彩超（肝胆脾胰超声）；"
+        "异常结果：胆囊泥沙样结石。"
+    )
+
+
+@pytest.mark.parametrize(
+    ("image_type", "kept_field", "cleared_fields"),
+    [
+        ("检验检测报告", "abnormal_indicators", ("abnormal_results", "discharge_diagnosis")),
+        ("CT诊断报告", "abnormal_results", ("abnormal_indicators", "discharge_diagnosis")),
+        ("住院/出院报告", "discharge_diagnosis", ("abnormal_indicators", "abnormal_results")),
+        ("门诊病历", "abnormal_results", ("abnormal_indicators", "discharge_diagnosis")),
+    ],
+)
+def test_normalize_inspection_finding_enforces_category_fields(
+    image_type, kept_field, cleared_fields
+) -> None:
+    report = InspectionFinding(
+        image_type=image_type,
+        is_valid_report=False,
+        abnormal_indicators=["白细胞升高"],
+        abnormal_results=["胆囊泥沙样结石"],
+        discharge_diagnosis="肺炎",
+        discharge_condition="好转",
+    )
+
+    medical_record_agents._normalize_inspection_finding(report)
+
+    assert report.is_valid_report is True
+    assert getattr(report, kept_field)
+    for field in cleared_fields:
+        assert not getattr(report, field)
+
+
+def test_normalize_inspection_finding_clears_non_target_document() -> None:
+    report = InspectionFinding(
+        image_type="非目标医学文档",
+        is_valid_report=True,
+        report_name="处方",
+        abnormal_results=["不应保留"],
+    )
+
+    medical_record_agents._normalize_inspection_finding(report)
+
+    assert report.is_valid_report is False
+    assert report.report_name == ""
+    assert report.abnormal_results == []
 
 
 def test_format_tongue_face_result_text_uses_natural_language_sections() -> None:
@@ -1606,14 +1830,14 @@ def test_selected_tongue_face_stage_overwrites_only_its_result() -> None:
     assert "ai_processing_stages" not in result
 
 
-def test_selected_treatment_stage_adds_field_to_complete_record() -> None:
+def test_selected_clinical_extraction_adds_treatment_field_to_complete_record() -> None:
     agents = object.__new__(medical_record_agents.MedicalRecordAgents)
     agents.stage_timeout = 0
 
-    async def infer_treatment_principle(record):
+    async def extract_clinical_fields(record, use_rag):
         record["ai_treatment_principle"] = "清热利湿"
 
-    agents.infer_treatment_principle = infer_treatment_principle
+    agents.extract_clinical_fields = extract_clinical_fields
     record = {
         "order_sn": "TREATMENT-UPSERT-1",
         "patient_appeal": "口干",
@@ -1622,7 +1846,7 @@ def test_selected_treatment_stage_adds_field_to_complete_record() -> None:
         "original_only": 123,
     }
 
-    result = asyncio.run(agents.process(record, stage_names=["treatment_principle"]))
+    result = asyncio.run(agents.process(record, stage_names=["clinical_extraction"]))
 
     assert result["ai_treatment_principle"] == "清热利湿"
     assert result["original_only"] == 123
@@ -1636,6 +1860,8 @@ def test_history_cleaning_result_excludes_birth_and_marriage_fields() -> None:
 
 def test_stage_output_name_and_image_dependency() -> None:
     assert medical_record_agents.STAGE_NAMES[-1] == "diagnosis_normalization"
+    assert "current_visit_history" not in medical_record_agents.STAGE_NAMES
+    assert "treatment_principle" not in medical_record_agents.STAGE_NAMES
     assert medical_record_agents.resolve_stage_names(["inspection_vlm"]) == (
         "image_classification",
         "inspection_vlm",
@@ -1651,6 +1877,14 @@ def test_history_cleaning_prompt_prefers_relative_report_time() -> None:
     assert "必须优先使用相对时间作为现病史中的时间状语" in prompt
     assert "半月前血常规检查，见轻度贫血" in prompt
     assert "若未提供相对时间，必须使用报告日期" in prompt
+    assert "只清洗与本次就诊对应的段落" in prompt
+
+
+def test_extraction_prompt_includes_treatment_principle_rules() -> None:
+    prompt = medical_record_agents._load_prompt("extract_prompt.txt")
+
+    assert "治则治法 treatment_principle" in prompt
+    assert "仅有外用处方时必须明确写作外治" in prompt
 
 
 def test_group_classified_images_routes_categories_and_keeps_other_separate() -> None:
@@ -1819,13 +2053,11 @@ def test_process_classifies_once_and_filters_other_images() -> None:
 
     agents.analyze_inspection_images = analyze_inspection
     agents.analyze_tongue_face_images = analyze_tongue_face
-    agents.extract_current_visit_history = lambda record, enabled: None
     agents.clean_histories = lambda record: None
     agents.complete_diagnoses = lambda record: None
     agents.extract_clinical_fields = lambda record, use_rag: None
-    agents.infer_treatment_principle = lambda record: None
 
-    asyncio.run(agents.process({}, extract_current_history=False))
+    asyncio.run(agents.process({}))
 
     assert calls == {
         "inspection": ["report.jpg"],

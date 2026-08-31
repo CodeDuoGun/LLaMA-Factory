@@ -71,8 +71,7 @@ python medical/data_utils/medical_record_agents.py \
 ```
 
 可选阶段为 `diagnosis_normalization`、`image_classification`、`inspection_vlm`、`tongue_face_vlm`、
-`current_visit_history`、`clinical_cleaning`、`diagnosis_completion`、`clinical_extraction` 和
-`treatment_principle`。不传 `--stage-name` 时保持原有行为并运行全部阶段；传入阶段后，输出文件名会记录
+`clinical_cleaning`、`diagnosis_completion` 和 `clinical_extraction`。不传 `--stage-name` 时保持原有行为并运行全部阶段；传入阶段后，输出文件名会记录
 阶段组合，例如 `medical_records_ai__stage_clinical_cleaning__diagnosis_completion.jsonl`。选择
 `inspection_vlm` 或 `tongue_face_vlm` 时会自动加入其必要依赖 `image_classification`，文件名以实际执行阶段为准。
 
@@ -82,7 +81,25 @@ JSONL 始终是 upsert 后的完整病历，不额外写入 `ai_processing_stage
 
 `clinical_cleaning` 会将 `admin_face_describe`（舌象及面相）、`birth_detail`（生育史）、
 `is_marriage_history`（婚恋史）及三个原始诊断字段一并提供给模型作为上下文，输出主诉、现病史一致性、
-五史和三个 AI 诊断及其修正理由；生育史和婚恋史本身保持原病历值，不生成对应 AI 字段。
+五史和三个 AI 诊断及其修正理由；它也负责从按日期累积的病史中定位并清洗本次就诊现病史。
+生育史和婚恋史本身保持原病历值，不生成对应 AI 字段。`clinical_extraction` 在提取病因、病机、病位、
+病期、病程和关键症状的同一次调用中生成 `ai_treatment_principle`。
+
+只重跑 doctor 97 的 `unprocessed` / `problem` 记录时，可用 MySQL 查询结果作为白名单，按 `order_sn`
+与历史 JSONL 取交集，只执行图片管线和 `clinical_cleaning`，并仅回写原表的 `ai_` 字段：
+
+```bash
+python medical/data_utils/medical_record_agents.py \
+  --data-source mysql \
+  --save-to mysql \
+  --doctor-id 97 \
+  --record-status unprocessed problem \
+  --reprocess-image-cleaning-from-jsonl \
+    medical/processed_data/doctor_97_巢国俊/medical_records_ai_stage.jsonl
+```
+
+省略 `--record-status` 时，该重跑模式默认使用 `unprocessed problem`。MySQL 中存在但 JSONL 中没有相同
+`order_sn` 的记录会记录警告并跳过，不会调用模型或写回数据库。
 
 诊断标签归一化已经集成在此主流程中。模型结果先经过代码内别名表，再经过 Excel 标准词表：
 
