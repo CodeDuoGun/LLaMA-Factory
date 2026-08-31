@@ -115,6 +115,7 @@ FILTER_FILE_NAME = "filter.json"
 MYSQL_UPDATE_PROGRESS_FILE_NAME = "mysql_stage_update_progress.json"
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 DASHSCOPE_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_MODEL_TIMEOUT = 300.0
 DIAGNOSIS_FIELDS = ("diagnosis_illness", "diagnosis_disease", "diagnosis_sickness")
 STAGE_NAMES = (
     "image_classification",
@@ -147,21 +148,13 @@ CLEANED_HISTORY_FIELDS = (
     "special_history",
     "family_history",
 )
-IMAGE_CLEANING_AI_FIELDS = {
-    "ai_inspection_report_img",
-    "ai_tongue_face_img",
-    "ai_patient_appeal",
-    "ai_new_medical_history",
-    "ai_complaint_history_consistent",
-    "ai_complaint_history_issues",
-    *(f"ai_{field}" for field in CLEANED_HISTORY_FIELDS),
-    *(f"ai_{field}" for field in DIAGNOSIS_FIELDS),
-    *(f"ai_{field}_reason" for field in DIAGNOSIS_FIELDS),
-}
+
 IMAGE_FIELDS = ("tongue_face_img", "admin_face_img", "admin_report_img", "inspection_report_img")
 IMAGE_CATEGORIES = ("舌", "面", "患处", "检验检查报告类", "其他类")
 TONGUE_FACE_IMAGE_CATEGORIES = ("舌", "面", "患处")
-MAX_VLM_IMAGES_PER_REQUEST = 8
+# Smaller multimodal requests reduce upload/context latency for inspection reports.
+# Batches are dispatched concurrently up to OCR_BATCH_CONCURRENCY.
+MAX_VLM_IMAGES_PER_REQUEST = 4
 OCR_BATCH_CONCURRENCY = 3
 MAX_CLASSIFICATION_IMAGES_PER_REQUEST = 8
 IMAGE_CLASSIFICATION_BATCH_CONCURRENCY = 2
@@ -2808,7 +2801,7 @@ def build_model(
         temperature=temperature,
         thinking=resolved_thinking,
         max_tokens=max_tokens,
-        timeout=getattr(args, "timeout", 120.0),
+        timeout=getattr(args, "timeout", DEFAULT_MODEL_TIMEOUT),
         max_retries=getattr(args, "max_retries", 2),
     ).build()
 
@@ -2942,9 +2935,11 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
         return 0, 0, skipped_by_progress
 
     # Optional limit is applied after progress skipping.
+    logger.info(f"before limit: {len(mysql_records)}")
     if args.limit and args.limit > 0:
         mysql_records = mysql_records[: args.limit]
         logger.info(f"应用 --limit 后待处理 {len(mysql_records)} 条新记录")
+    # import pdb; pdb.set_trace()
 
     # 2) Raw clinical fields always come from the original dataset.
     source_records = _load_original_records_for_mysql(mysql_records, DEFAULT_INPUT)
@@ -2989,7 +2984,7 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
         reviewer_model=reviewer_model,
         enable_review=enable_review,
         filter_path=args.output_dir / FILTER_FILE_NAME,
-        stage_timeout=getattr(args, "timeout", 120.0),
+        stage_timeout=getattr(args, "timeout", DEFAULT_MODEL_TIMEOUT),
     )
 
     succeeded = 0
@@ -3077,7 +3072,7 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
                 continue
 
             # 3/4) Never save the whole enriched record. Only changed stage ai_* fields.
-            logger.info(f"本次更新病历表内容{enriched.keys()}")
+            # logger.info(f"本次更新病历表内容{enriched.keys()}")
             updated_field_count = _update_mysql_stage_ai_fields(
                 item["mysql_record"],
                 item["before_record"],
@@ -3196,7 +3191,7 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
         reviewer_model=reviewer_model,
         enable_review=enable_review,
         filter_path=args.output_dir / FILTER_FILE_NAME,
-        stage_timeout=getattr(args, "timeout", 120.0),
+        stage_timeout=getattr(args, "timeout", DEFAULT_MODEL_TIMEOUT),
     )
     if args.reprocess or reprocess_selected:
         processed_ids, processed_order_sns = set(), set()
@@ -3579,7 +3574,7 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="每完成多少条病历输出一次后台进度日志，默认 10",
     )
-    parser.add_argument("--timeout", type=float, default=120.0, help="单次模型请求超时秒数")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_MODEL_TIMEOUT, help="单次模型请求超时秒数，默认 300 秒")
     parser.add_argument("--max-retries", type=int, default=2, help="模型请求重试次数")
     parser.add_argument(
         "--thinking",
