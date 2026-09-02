@@ -2627,7 +2627,9 @@ def export_mysql_records_to_local(args: argparse.Namespace) -> int:
     from medical.data_utils.db_manager import DBManager
 
     output_dir: Path = args.output_dir
-    filters = _mysql_record_filters(args)
+    doctor_ids_filter = {_text(doctor_id) for doctor_id in (args.doctor_id or []) if _text(doctor_id)}
+    status_filter = _text(getattr(args, "export_status", ""))
+    export_doctor_name = _text(getattr(args, "export_doctor_name", ""))
     export_file_name = _text(getattr(args, "export_file_name", "records.jsonl")) or "records.jsonl"
     if Path(export_file_name).name != export_file_name or export_file_name in {".", ".."}:
         raise ValueError("--export-file-name 只能是文件名，不能包含目录")
@@ -2638,15 +2640,23 @@ def export_mysql_records_to_local(args: argparse.Namespace) -> int:
         columns = _mysql_table_columns(manager, MYSQL_RECORD_TABLE)
         id_column = MYSQL_ID_COLUMN if MYSQL_ID_COLUMN in columns else "medical_record_id"
 
-        for required_column in filters:
-            if required_column not in columns:
+        filters: dict[str, Any] = {}
+        if doctor_ids_filter:
+            if "doctor_id" not in columns:
                 raise ValueError(
-                    f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 {required_column} 字段，无法按固定条件导出"
+                    f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 doctor_id 字段，无法按医生过滤导出"
                 )
+            filters["doctor_id"] = sorted(doctor_ids_filter)
+        if status_filter:
+            if "status" not in columns:
+                raise ValueError(
+                    f"MySQL 表 {MYSQL_RECORD_TABLE} 不存在 status 字段，无法按标注状态过滤导出"
+                )
+            filters["status"] = status_filter
 
         rows = manager.select(
             MYSQL_RECORD_TABLE,
-            filters=filters,
+            filters=filters or None,
             limit=limit if limit > 0 else None,
             order_by=["-id"] if id_column in columns else None,
         )
@@ -2671,8 +2681,12 @@ def export_mysql_records_to_local(args: argparse.Namespace) -> int:
         for row in rows:
             record = _mysql_row_to_record(row)
             doctor_id = _text(record.get("doctor_id")) or "unknown"
-            # SQL 已使用统一固定 filter；目录名直接使用记录中的医生姓名。
-            doctor_name = record.get("doctor_name")
+            # 再次校验筛选条件，避免自定义数据库适配器忽略 filters 后误导出数据。
+            if doctor_ids_filter and doctor_id not in doctor_ids_filter:
+                continue
+            if status_filter and _text(record.get("status")) != status_filter:
+                continue
+            doctor_name = export_doctor_name or record.get("doctor_name")
             file = get_doctor_file(doctor_id, doctor_name)
             _write_jsonl(file, record)
             count += 1
@@ -3608,6 +3622,16 @@ def parse_args() -> argparse.Namespace:
         "--export-mode",
         action="store_true",
         help="仅导出模式：将 MySQL 数据导出到本地 JSONL，不执行处理",
+    )
+    parser.add_argument(
+        "--export-status",
+        default="",
+        help="仅导出指定 status 的记录；例如 labeled。仅与 --export-mode 一起使用",
+    )
+    parser.add_argument(
+        "--export-doctor-name",
+        default="",
+        help="指定导出目录中的医生姓名，只用于文件命名，不参与查询过滤",
     )
     parser.add_argument(
         "--export-file-name",

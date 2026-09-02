@@ -82,7 +82,7 @@ PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" "${RUNNER[@]}" "${AGENT_S
   --doctor-id "${DOCTOR_ID}" \
   --export-status labeled \
   --export-doctor-name "${DOCTOR_NAME}" \
-  --export-file-name medical_records_ai_stage.jsonl \
+  --export-file-name medical_records_labeled.jsonl \
   --limit 0 \
   --output-dir "${OUTPUT_DIR}"
 
