@@ -194,3 +194,5 @@ AGENTS.md
 # sft data
 data/medical_consult_sharegpt.json
 data/wuweiping_prescription_sft_dataset.json
+!medical/data_utils/prompts/
+medical/eval_data
