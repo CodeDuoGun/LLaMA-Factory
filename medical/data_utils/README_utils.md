@@ -241,6 +241,23 @@ PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --yes
 
 可用 `--doctor-id 97 --doctor-id 43` 限制医生，或用 `--labeled-dir`、`--raw-dir` 覆盖默认数据目录。
 
+### `update_labeled_diagnosis_fields.py`
+
+读取 `data/labeled_records` 下的全部标注 JSONL，使用 `medical/analysis/engine.py` 中的三个归一化函数处理
+`ai_diagnosis_illness`、`ai_diagnosis_disease` 和 `ai_diagnosis_sickness`，按 `doctor_id + order_sn` 匹配
+标注表，并且只更新这三个字段，不加载 Excel 标准词表。先执行只读预检：
+
+```bash
+cd /Users/tangxueduo/Projects/LLaMA-Factory
+PYTHONPATH=. python medical/data_utils/update_labeled_diagnosis_fields.py --dry-run
+```
+
+确认无误后写入 MySQL：
+
+```bash
+PYTHONPATH=. python medical/data_utils/update_labeled_diagnosis_fields.py --yes
+```
+
 已有相同 `order_sn` 的记录会更新，不存在时新增。可为已有表增加带类型默认值的字段；例如新增
 `ai_treatment_principle VARCHAR(255) NOT NULL DEFAULT ''`：
 

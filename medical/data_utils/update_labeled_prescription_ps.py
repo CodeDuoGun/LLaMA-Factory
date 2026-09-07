@@ -310,6 +310,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """
+    PYTHONPATH=. conda run --no-capture-output -n llamafactory \
+  python medical/data_utils/update_labeled_prescription_ps.py \
+  --yes \
+  --batch-size 200
+
+  # 只处理某一个医生
+  PYTHONPATH=. conda run --no-capture-output -n llamafactory \
+  python medical/data_utils/update_labeled_prescription_ps.py \
+  --yes \
+  --batch-size 200 \
+  --doctor-id 97
+    """
     args = build_parser().parse_args()
     if not args.dry_run and not args.yes:
         raise SystemExit("默认不直接写库；预览请加 --dry-run，确认写入请加 --yes")

@@ -63,10 +63,6 @@ class LLMSettings:
             fallback_key = _config_value("DEEPSEEK_API_KEY")
             fallback_url = _config_value("DEEPSEEK_BASE_URL")
             fallback_model = _config_value("DEEPSEEK_MODEL", "deepseek-v3")
-        elif provider == "baichuan":
-            fallback_key = _config_value("BAICHUAN_API_KEY")
-            fallback_url = _config_value("BAICHUAN_BASE_URL")
-            fallback_model = _config_value("BAICHUAN_TEXT_MODEL")
         else:
             fallback_key = _config_value("ARK_API_KEY")
             fallback_url = _config_value("ARK_API_URL") or _config_value("ARK_BASE_URL")

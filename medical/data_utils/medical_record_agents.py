@@ -3449,7 +3449,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--diagnosis-model",
         default=_env_any(
-            ("MEDICAL_AGENT_DIAGNOSIS_MODEL", "DEEPSEEK_TEXT_MODEL", "BAICHUAN_TEXT_MODEL"),
+            ("MEDICAL_AGENT_DIAGNOSIS_MODEL", "DEEPSEEK_TEXT_MODEL"),
             "Baichuan4-Turbo",
         ),
         help="诊断补全模型，默认使用独立诊断模型配置",
@@ -3457,14 +3457,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--diagnosis-base-url",
         default=_env_any(
-            ("MEDICAL_AGENT_DIAGNOSIS_BASE_URL", "DEEPSEEK_BASE_URL", "BAICHUAN_BASE_URL"),
-            "https://api.baichuan-ai.com/v1/",
+            ("MEDICAL_AGENT_DIAGNOSIS_BASE_URL", "DEEPSEEK_BASE_URL"),
         ),
         help="诊断补全模型的 OpenAI 兼容接口地址",
     )
     parser.add_argument(
         "--diagnosis-api-key",
-        default=_env_any(("MEDICAL_AGENT_DIAGNOSIS_API_KEY", "DEEPSEEK_API_KEY", "BAICHUAN_API_KEY")),
+        default=_env_any(("MEDICAL_AGENT_DIAGNOSIS_API_KEY", "DEEPSEEK_API_KEY")),
         help="诊断补全模型 API Key",
     )
     parser.add_argument("--vlm-model", default=_env("MEDICAL_AGENT_VLM_MODEL"), help="视觉模型，默认同文本模型")

@@ -703,13 +703,6 @@ def create_llm_call(model: str):
         )
         model = config.DEEPSEEK_MODEL
 
-    elif provider == "baichuan":
-        client = OpenAI(
-            api_key=config.BAICHUAN_API_KEY,
-            base_url=config.BAICHUAN_BASE_URL,
-        )
-        model = config.BAICHUAN_TEXT_MODEL
-
     elif provider == "ark":
         client = OpenAI(
             api_key=config.ARK_API_KEY,

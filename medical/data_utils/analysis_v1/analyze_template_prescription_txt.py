@@ -296,10 +296,6 @@ def create_llm_call(
             selected_base_url = selected_base_url or _config_value("DEEPSEEK_BASE_URL")
             selected_api_key = selected_api_key or _config_value("DEEPSEEK_API_KEY")
             selected_model = selected_model or _config_value("DEEPSEEK_MODEL")
-        elif provider == "baichuan":
-            selected_base_url = selected_base_url or _config_value("BAICHUAN_BASE_URL")
-            selected_api_key = selected_api_key or _config_value("BAICHUAN_API_KEY")
-            selected_model = selected_model or _config_value("BAICHUAN_TEXT_MODEL")
         else:
             selected_base_url = selected_base_url or _config_value("ARK_BASE_URL")
             selected_api_key = selected_api_key or _config_value("ARK_API_KEY")
