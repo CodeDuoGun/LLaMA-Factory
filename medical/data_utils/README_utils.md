@@ -222,6 +222,25 @@ python medical/data_utils/import_ai_medical_records.py inquiry <order_sn>
 python medical/data_utils/import_ai_medical_records.py record 1001
 ```
 
+### `update_labeled_prescription_ps.py`
+
+使用 `data/labeled_records` 中的标注记录作为更新白名单，按 `doctor_id + order_sn` 找到
+`medical/data/202301_online` 中的原始病历，调用 `ai_medical_records.py` 的 `format_ps` 重新处理原始
+处方，并且只更新 `mlops_annotation_medical_record.ps` 字段。默认先执行只读预检：
+
+```bash
+cd /Users/tangxueduo/Projects/LLaMA-Factory
+PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --dry-run
+```
+
+确认匹配无误后写入 MySQL：
+
+```bash
+PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --yes
+```
+
+可用 `--doctor-id 97 --doctor-id 43` 限制医生，或用 `--labeled-dir`、`--raw-dir` 覆盖默认数据目录。
+
 已有相同 `order_sn` 的记录会更新，不存在时新增。可为已有表增加带类型默认值的字段；例如新增
 `ai_treatment_principle VARCHAR(255) NOT NULL DEFAULT ''`：
 

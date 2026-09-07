@@ -137,7 +137,10 @@ DIAGNOSIS_TERM_ALIASES = {
     "胆汁返流型胃炎": "胆汁反流性胃炎",
     "返流胃炎": "反流性胃炎",
     "返流性胃炎": "反流性胃炎",
+    "焦虑症": "焦虑状态"
 }
+
+# “中医证候名称别名映射表”，用于把不同写法统一成一个标准证候名称。
 SYNDROME_TERM_ALIASES = {
     "湿毒蕴肤症": "湿毒蕴肤证",
     "血热瘀滞症": "血热瘀滞证",
@@ -145,7 +148,8 @@ SYNDROME_TERM_ALIASES = {
     "脾肺两虚": "脾肺两虚证",
     "肺脾两虚证": "脾肺两虚证",
     "肺脾两虚": "脾肺两虚证",
-    "痰瘀互结9": "痰瘀互结"
+    "痰瘀互结9": "痰瘀互结",
+    "肺脾气虚证": "脾肺气虚证"
 
 }
 SICKNESS_TERM_ALIASES = {
@@ -165,7 +169,8 @@ SICKNESS_TERM_ALIASES = {
     "喘病": "喘病",
     "肺胀病": "肺胀",
     "喉痹病": "喉痹",
-    "肺结节": "积聚类病",
+    "肺结节": "肺积",
+    "肺积病":"肺积",
     "癌": "癌类病",
     "癌病类": "癌类病",
     "癌变病": "癌类病",
@@ -187,6 +192,7 @@ SICKNESS_TERM_ALIASES = {
     "胃脘痛": "胃痛",
     "鼓胀": "臌胀病",
 }
+# 用来定义“没有分隔符、但实际包含多个诊断/证候”的已知词组。"痰瘀阻肺证肝气郁结证" 会拆成：["痰瘀阻肺证", "肝气郁结证"] 然后最终归一化为：痰瘀阻肺证、肝气郁结证
 COMPOUND_DIAGNOSIS_TERMS = (
     "痰瘀阻肺证",
     "肝气郁结证",
@@ -302,6 +308,7 @@ def normalize_syndrome_value(value: Any) -> str:
                 syndrome = _normalize_diagnosis_part(item, SYNDROME_TERM_ALIASES)
                 if syndrome in EMPTY_SYNDROME_PLACEHOLDERS:
                     continue
+                
                 if (
                     syndrome
                     and syndrome not in UNSPECIFIED_SYNDROMES

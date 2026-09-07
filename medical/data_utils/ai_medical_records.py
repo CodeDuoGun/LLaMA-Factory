@@ -456,7 +456,7 @@ def format_drugs(drugs: list[dict[str, Any]], usage_type: str) -> list[dict[str,
         if usage_type not in ("西药","保健品", "中成药", "经验方"):
             result.append(
                 {
-                    "drug_name": drug.get("drug_name",""), 
+                    "drug_name": drug.get("drug_name","") or drug.get("sub_drug_name", "") or drug.get("show_name", ""), 
                     "drug_num": drug.get("drug_num", 0), 
                     "unit": drug.get("unit_name", ""), 
                     "max_use": drug.get("max_use", ""), 
@@ -465,7 +465,7 @@ def format_drugs(drugs: list[dict[str, Any]], usage_type: str) -> list[dict[str,
             )
         else:
             result.append({
-                "drug_name": drug.get("drug_name", ""),
+                "drug_name": drug.get("drug_name", "") or drug.get("sub_drug_name", "") or drug.get("show_name", ""),
                 "drug_num": drug.get("spec_number",1) * drug.get("drug_num", 0), # 规格转化系数
                 "unit": "g", 
                 "max_use": drug.get("max_use", ""),

@@ -15,16 +15,6 @@
 
 """使用 LangChain 对多医生病历进行结构化 AI 补全和清洗.
 
-默认遍历 ``medical/data/202301_online/`` 下所有医生的 JSON 数据，也支持传入单个
-JSON/JSONL 文件。
-原始字段不会被覆盖，所有模型生成结果均写入 ``ai_`` 前缀字段。
-处理结果按医生增量追加到 ``medical/processed_data/``；成功记录再次运行时自动跳过，
-失败记录写入独立 JSONL 并在后续运行中重试。
-
-示例:
-    python medical/data_utils/medical_record_agents.py \
-        --model gpt-4.1-mini \
-        --vlm-model gpt-4.1-mini
 """
 
 # ruff: noqa: E402, I001
@@ -126,12 +116,7 @@ STAGE_NAMES = (
     "clinical_extraction",
     "diagnosis_normalization",
 )
-IMAGE_CLEANING_STAGES = (
-    "image_classification",
-    "inspection_vlm",
-    "tongue_face_vlm",
-    "clinical_cleaning",
-)
+
 HISTORY_FIELDS = (
     "old_medical_history",
     "allergic_history",
@@ -1424,13 +1409,13 @@ class MedicalRecordAgents:
                     f"原始病史：{_json_for_prompt(histories)}\n"
                     f"医生书写的舌象及面相 admin_face_describe：{_text(record.get('admin_face_describe')) or '未记录'}\n"
                     f"生育史 birth_detail：{_text(record.get('birth_detail')) or '未记录'}\n"
-                    f"婚恋史 is_marriage_history（统一映射为 marriage_history）："
+                    f"婚姻史 marriage_history："
                     f"{histories['marriage_history'] or '未记录'}\n"
                     f"西医诊断 diagnosis_illness：{_text(record.get('diagnosis_illness')) or '未记录'}\n"
                     f"中医证型 diagnosis_disease：{_text(record.get('diagnosis_disease')) or '未记录'}\n"
                     f"中医诊断 diagnosis_sickness：{_text(record.get('diagnosis_sickness')) or '未记录'}\n"
-                    f"检查报告图片分析：\n{inspection_description}\n"
-                    f"舌面患处图片分析：\n{tongue_face_description}"
+                    f"检查报告分析结果：\n{inspection_description}\n"
+                    f"舌面患处分析结果：\n{tongue_face_description}"
                 )
             ),
             HistoryCleaningResult,
@@ -2516,7 +2501,7 @@ def _mysql_record_filters(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "doctor_id": doctor_ids,
-        "status": ["unprocessed", "problem"],
+        "status": ["problem"],
     }
 
 
