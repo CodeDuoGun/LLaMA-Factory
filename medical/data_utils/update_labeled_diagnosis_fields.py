@@ -225,6 +225,18 @@ def update_database(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """
+    PYTHONPATH=. conda run --no-capture-output -n llamafactory \
+  python medical/data_utils/update_labeled_diagnosis_fields.py \
+  --yes
+
+    # 只更新某一个医生
+    PYTHONPATH=. conda run --no-capture-output -n llamafactory \
+  python medical/data_utils/update_labeled_diagnosis_fields.py \
+  --doctor-id 567 \
+  --batch-size 500 \
+  --yes 
+    """
     parser = argparse.ArgumentParser(description="归一化标注表中的三个 AI 诊断字段")
     parser.add_argument("--labeled-dir", type=Path, default=DEFAULT_LABELED_DIR)
     parser.add_argument("--table-name", default=DEFAULT_TABLE_NAME)

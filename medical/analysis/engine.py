@@ -221,7 +221,10 @@ def _normalize_diagnosis_part(value: str, aliases: dict[str, str]) -> str:
     part = re.sub(r"\s+", "", value).strip(".。·•?？")
     if part in EMPTY_DIAGNOSIS_PLACEHOLDERS or _is_symbol_only(part):
         return ""
-    return aliases.get(part, part)
+    normalized = aliases.get(part, part)
+    if aliases is SYNDROME_TERM_ALIASES and normalized != part:
+        print(f"SYNDROME_TERM_ALIASES 替换：{part} -> {normalized}")
+    return normalized
 
 
 def _split_compound_diagnosis_part(value: str, aliases: dict[str, str]) -> list[str]:
@@ -261,45 +264,58 @@ def _is_chinese_text(value: str) -> bool:
 
 def normalize_diagnosis_value(value: Any) -> str:
     """Normalize multi-item diagnosis fields without merging distinct concepts."""
+    # 步骤 1：过滤结构化占位值，以及不包含中文的无效输入。
     if _is_structured_diagnosis_placeholder(value):
         return ""
     text = _clean(value)
     if not text or not CHINESE_CHARACTER_PATTERN.search(text):
         return ""
+
+    # 步骤 2：按诊断分隔符拆分，并展开、规范化每个诊断项。
     parts = []
     for part in re.split(DIAGNOSIS_SEPARATOR_PATTERN, text):
         parts.extend(_split_compound_diagnosis_part(part, DIAGNOSIS_TERM_ALIASES))
     if not parts:
         return ""
+
+    # 步骤 3：去重并排序，使用统一分隔符拼接结果。
     return "、".join(sorted(set(parts)))
 
 
 def normalize_sickness_value(value: Any) -> str:
     """Normalize TCM disease names without applying western diagnosis aliases."""
+    # 步骤 1：过滤结构化占位值，以及不包含中文的无效输入。
     if _is_structured_diagnosis_placeholder(value):
         return ""
     text = _clean(value)
     if not text or not CHINESE_CHARACTER_PATTERN.search(text):
         return ""
+
+    # 步骤 2：按诊断分隔符拆分，并使用中医疾病别名规范化每个疾病项。
     parts = []
     for part in re.split(DIAGNOSIS_SEPARATOR_PATTERN, text):
         parts.extend(_split_compound_diagnosis_part(part, SICKNESS_TERM_ALIASES))
     if not parts:
         return ""
+
+    # 步骤 3：去重并排序，使用统一分隔符拼接结果。
     return "、".join(sorted(set(parts)))
 
 
 def normalize_syndrome_value(value: Any) -> str:
     """Normalize syndrome suffixes, separators, duplicates, and item order."""
+    # 步骤 1：过滤结构化占位值，以及不包含中文的无效输入。
     if _is_structured_diagnosis_placeholder(value):
         return ""
     text = _clean(value)
     if not text or not CHINESE_CHARACTER_PATTERN.search(text):
         return ""
+
+    # 步骤 2：过滤空证候占位值。
     if text in EMPTY_SYNDROME_PLACEHOLDERS:
         return ""
-    # 如果字段没有中文符号，返回空
 
+    # 步骤 3：按诊断分隔符和“证”字边界拆分复合证候，并统一别名。
     syndromes = []
     for part in re.split(DIAGNOSIS_SEPARATOR_PATTERN, text):
         for compound_part in _split_compound_diagnosis_part(part, SYNDROME_TERM_ALIASES):
@@ -308,7 +324,8 @@ def normalize_syndrome_value(value: Any) -> str:
                 syndrome = _normalize_diagnosis_part(item, SYNDROME_TERM_ALIASES)
                 if syndrome in EMPTY_SYNDROME_PLACEHOLDERS:
                     continue
-                
+
+                # 步骤 4：为有效的纯中文证候补全“证”后缀，保留无需补全的特殊值。
                 if (
                     syndrome
                     and syndrome not in UNSPECIFIED_SYNDROMES
@@ -318,6 +335,8 @@ def normalize_syndrome_value(value: Any) -> str:
                     syndrome = f"{syndrome}证"
                 if syndrome:
                     syndromes.append(syndrome)
+
+    # 步骤 5：去重并排序，使用统一分隔符拼接结果。
     return "、".join(sorted(set(syndromes)))
 
 
