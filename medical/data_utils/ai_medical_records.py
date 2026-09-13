@@ -460,7 +460,8 @@ def format_drugs(drugs: list[dict[str, Any]], usage_type: str) -> list[dict[str,
                     "drug_num": drug.get("drug_num", 0), 
                     "unit": drug.get("unit_name", ""), 
                     "max_use": drug.get("max_use", ""), 
-                    "min_use": drug.get("min_use", "")
+                    "min_use": drug.get("min_use", ""),
+                    "decoction_name": drug.get("decoction_name", ""),
                 },
             )
         else:
@@ -470,6 +471,7 @@ def format_drugs(drugs: list[dict[str, Any]], usage_type: str) -> list[dict[str,
                 "unit": "g", 
                 "max_use": drug.get("max_use", ""),
                 "min_use": drug.get("min_use", ""),
+                "decoction_name": drug.get("decoction_name", ""),
             })
     return result
 
