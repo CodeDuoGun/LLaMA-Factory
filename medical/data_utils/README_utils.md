@@ -143,6 +143,23 @@ CONDA_ENV=llama_factory BATCH_SIZE=2 LIMIT_PER_DOCTOR=4000 \
 bash medical/data_utils/run_failed_six_doctors.sh
 ```
 
+### `export_labeled_six_doctors.sh`
+
+按固定的六位医生列表批量从 MySQL 导出 `labeled` 病例标注数据。默认输出到
+`/Users/tangxueduo/Projects/tcm-disease-gateway/data/labeled_records`，每位医生开始导出前删除其旧的
+`medical_records_labeled.jsonl`，再写入新文件：
+
+```bash
+bash medical/data_utils/export_labeled_six_doctors.sh
+```
+
+也可以指定输出目录。设置 `DELETE_OLD=0` 可跳过导出前的预删除（有导出结果时程序仍会替换目标文件）：
+
+```bash
+bash medical/data_utils/export_labeled_six_doctors.sh /path/to/labeled_records
+DELETE_OLD=0 bash medical/data_utils/export_labeled_six_doctors.sh
+```
+
 ## 诊断标签离线归一化
 
 ### `normalize_ai_diagnosis_labels.py`

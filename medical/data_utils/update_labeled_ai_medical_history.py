@@ -213,7 +213,7 @@ def main() -> None:
     """Validate labeled records and optionally update the annotation table."""
     args = build_parser().parse_args()
     """
-    python medical/data_utils/update_labeled_ai_medical_history.py --yes --doctor-id 43 --batch-size 200
+    python medical/data_utils/update_labeled_ai_medical_history.py --yes --batch-size 200
     """
     if not args.dry_run and not args.yes:
         raise SystemExit("默认不直接写库；预览请加 --dry-run，确认写入请加 --yes")
