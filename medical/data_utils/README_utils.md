@@ -241,22 +241,89 @@ python medical/data_utils/import_ai_medical_records.py record 1001
 
 ### `update_labeled_prescription_ps.py`
 
-使用 `data/labeled_records` 中的标注记录作为更新白名单，按 `doctor_id + order_sn` 找到
-`medical/data/202301_online` 中的原始病历，调用 `ai_medical_records.py` 的 `format_ps` 重新处理原始
-处方，并且只更新 `mlops_annotation_medical_record.ps` 字段。默认先执行只读预检：
+该脚本用于修正标注表中的处方字段 `ps`。它不会使用标注 JSONL 中已有的 `ps` 值，而是按标注记录筛选出
+需要更新的病例，再从原始病历目录读取同一病例的原始处方，调用
+`medical.data_utils.ai_medical_records.format_ps` 统一格式后写入数据库。
+
+#### 处理流程
+
+1. 只递归读取 `--labeled-dir` 下文件名为 `medical_records_labeled.jsonl` 的文件，建立更新白名单。
+2. 递归读取 `--raw-dir` 下所有 `.json` 和 `.jsonl` 文件，按 `doctor_id + order_sn` 找到原始处方。
+3. 对原始 `ps` 调用 `format_ps`，统一处方层级字段和药品明细字段。
+4. 预检数据库表是否存在 `doctor_id`、`order_sn`、`ps`，并确认每个待更新键都能匹配到且没有重复。
+5. 预检全部通过后，按 `--batch-size` 分批事务更新；数据库中只修改 `ps` 列，不新增记录、不修改其他列。
+
+`format_ps` 支持饮片、颗粒、膏方、丸剂、粉剂、浓缩丸、糊丸、经验方以及西药/中成药/保健品等
+处方类型；不支持的 `drug_process_name` 或缺少合法 `ps` 数组会直接报错。空处方会格式化为空数组。
+
+#### 默认路径和匹配规则
+
+- 标注目录：`/Users/tangxueduo/Projects/tcm-disease-gateway/data/labeled_records`
+- 原始目录：`medical/data/202301_online`，递归处理其中所有 `.json` 和 `.jsonl` 文件
+- 数据表：`mlops_annotation_medical_record`
+- 匹配键：`doctor_id + order_sn`；`order_sn` 相同但医生不同也不会混用。
+
+标注目录只递归查找 `medical_records_labeled.jsonl`，其他 JSON/JSONL 文件会被忽略；原始目录则递归读取所有
+JSON/JSONL 文件。如果标注目录中存在多个同名文件且包含相同 `doctor_id/order_sn`，脚本仍会报重复键并终止。
+
+#### 使用方式
+
+脚本默认不写数据库，必须显式选择 `--dry-run` 或 `--yes`。建议先做只读预检：
 
 ```bash
 cd /Users/tangxueduo/Projects/LLaMA-Factory
 PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --dry-run
 ```
 
-确认匹配无误后写入 MySQL：
+确认预检通过后，写入全部医生：
 
 ```bash
 PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --yes
 ```
 
-可用 `--doctor-id 97 --doctor-id 43` 限制医生，或用 `--labeled-dir`、`--raw-dir` 覆盖默认数据目录。
+只处理一个医生或多个指定医生时，重复传入 `--doctor-id`：
+
+```bash
+PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py \
+  --dry-run --doctor-id 567
+
+PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py \
+  --yes --doctor-id 567 --doctor-id 43
+```
+
+覆盖输入目录、表名或调整批量大小：
+
+```bash
+PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py \
+  --dry-run \
+  --labeled-dir /path/to/labeled_records \
+  --raw-dir /path/to/202301_online \
+  --table-name mlops_annotation_medical_record \
+  --batch-size 200
+```
+
+#### 参数说明
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--labeled-dir` | `/Users/tangxueduo/Projects/tcm-disease-gateway/data/labeled_records` | 更新白名单目录，只递归读取 `medical_records_labeled.jsonl` |
+| `--raw-dir` | `medical/data/202301_online` | 原始病历目录，递归读取所有 JSON/JSONL |
+| `--table-name` | `mlops_annotation_medical_record` | 要更新的数据库表 |
+| `--doctor-id` | 全部医生 | 医生 ID，可重复传入多个 |
+| `--batch-size` | `100` | 预检查询和写入的批大小，必须大于 0 |
+| `--dry-run` | 关闭 | 只解析、匹配、格式化和预检，不写数据库 |
+| `--yes` | 关闭 | 确认执行数据库写入；与 `--dry-run` 同时传入时以预检为准 |
+
+#### 常见报错
+
+- `标注数据存在重复 ...`：标注目录递归扫描到了同一病例的多个文件或重复行。
+- `原始数据中找不到对应记录`：原始目录缺少白名单中的 `doctor_id/order_sn`。
+- `原始数据 ... 的 ps 不是数组`：原始病历的处方字段不是列表。
+- `格式化处方失败` 或 `不支持的药品类型`：处方结构不符合 `format_ps` 支持的格式。
+- `数据表中找不到对应记录`：数据库中没有对应标注行；脚本不会自动插入缺失行。
+
+脚本完成后会输出“尝试更新条数”和“数据库实际变更条数”。`--dry-run` 不会产生任何数据库写入，
+但仍需要可连接数据库，以便完成表结构和目标行预检。
 
 ### `update_labeled_diagnosis_fields.py`
 

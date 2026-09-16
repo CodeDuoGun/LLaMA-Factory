@@ -14,8 +14,9 @@
 
 """用原始病历处方重新格式化并更新 MySQL 标注表的 ``ps`` 字段.
 
-标注记录和原始记录通过 ``doctor_id + order_sn`` 对齐。标注文件只作为更新
-白名单，处方内容始终取自原始病历的 ``ps``，并复用
+标注记录和原始记录通过 ``doctor_id + order_sn`` 对齐。标注目录只读取文件名为
+``medical_records_labeled.jsonl`` 的文件作为更新白名单；原始目录递归读取所有
+JSON/JSONL 文件。处方内容始终取自原始病历的 ``ps``，并复用
 ``medical.data_utils.ai_medical_records.format_ps`` 进行格式化。
 """
 
@@ -37,6 +38,7 @@ from medical.data_utils.db_manager import DBManager
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LABELED_DIR = Path("/Users/tangxueduo/Projects/tcm-disease-gateway/data/labeled_records")
 DEFAULT_RAW_DIR = PROJECT_ROOT / "medical/data/202301_online"
+LABELED_RECORD_FILE_NAME = "medical_records_labeled.jsonl"
 
 
 RecordKey = tuple[str, str]
@@ -120,18 +122,21 @@ def _iter_json_records(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
         yield position, record
 
 
-def _data_files(root: Path) -> list[Path]:
+def _data_files(root: Path, *, file_name: str | None = None) -> list[Path]:
+    """Recursively find JSON data files, optionally matching an exact filename."""
     if not root.is_dir():
         raise FileNotFoundError(f"数据目录不存在: {root}")
+    if file_name is not None:
+        return sorted(path for path in root.rglob("*") if path.is_file() and path.name == file_name)
     return sorted(path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in {".json", ".jsonl"})
 
 
 def load_labeled_records(root: Path, doctor_ids: set[str] | None = None) -> dict[RecordKey, LabeledRecord]:
-    """Load the labeled-record whitelist keyed by ``doctor_id + order_sn``."""
+    """Load recursive ``medical_records_labeled.jsonl`` files as the update whitelist."""
     records: dict[RecordKey, LabeledRecord] = {}
-    files = _data_files(root)
+    files = _data_files(root, file_name=LABELED_RECORD_FILE_NAME)
     if not files:
-        raise FileNotFoundError(f"标注目录中没有 JSON/JSONL 文件: {root}")
+        raise FileNotFoundError(f"标注目录中没有 {LABELED_RECORD_FILE_NAME}: {root}")
 
     for path in files:
         for line_number, record in _iter_json_records(path):
@@ -310,18 +315,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """
-    PYTHONPATH=. conda run --no-capture-output -n llamafactory \
-  python medical/data_utils/update_labeled_prescription_ps.py \
-  --yes \
-  --batch-size 200
+    """解析数据、完成数据库预检，并按需更新标注表的 ps 字段.
 
-  # 只处理某一个医生
-  PYTHONPATH=. conda run --no-capture-output -n llamafactory \
-  python medical/data_utils/update_labeled_prescription_ps.py \
-  --yes \
-  --batch-size 200 \
-  --doctor-id 97
+    示例::
+
+        PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --dry-run
+        PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --yes --batch-size 200
+        PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --yes --doctor-id 567
     """
     args = build_parser().parse_args()
     if not args.dry_run and not args.yes:

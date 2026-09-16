@@ -452,7 +452,7 @@ def format_drugs(drugs: list[dict[str, Any]], usage_type: str) -> list[dict[str,
         # if not isinstance(drug, dict):
             # print(f"drug: {drugs}")
             # import pdb; pdb.set_trace()
-        # 不在这些类别中的药，不需要进行单位转化
+        # 不在这些类别中的药，需要进行单位转化
         if usage_type not in ("西药","保健品", "中成药", "经验方"):
             result.append(
                 {
@@ -498,10 +498,16 @@ def format_ps(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # 解析经验方结构
         elif p.get("drug_process_name") == "经验方":
             format_p["usage_desc"] = p.get("prescription_items", {}).get("drugList", [])[-1].get("use_limit_text", "")
-            drugs = p.get("prescription_items", {}).get("drugList", [])[-1].get("formula", [])
-            if "drugList" in drugs:
-                drugs = drugs["drugList"]
-            format_p["drugs"] = format_drugs(drugs, usage_type)
+            # 经验方只给出经验方的名字，不给出具体药物明细
+            drugs = p.get("prescription_items", {}).get("drugList", [])[-1]
+            format_p["drugs"] = {
+                "drug_name": drugs.get("sub_drug_name", ""),
+                "drug_num": drugs.get("drug_num", 0),
+                "unit": drugs.get("unit_name", ""),
+                "max_use": drugs.get("max_use", ""), 
+                "min_use": drugs.get("min_use", ""),
+                "decoction_name": drugs.get("decoction_name", ""),
+            }
         # 解析饮片颗粒结构
         elif p.get("drug_process_name") in ("颗粒", "饮片","膏方", "蜜丸","水蜜丸","粉剂","浓缩丸","水丸","糊丸", "小蜜丸"):
             format_p["usage_desc"] = p.get("usage_desc", "")
