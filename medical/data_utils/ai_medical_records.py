@@ -489,7 +489,7 @@ def format_ps(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "drug_process_name": p.get("drug_process_name", ""),
             "dosage": p.get("dosage", ""),
             "doctor_advice": p.get("doctor_advice", ""),
-            "produce_merchant": p.get("prescription_items", {}).get("drugList", [])[-1].get("produce_merchant", "")
+            "produce_merchant": p.get("drugstore_name", "")
         }
         # 解析西药结构
         if p.get("drug_process_name") in ("西药","保健品", "中成药"):
@@ -500,14 +500,14 @@ def format_ps(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
             format_p["usage_desc"] = p.get("prescription_items", {}).get("drugList", [])[-1].get("use_limit_text", "")
             # 经验方只给出经验方的名字，不给出具体药物明细
             drugs = p.get("prescription_items", {}).get("drugList", [])[-1]
-            format_p["drugs"] = {
+            format_p["drugs"] = [{
                 "drug_name": drugs.get("sub_drug_name", ""),
                 "drug_num": drugs.get("drug_num", 0),
                 "unit": drugs.get("unit_name", ""),
                 "max_use": drugs.get("max_use", ""), 
                 "min_use": drugs.get("min_use", ""),
                 "decoction_name": drugs.get("decoction_name", ""),
-            }
+            }]
         # 解析饮片颗粒结构
         elif p.get("drug_process_name") in ("颗粒", "饮片","膏方", "蜜丸","水蜜丸","粉剂","浓缩丸","水丸","糊丸", "小蜜丸"):
             format_p["usage_desc"] = p.get("usage_desc", "")

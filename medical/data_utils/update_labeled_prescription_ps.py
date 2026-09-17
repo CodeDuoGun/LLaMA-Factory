@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -297,6 +298,72 @@ def update_database(
     return attempted, changed
 
 
+def update_labeled_files(updates: list[PrescriptionUpdate]) -> tuple[int, int]:
+    """数据库写入成功后，将格式化后的 ``ps`` 原子写回标注 JSONL 文件。"""
+    updates_by_path: dict[Path, dict[RecordKey, list[dict[str, Any]]]] = {}
+    for item in updates:
+        updates_by_path.setdefault(item.labeled_path, {})[item.key] = item.ps
+
+    updated_files = 0
+    updated_records = 0
+    for path, path_updates in updates_by_path.items():
+        temporary_path: Path | None = None
+        seen_keys: set[RecordKey] = set()
+        try:
+            with path.open("r", encoding="utf-8", newline="") as source:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    newline="",
+                    dir=path.parent,
+                    prefix=f".{path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as target:
+                    temporary_path = Path(target.name)
+                    for line_number, line in enumerate(source, start=1):
+                        if not line.strip():
+                            target.write(line)
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(
+                                f"{path} 第 {line_number} 行不是合法 JSON: {exc}"
+                            ) from exc
+                        if not isinstance(record, dict):
+                            raise ValueError(f"{path} 第 {line_number} 行必须是 JSON 对象")
+
+                        key = _record_key(record, path=path, position=line_number)
+                        ps = path_updates.get(key)
+                        if ps is None:
+                            target.write(line)
+                            continue
+
+                        record["ps"] = ps
+                        json.dump(record, target, ensure_ascii=False, separators=(",", ":"))
+                        target.write("\r\n" if line.endswith("\r\n") else "\n")
+                        seen_keys.add(key)
+                        updated_records += 1
+
+            missing = set(path_updates) - seen_keys
+            if missing:
+                preview = ", ".join(
+                    f"{doctor_id}/{order_sn}"
+                    for doctor_id, order_sn in sorted(missing)[:20]
+                )
+                raise ValueError(f"本地文件 {path} 找不到待更新记录: {preview}")
+
+            temporary_path.replace(path)
+            temporary_path = None
+            updated_files += 1
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
+
+    return updated_files, updated_records
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="用原始病历处方格式更新标注表的 ps 字段")
     parser.add_argument("--labeled-dir", type=Path, default=DEFAULT_LABELED_DIR)
@@ -321,7 +388,7 @@ def main() -> None:
 
         PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --dry-run
         PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --yes --batch-size 200
-        PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --yes --doctor-id 567
+        PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --yes --doctor-id 97
     """
     args = build_parser().parse_args()
     if not args.dry_run and not args.yes:
@@ -354,7 +421,9 @@ def main() -> None:
     finally:
         manager.close()
 
+    updated_files, updated_records = update_labeled_files(updates)
     print(f"写入完成：尝试 {attempted} 条，数据库实际变更 {changed} 条；仅更新 ps 字段")
+    print(f"本地文件更新完成：{updated_files} 个文件，{updated_records} 条记录")
 
 
 if __name__ == "__main__":
