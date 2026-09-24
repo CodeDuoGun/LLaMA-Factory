@@ -388,7 +388,7 @@ def main() -> None:
 
         PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --dry-run
         PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --yes --batch-size 200
-        PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --yes --doctor-id 97
+        PYTHONPATH=. python medical/data_utils/update_labeled_prescription_ps.py --yes --doctor-id 432
     """
     args = build_parser().parse_args()
     if not args.dry_run and not args.yes:

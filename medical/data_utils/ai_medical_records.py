@@ -464,7 +464,7 @@ def format_drugs(drugs: list[dict[str, Any]], usage_type: str) -> list[dict[str,
             # 不在这些类别中的药，需要进行单位转化
             result.append({
                 "drug_name": drug.get("drug_name", "") or drug.get("sub_drug_name", "") or drug.get("show_name", ""),
-                "drug_num": drug.get("spec_number",1) * drug.get("drug_num", 0), # 规格转化系数
+                "drug_num": float(drug.get("spec_number",1)) * int(drug.get("drug_num", 0)), # 规格转化系数
                 "unit_name": "g", 
                 "max_use": drug.get("max_use", ""),
                 "min_use": drug.get("min_use", ""),
