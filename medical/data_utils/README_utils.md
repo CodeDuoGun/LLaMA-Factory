@@ -369,6 +369,32 @@ python medical/data_utils/import_one_ai_medical_record.py --input <medical_recor
 python medical/data_utils/import_one_ai_medical_record.py --input <medical_records_ai.jsonl> --line-number 1
 ```
 
+### `update_labeled_treatment_principle.py`
+
+将朱子奇（`doctor_id=43`）标注文件中的治疗原则写入标注病历表的
+`ai_treatment_principle` 字段。脚本默认读取：
+
+`/Users/tangxueduo/Projects/tcm-disease-gateway/data/labeled_records/doctor_43_朱子奇/medical_records_labeled.jsonl`
+
+标注文件与数据库按 `doctor_id + order_sn` 匹配，只更新治疗原则字段 `ai_treatment_principle`，不修改其他列。
+
+先执行只读预检：
+
+```bash
+cd /Users/tangxueduo/Projects/LLaMA-Factory
+PYTHONPATH=. python medical/data_utils/update_labeled_treatment_principle.py --dry-run
+```
+
+确认预检通过后写入：
+
+```bash
+PYTHONPATH=. python medical/data_utils/update_labeled_treatment_principle.py \
+  --yes --batch-size 200
+```
+
+如需更换输入文件，可传 `--labeled-file /path/to/medical_records_labeled.jsonl`；脚本默认不写数据库，必须显式传入
+`--dry-run` 或 `--yes`。
+
 ## 格式化与基础组件
 
 | 文件 | 作用 |

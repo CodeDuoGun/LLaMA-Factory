@@ -92,6 +92,12 @@ def _print_json(value: Any) -> None:
 def main() -> None:
     """运行导入或查询命令."""
     args = build_parser().parse_args()
+    """
+    批量写入某医生数据到
+    PYTHONPATH=. python -m app.medical.import_ai_medical_records import \
+  --input app/medical/processed_data/doctor_43_朱子奇/medical_records_ai.jsonl \
+  --batch-size 100
+    """
     repository = AIMedicalRecordRepository(
         db_manager,
         table_name=args.table_name,

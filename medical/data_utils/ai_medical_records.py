@@ -449,26 +449,23 @@ def format_drugs(drugs: list[dict[str, Any]], usage_type: str) -> list[dict[str,
     result = []
     
     for drug in drugs:
-        # if not isinstance(drug, dict):
-            # print(f"drug: {drugs}")
-            # import pdb; pdb.set_trace()
-        # 不在这些类别中的药，需要进行单位转化
-        if usage_type not in ("西药","保健品", "中成药", "经验方"):
+        if usage_type in ("西药","保健品", "中成药", "经验方"):
             result.append(
                 {
                     "drug_name": drug.get("drug_name","") or drug.get("sub_drug_name", "") or drug.get("show_name", ""), 
                     "drug_num": drug.get("drug_num", 0), 
-                    "unit": drug.get("unit_name", ""), 
+                    "unit_name": drug.get("unit_name", "") or drug.get("unit",""), 
                     "max_use": drug.get("max_use", ""), 
                     "min_use": drug.get("min_use", ""),
                     "decoction_name": drug.get("decoction_name", ""),
                 },
             )
         else:
+            # 不在这些类别中的药，需要进行单位转化
             result.append({
                 "drug_name": drug.get("drug_name", "") or drug.get("sub_drug_name", "") or drug.get("show_name", ""),
                 "drug_num": drug.get("spec_number",1) * drug.get("drug_num", 0), # 规格转化系数
-                "unit": "g", 
+                "unit_name": "g", 
                 "max_use": drug.get("max_use", ""),
                 "min_use": drug.get("min_use", ""),
                 "decoction_name": drug.get("decoction_name", ""),
@@ -503,7 +500,7 @@ def format_ps(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
             format_p["drugs"] = [{
                 "drug_name": drugs.get("sub_drug_name", ""),
                 "drug_num": drugs.get("drug_num", 0),
-                "unit": drugs.get("unit_name", ""),
+                "unit_name": drugs.get("unit_name", ""),
                 "max_use": drugs.get("max_use", ""), 
                 "min_use": drugs.get("min_use", ""),
                 "decoction_name": drugs.get("decoction_name", ""),
