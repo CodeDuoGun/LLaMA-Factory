@@ -46,6 +46,18 @@ python medical/data_utils/medical_record_agents.py \
   --progress-every 10
 ```
 
+LangGraph 版本沿用相同的命令行参数、文件/MySQL 读写和断点处理；每条病历内部把图片分类、报告解析、舌面标注、病史清洗、诊断补全、临床字段抽取和诊断归一化作为独立节点运行。检查报告解析与舌面标注在图片分类后并行执行：
+
+```bash
+python medical/data_utils/medical_record_langgraph.py \
+  --input <input.jsonl> \
+  --output-dir medical/processed_data \
+  --doctor-id 43 \
+  --batch-size 8
+```
+
+可用 `--stage-name` 选择节点阶段，行为与 `medical_record_agents.py` 相同。LangGraph 依赖已加入 `requirements.txt`。
+
 常用参数：
 
 | 参数 | 作用 |
