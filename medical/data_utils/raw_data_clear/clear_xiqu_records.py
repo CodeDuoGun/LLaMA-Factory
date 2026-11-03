@@ -30,25 +30,32 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATA_DIR = PROJECT_ROOT / "medical/data/二期西区"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "medical/processed_data"
 ALLOWED_CATEGORIES = {"中成药费", "中草药费", "中草药颗粒费", "西药费"}
+HERBAL_CATEGORIES = {"中草药费", "中草药颗粒费"}
 DRUG_PROCESS_NAMES = {
     "中成药费": "中成药",
     "中草药费": "饮片",
     "中草药颗粒费": "颗粒",
     "西药费": "西药",
 }
-DRUG_PROCESS_NAMES_BY_CODE = {"C": "饮片", "K": "颗粒", "Z": "中成药", "X": "西药"}
+DRUG_PROCESS_NAMES_BY_COOKING_METHOD = {
+    "颗粒": "颗粒",
+    "代煎": "饮片",
+    "自煎": "饮片",
+    "打粉": "饮片",
+}
 
 RECORD_REQUIRED_COLUMNS = ("门诊号", "时间", "患者姓名", "主诉", "初步诊断")
 PRESCRIPTION_REQUIRED_COLUMNS = (
     "门诊号",
     "处方号",
-    "项目代码",
+    "证件号",
     "项目名称",
     "单量",
     "单位",
     "剂数",
     "频次",
     "用法",
+    "煎法",
     "分类名称",
     "收费标志",
 )
@@ -121,6 +128,55 @@ def require_columns(frame: pd.DataFrame, columns: tuple[str, ...], path: Path) -
 
 def _is_blank_cell(value: Any) -> bool:
     return clean_text(value) == ""
+
+
+def has_history_content(value: Any) -> bool:
+    """判断病史字段是否包含肯定信息，而不是空值或否定/未记录占位语。"""
+    text = clean_text(value)
+    if not text:
+        return False
+
+    negative_prefixes = (
+        "没有",
+        "暂无",
+        "暂时无",
+        "未有",
+        "未见",
+        "未发现",
+        "未记录",
+        "未提供",
+        "未询问",
+        "未说明",
+        "未诉",
+        "未述",
+        "否认",
+        "不详",
+        "未知",
+        "无",
+    )
+    labels = ("既往史", "过敏史", "个人史", "家族史")
+    relatives = ("父母", "父亲", "母亲", "兄弟姐妹", "兄弟", "姐妹", "直系亲属", "家族成员")
+    clauses = re.split(r"[\r\n,，;；。]+", text)
+
+    for clause in clauses:
+        normalized = re.sub(r"\s+", "", clause).strip("：:")
+        for label in labels:
+            if normalized.startswith(label):
+                normalized = normalized[len(label) :].lstrip("：:")
+                break
+        for relative in relatives:
+            if normalized.startswith(relative):
+                normalized = normalized[len(relative) :].lstrip("：:")
+                break
+        if not normalized:
+            continue
+
+        is_negative = normalized.startswith(negative_prefixes) and not normalized.startswith("无花果")
+        if is_negative and not re.search(r"但|不过|曾患|曾有|现有|另有|同时有|并有", normalized):
+            continue
+        return True
+
+    return False
 
 
 def classify_diagnosis_by_rule(diagnosis: Any) -> dict[str, str]:
@@ -285,9 +341,11 @@ def prepare_prescription_data(path: Path) -> pd.DataFrame:
     prescriptions["_mzh"] = prescriptions["门诊号"].map(normalize_outpatient_no)
     prescriptions["_rx_no"] = prescriptions["处方号"].map(clean_text)
     prescriptions["_category"] = prescriptions["分类名称"].map(clean_text)
-    code_prefixes = prescriptions["项目代码"].map(lambda value: clean_text(value).upper()[:1])
-    prescriptions["_drug_process_name"] = code_prefixes.map(DRUG_PROCESS_NAMES_BY_CODE)
-    prescriptions["_code_type_fallback"] = prescriptions["_drug_process_name"].isna()
+    prescriptions["_cooking_method"] = prescriptions["煎法"].map(clean_text)
+    prescriptions["_drug_process_name"] = prescriptions["_cooking_method"].map(
+        DRUG_PROCESS_NAMES_BY_COOKING_METHOD
+    )
+    prescriptions["_cooking_method_fallback"] = prescriptions["_drug_process_name"].isna()
     prescriptions["_drug_process_name"] = prescriptions["_drug_process_name"].fillna(
         prescriptions["_category"].map(DRUG_PROCESS_NAMES)
     )
@@ -342,7 +400,7 @@ def build_drug_entry(row: pd.Series) -> dict[str, Any]:
 
 
 def aggregate_prescriptions(rows: pd.DataFrame, treatment_plan: Any) -> list[dict[str, Any]]:
-    """按处方号和分类名称组装 ps；同一处方中的每个药品保留为一条明细。"""
+    """按处方号和药品加工类型组装 ps；同一处方中的每个药品保留为一条明细。"""
     if rows.empty:
         return []
 
@@ -395,6 +453,10 @@ def build_record(
     treatment_plan = clean_text(row.get("治疗计划及建议"))
     diagnoses = classify_diagnosis_by_rule(row.get("初步诊断"))
     is_first = _first_value(prescription_rows, "初复诊")
+    old_medical_history = clean_text(row.get("既往史"))
+    allergic_history = clean_text(row.get("过敏史"))
+    personal_history = clean_text(row.get("个人史"))
+    family_history = clean_text(row.get("家族史"))
 
     return OrderedDict(
         order_sn=normalize_outpatient_no(row.get("门诊号")),
@@ -408,26 +470,26 @@ def build_record(
         patient_name=clean_text(row.get("患者姓名")),
         patient_sex=clean_text(row.get("患者性别")),
         patient_age=normalize_number(re.sub(r"[^0-9.]", "", clean_text(row.get("年龄")))),
-        patient_idcard="",
+        patient_idcard=_first_value(prescription_rows, "证件号"),
         patient_mobile="",
         patient_height=None,
         patient_weight=None,
         patient_appeal=complaint,
         doc_ass_stu_appeal=complaint,
         new_medical_history="\n".join(history_parts),
-        is_old_medical_history="",
-        old_medical_history=clean_text(row.get("既往史")),
-        is_allergic_history="",
-        allergic_history=clean_text(row.get("过敏史")),
-        is_personal_history="",
-        personal_history="",
+        is_old_medical_history="是" if has_history_content(old_medical_history) else "否",
+        old_medical_history=old_medical_history,
+        is_allergic_history="是" if has_history_content(allergic_history) else "否",
+        allergic_history=allergic_history,
+        is_personal_history="是" if has_history_content(personal_history) else "否",
+        personal_history=personal_history,
         is_special="",
         special_history="",
         is_child_history="",
         birth_detail="",
         is_marriage_history="",
-        is_family_history="",
-        family_history="",
+        is_family_history="是" if has_history_content(family_history) else "否",
+        family_history=family_history,
         inspection_report_img=[],
         tongue_face_img=[],
         admin_report_img=[],
@@ -480,9 +542,14 @@ def process_doctor(
     print(f"[{doctor_name}] 读取收费处方明细: {prescription_path}")
     prescriptions = prepare_prescription_data(prescription_path)
     print(f"  保留药品明细: {len(prescriptions)}，门诊号数: {prescriptions['_mzh'].nunique()}")
-    fallback_count = int(prescriptions["_code_type_fallback"].sum())
+    fallback_count = int(
+        (
+            prescriptions["_cooking_method_fallback"]
+            & prescriptions["_category"].isin(HERBAL_CATEGORIES)
+        ).sum()
+    )
     if fallback_count:
-        print(f"  未识别项目代码、按分类名称回退: {fallback_count} 条")
+        print(f"  草药类煎法为空或未识别、按分类名称回退: {fallback_count} 条")
 
     prescriptions_by_mzh = {mzh: group for mzh, group in prescriptions.groupby("_mzh", sort=False)}
     output_records = []
