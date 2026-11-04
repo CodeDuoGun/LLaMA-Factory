@@ -43,6 +43,7 @@ DRUG_PROCESS_NAMES_BY_COOKING_METHOD = {
     "自煎": "饮片",
     "打粉": "饮片",
 }
+MAX_PATIENT_ID = 2_147_483_647
 
 RECORD_REQUIRED_COLUMNS = ("门诊号", "时间", "患者姓名", "主诉", "初步诊断")
 PRESCRIPTION_REQUIRED_COLUMNS = (
@@ -78,6 +79,76 @@ def clean_text(value: Any) -> str:
 def normalize_outpatient_no(value: Any) -> str:
     """规范门诊号，避免浮点格式及空白导致无法匹配。"""
     return re.sub(r"\.0$", "", clean_text(value)).strip()
+
+
+def normalize_patient_idcard(value: Any) -> str:
+    """规范证件号，用于同一患者的 ID 映射。"""
+    return re.sub(r"\s+", "", clean_text(value)).upper()
+
+
+class PatientIdAllocator:
+    """根据证件号分配稳定且不重复的正整数患者 ID。"""
+
+    def __init__(
+        self,
+        output_dir: Path,
+        doctor_outputs: list[tuple[str, int | None]] | None = None,
+    ) -> None:
+        self.card_to_id: dict[str, int] = {}
+        self.id_to_card: dict[int, str] = {}
+        output_paths = set(output_dir.glob("doctor_二期西区_*/medical_records_ai.jsonl"))
+        for doctor_name, doctor_id in doctor_outputs or []:
+            folder_name = (
+                f"doctor_二期西区_{doctor_name}"
+                if doctor_id is None
+                else f"doctor_{doctor_id}_{doctor_name}"
+            )
+            output_path = output_dir / folder_name / "medical_records_ai.jsonl"
+            if output_path.is_file():
+                output_paths.add(output_path)
+
+        for path in sorted(output_paths):
+            with path.open(encoding="utf-8") as file:
+                for line_number, line in enumerate(file, start=1):
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    card = normalize_patient_idcard(record.get("patient_idcard"))
+                    patient_id = record.get("patient_id")
+                    if not card or isinstance(patient_id, bool) or patient_id is None:
+                        continue
+                    try:
+                        patient_id = int(patient_id)
+                    except (TypeError, ValueError):
+                        raise ValueError(f"{path}:{line_number} 的 patient_id 不是整数") from None
+                    self._register(card, patient_id, f"{path}:{line_number}")
+
+        self.next_id = max(self.id_to_card, default=0) + 1
+
+    def _register(self, card: str, patient_id: int, source: str) -> None:
+        if not 1 <= patient_id <= MAX_PATIENT_ID:
+            raise ValueError(f"{source} 的 patient_id 超出正整数范围: {patient_id}")
+        existing_id = self.card_to_id.get(card)
+        if existing_id is not None and existing_id != patient_id:
+            raise ValueError(f"同一证件号对应多个 patient_id，位置: {source}")
+        existing_card = self.id_to_card.get(patient_id)
+        if existing_card is not None and existing_card != card:
+            raise ValueError(f"不同证件号对应相同 patient_id，位置: {source}")
+        self.card_to_id[card] = patient_id
+        self.id_to_card[patient_id] = card
+
+    def get_or_create(self, idcard: Any) -> int | None:
+        card = normalize_patient_idcard(idcard)
+        if not card:
+            return None
+        if card in self.card_to_id:
+            return self.card_to_id[card]
+        if self.next_id > MAX_PATIENT_ID:
+            raise OverflowError("patient_id 已超出数据库有符号 INT 的最大值")
+        patient_id = self.next_id
+        self._register(card, patient_id, "本次清洗")
+        self.next_id += 1
+        return patient_id
 
 
 def normalize_number(value: Any) -> str:
@@ -266,6 +337,17 @@ def _first_value(frame: pd.DataFrame, column: str) -> str:
     return ""
 
 
+def _first_datetime(frame: pd.DataFrame, column: str) -> str:
+    """返回指定列中的第一个有效日期时间。"""
+    if column not in frame:
+        return ""
+    for value in frame[column]:
+        text = datetime_text(value)
+        if text:
+            return text
+    return ""
+
+
 def _chinese_number(value: str) -> int | None:
     numerals = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
     if value.isdigit():
@@ -441,6 +523,7 @@ def build_record(
     prescription_rows: pd.DataFrame,
     doctor_name: str,
     doctor_id: int | None,
+    patient_id_allocator: PatientIdAllocator,
 ) -> dict[str, Any]:
     visit_time = datetime_text(row.get("时间"))
     complaint = clean_text(row.get("主诉"))
@@ -457,6 +540,7 @@ def build_record(
     allergic_history = clean_text(row.get("过敏史"))
     personal_history = clean_text(row.get("个人史"))
     family_history = clean_text(row.get("家族史"))
+    patient_idcard = _first_value(prescription_rows, "证件号")
 
     return OrderedDict(
         order_sn=normalize_outpatient_no(row.get("门诊号")),
@@ -464,13 +548,13 @@ def build_record(
         is_first=is_first,
         created_at=visit_time,
         start_time=visit_time,
-        stop_time="",
+        stop_time=_first_datetime(prescription_rows, "结账时间"),
         user_info_id=None,
-        patient_id=None,
+        patient_id=patient_id_allocator.get_or_create(patient_idcard),
         patient_name=clean_text(row.get("患者姓名")),
         patient_sex=clean_text(row.get("患者性别")),
         patient_age=normalize_number(re.sub(r"[^0-9.]", "", clean_text(row.get("年龄")))),
-        patient_idcard=_first_value(prescription_rows, "证件号"),
+        patient_idcard=patient_idcard,
         patient_mobile="",
         patient_height=None,
         patient_weight=None,
@@ -534,7 +618,11 @@ def process_doctor(
     prescription_path: Path,
     output_dir: Path,
     doctor_id: int | None = None,
+    patient_id_allocator: PatientIdAllocator | None = None,
 ) -> Path:
+    if patient_id_allocator is None:
+        patient_id_allocator = PatientIdAllocator(output_dir, [(doctor_name, doctor_id)])
+
     print(f"\n[{doctor_name}] 读取病历: {record_path}")
     records = prepare_record_data(record_path)
     print(f"  有效病历行: {len(records)}，门诊号数: {records['_mzh'].nunique()}")
@@ -559,7 +647,9 @@ def process_doctor(
         if matching_rows.empty:
             unmatched += 1
             continue
-        output_records.append(build_record(record, matching_rows, doctor_name, doctor_id))
+        output_records.append(
+            build_record(record, matching_rows, doctor_name, doctor_id, patient_id_allocator)
+        )
 
     if doctor_id is None:
         folder_name = f"doctor_二期西区_{doctor_name}"
@@ -614,8 +704,19 @@ def main() -> list[Path]:
     if not doctors:
         raise SystemExit(f"在 {args.data_dir} 下没有找到“医生名 病历.xlsx”与“医生名.xlsx”配对文件")
 
+    patient_id_allocator = PatientIdAllocator(
+        args.output_dir,
+        [(name, id_map.get(name)) for name, _, _ in doctors],
+    )
     return [
-        process_doctor(name, record_path, prescription_path, args.output_dir, id_map.get(name))
+        process_doctor(
+            name,
+            record_path,
+            prescription_path,
+            args.output_dir,
+            id_map.get(name),
+            patient_id_allocator,
+        )
         for name, record_path, prescription_path in doctors
     ]
 

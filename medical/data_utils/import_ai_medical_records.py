@@ -16,6 +16,7 @@
 
 import argparse
 import json
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ from medical.data_utils.ai_medical_records import (
     AIMedicalRecordRepository,
     add_column_with_type_default,
     drop_column,
+    iter_jsonl,
 )
 from medical.data_utils.db_manager import db_manager
 
@@ -89,13 +91,26 @@ def _print_json(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
 
 
+def _records_with_ai_fields(
+    records: Iterable[dict[str, Any]], skipped_count: list[int]
+) -> Iterator[dict[str, Any]]:
+    """只传递至少包含一个 ai_ 字段的病历记录。"""
+    for record in records:
+        if any(field.startswith("ai_") for field in record):
+            yield record
+            continue
+
+        skipped_count[0] += 1
+        print(f"[SKIP] order_sn={record.get('order_sn', '')}：病历不包含 ai_ 字段")
+
+
 def main() -> None:
     """运行导入或查询命令."""
     args = build_parser().parse_args()
     """
     批量写入某医生数据到
-    PYTHONPATH=. python -m app.medical.import_ai_medical_records import \
-  --input app/medical/processed_data/doctor_43_朱子奇/medical_records_ai.jsonl \
+PYTHONPATH=. python -m medical.data_utils.import_ai_medical_records import \
+  --input medical/processed_data/doctor_二期西区_于振宣/medical_records_ai.jsonl \
   --batch-size 100
     """
     repository = AIMedicalRecordRepository(
@@ -104,9 +119,15 @@ def main() -> None:
     )
 
     if args.command == "import":
-        count = repository.import_jsonl(args.input, batch_size=args.batch_size)
+        skipped_count = [0]
+        repository.create_table()
+        count = repository.batch_upsert_by_order_sn(
+            _records_with_ai_fields(iter_jsonl(args.input), skipped_count),
+            batch_size=args.batch_size,
+        )
         print(
             f"已写入或更新 {count} 条 AI 病例标注记录；"
+            f"跳过 {skipped_count[0]} 条不含 ai_ 字段的记录；"
             f"order_sn 已存在的记录已更新；数据表: {repository.table.name}"
         )
     elif args.command == "add-treatment-principle-column":

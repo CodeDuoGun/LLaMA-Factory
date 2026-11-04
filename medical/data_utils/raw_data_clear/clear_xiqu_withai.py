@@ -347,6 +347,10 @@ async def clean_file(args: argparse.Namespace) -> int:
 
                 try:
                     record = records[line_number]
+                    print(
+                        f"正在处理第 {line_number} 行，order_sn={_text(record.get('order_sn'))}",
+                        flush=True,
+                    )
                     payload = build_record_payload(record, previous_contexts.get(line_number))
                     response = await agent.ainvoke(
                         [HumanMessage(content=json.dumps(payload, ensure_ascii=False))]
