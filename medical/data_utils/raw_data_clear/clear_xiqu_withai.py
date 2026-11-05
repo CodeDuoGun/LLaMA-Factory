@@ -35,6 +35,7 @@ DEFAULT_INPUT = (
     / "medical/processed_data/doctor_二期西区_于振宣/medical_records_ai.jsonl"
 )
 PROMPT_PATH = PROJECT_ROOT / "medical/prompts/xiqu_cleaner.txt"
+EXTRACTION_PROMPT_PATH = PROJECT_ROOT / "medical/data_utils/prompts/extract_prompt.txt"
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
@@ -45,6 +46,16 @@ def load_system_prompt() -> str:
     prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
     if not prompt:
         raise ValueError(f"清洗提示词文件为空：{PROMPT_PATH}")
+    return prompt
+
+
+def load_extraction_prompt() -> str:
+    """Load the clinical extraction prompt from the project-local text file."""
+    if not EXTRACTION_PROMPT_PATH.is_file():
+        raise FileNotFoundError(f"临床信息抽取提示词文件不存在：{EXTRACTION_PROMPT_PATH}")
+    prompt = EXTRACTION_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    if not prompt:
+        raise ValueError(f"临床信息抽取提示词文件为空：{EXTRACTION_PROMPT_PATH}")
     return prompt
 
 
@@ -60,6 +71,7 @@ def build_output_schema() -> type:
         "XiquRecordCleaningResult",
         __doc__="Structured fields written to the matching ai_* keys in the source record.",
         __config__=ConfigDict(extra="forbid"),
+        patient_appeal=(str, Field(..., description="清洗后的主诉；无有效主诉时为空字符串")),
         new_medical_history=(str, Field(..., description="清洗后的本次现病史")),
         old_medical_history=(str, Field(..., description="清洗后的既往史")),
         allergic_history=(str, Field(..., description="清洗后的过敏史；未说明时为空字符串")),
@@ -211,6 +223,11 @@ def build_previous_visit_contexts(records: dict[int, dict[str, Any]]) -> dict[in
             }
             contexts[line_number] = {
                 "previous_visit_time": _visit_time(previous),
+                "previous_visit_appeal": _text(
+                    previous.get("ai_patient_appeal")
+                    or previous.get("patient_appeal")
+                    or previous.get("doc_ass_stu_appeal")
+                ),
                 "previous_visit_diagnoses": diagnoses,
             }
     return contexts
@@ -224,6 +241,7 @@ def build_record_payload(
         "see_doc_time",
         "patient_sex",
         "patient_appeal",
+        "doc_ass_stu_appeal",
         "new_medical_history",
         "old_medical_history",
         "allergic_history",
@@ -251,9 +269,68 @@ def build_record_payload(
     return payload
 
 
+def _cleaned_value(record: dict[str, Any], field: str) -> Any:
+    """Prefer the cleaner's result when available, otherwise use the source value."""
+    ai_field = f"ai_{field}"
+    return record[ai_field] if ai_field in record else record.get(field)
+
+
+def build_clinical_extraction_payload(record: dict[str, Any]) -> dict[str, Any]:
+    """Build a de-identified clinical payload for ClinicalExtractionResult."""
+    history_fields = {
+        "patient_appeal": "主诉",
+        "new_medical_history": "现病史",
+        "old_medical_history": "既往史",
+        "allergic_history": "过敏史",
+        "personal_history": "个人史",
+        "family_history": "家族史",
+        "special_history": "特殊时期",
+        "marriage_history": "婚姻史",
+        "birth_detail": "生育史",
+    }
+    clinical_record: dict[str, Any] = {
+        label: _without_image_references(_cleaned_value(record, field))
+        for field, label in history_fields.items()
+        if _cleaned_value(record, field) not in (None, "", [])
+    }
+    clinical_record["就诊时间"] = _visit_time(record)
+    clinical_record["就诊类型"] = _text(record.get("is_first"))
+    clinical_record["性别"] = _text(record.get("patient_sex"))
+
+    diagnoses = {
+        label: _cleaned_value(record, field)
+        for field, label in (
+            ("diagnosis_illness", "西医诊断"),
+            ("diagnosis_sickness", "中医病名"),
+            ("diagnosis_disease", "中医证候"),
+        )
+        if _cleaned_value(record, field) not in (None, "", [])
+    }
+    if diagnoses:
+        clinical_record["诊断"] = diagnoses
+
+    for key, label in (
+        ("ai_inspection_report_img", "检查报告分析"),
+        ("ai_tongue_face_img", "舌面患处分析"),
+    ):
+        value = _without_image_references(record.get(key))
+        if value not in (None, "", []):
+            clinical_record[label] = value
+
+    disposition = _text(record.get("disposition"))
+    if disposition:
+        clinical_record["治疗计划"] = disposition
+    prescriptions = _without_image_references(record.get("ps"))
+    if prescriptions not in (None, "", []):
+        clinical_record["处方详情"] = prescriptions
+
+    return {"病历信息": clinical_record, "知识库知识": "无"}
+
+
 def apply_result(record: dict[str, Any], result: Any) -> dict[str, Any]:
     """Map structured output fields to their ai_* counterparts."""
     for field in (
+        "patient_appeal",
         "new_medical_history",
         "old_medical_history",
         "allergic_history",
@@ -271,6 +348,18 @@ def apply_result(record: dict[str, Any], result: Any) -> dict[str, Any]:
     ):
         value = getattr(result, field)
         record[f"ai_{field}"] = value.strip() if isinstance(value, str) else value
+    return record
+
+
+def apply_clinical_extraction_result(record: dict[str, Any], result: Any) -> dict[str, Any]:
+    """Write ClinicalExtractionResult fields to the corresponding ai_* keys."""
+    values = result.model_dump()
+    for field, value in values.items():
+        if isinstance(value, str):
+            value = value.strip()
+        elif isinstance(value, list):
+            value = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        record[f"ai_{field}"] = value
     return record
 
 
@@ -301,6 +390,7 @@ async def clean_file(args: argparse.Namespace) -> int:
     from langchain_core.messages import HumanMessage
 
     from medical.data_utils.structured_agent import AgentModelConfig, StructuredAgent, StructuredOutputMode
+    from medical.schema.clear_record_basemodel import ClinicalExtractionResult
 
     output_schema = build_output_schema()
     config = AgentModelConfig(
@@ -318,6 +408,14 @@ async def clean_file(args: argparse.Namespace) -> int:
         output_schema,
         system_prompt=system_prompt,
         name="xiqu_medical_record_cleaner",
+        output_mode=StructuredOutputMode.JSON_OBJECT,
+        validation_retries=1,
+    )
+    extraction_agent = StructuredAgent.from_config(
+        config,
+        ClinicalExtractionResult,
+        system_prompt=load_extraction_prompt(),
+        name="xiqu_clinical_extractor",
         output_mode=StructuredOutputMode.JSON_OBJECT,
         validation_retries=1,
     )
@@ -356,10 +454,19 @@ async def clean_file(args: argparse.Namespace) -> int:
                         [HumanMessage(content=json.dumps(payload, ensure_ascii=False))]
                     )
                     apply_result(record, response.output)
+                    extraction_payload = build_clinical_extraction_payload(record)
+                    print(
+                        f"正在抽取临床字段，第 {line_number} 行，order_sn={_text(record.get('order_sn'))}",
+                        flush=True,
+                    )
+                    extraction_response = await extraction_agent.ainvoke(
+                        [HumanMessage(content=json.dumps(extraction_payload, ensure_ascii=False))]
+                    )
+                    apply_clinical_extraction_result(record, extraction_response.output)
                     target.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
                 except Exception as exc:
                     raise RuntimeError(
-                        f"第 {line_number} 行清洗失败（{type(exc).__name__}）；原文件未覆盖"
+                        f"第 {line_number} 行处理失败（{type(exc).__name__}）；原文件未覆盖"
                     ) from exc
 
                 processed += 1
