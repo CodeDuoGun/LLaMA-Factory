@@ -3,7 +3,6 @@ import os
 import sys
 import redis
 from loguru import logger as logurulogger
-import redis.exceptions
 from medical.config import config
 import json
 from redis.retry import Retry
@@ -53,9 +52,10 @@ class Logging:
 
     def __init__(self):
         self.log_path = "logs"
-        self._connect_redis()
         if config.IS_LOCAL:
             os.makedirs(self.log_path, exist_ok=True)
+        else:
+            self._connect_redis()
         self._initlogger()
         self._reset_log_handler()
     
@@ -91,8 +91,10 @@ class Logging:
             level=logging.DEBUG,
             colorize=True,
         )
-
-        logurulogger.add(self._log_to_redis, level="INFO", format=LOG_FORMAT)
+        if not config.IS_LOCAL:
+            # Redis uses a synchronous socket client. Queue the sink so LangGraph's
+            # ASGI event loop never performs Redis I/O while handling a log record.
+            logurulogger.add(self._log_to_redis, level="INFO", format=LOG_FORMAT, enqueue=True)
         self.logger = logurulogger
         
 
@@ -100,12 +102,11 @@ class Logging:
         """将日志写入 Redis 列表"""
         try:
             self.redis_client.rpush(f"nlp.logger.{config.env_version}.log", json.dumps({"message": message}))
-        except redis.exceptions.ConnectionError as e:
-            logger.error(f"write {message} Redis connection error: {e}")
-        except redis.exceptions.TimeoutError as e:
-            logger.error(f"write {message} Redis operation timed out: {e}")
         except Exception as e:
-            logger.error(f"write {message} Unexpected error: {e}")
+            # Never log through Loguru from one of its own sinks: that re-enters
+            # the same handler and can deadlock. Keep the fallback out of the
+            # Redis sink and avoid echoing the log message, which may contain PHI.
+            sys.stderr.write(f"Redis log sink failed: {type(e).__name__}: {e}\n")
 
     def _reset_log_handler(self):
         for log in LOG_NAME:
@@ -117,4 +118,3 @@ class Logging:
         return self.logger 
 
 logger = Logging().getlogger()
-
