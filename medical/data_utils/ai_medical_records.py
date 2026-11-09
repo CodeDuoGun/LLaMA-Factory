@@ -16,6 +16,7 @@
 
 import json
 from collections.abc import Iterable, Iterator, Mapping
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,8 +36,8 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
-    inspect,
     insert,
+    inspect,
     literal,
     text,
     update,
@@ -441,21 +442,51 @@ def drop_column(manager: "DBManager", table_name: str, column_name: str) -> bool
 
 
 
-def format_drugs(drugs: list[dict[str, Any]], usage_type: str) -> list[dict[str, Any]]:
+def format_drugs(
+    drugs: list[dict[str, Any]],
+    usage_type: str,
+    drug_process_name: str = "",
+) -> list[dict[str, Any]]:
     """格式化药品明细,用于es存储.
     """
     if not drugs:
         return []
     result = []
-    
+
     for drug in drugs:
-        if usage_type in ("西药","保健品", "中成药", "经验方"):
+        drug_name = drug.get("drug_name", "") or drug.get("sub_drug_name", "") or drug.get("show_name", "")
+        if drug_process_name in ("饮片", "颗粒"):
+            spec_number = drug.get("spec_number", 1)
+            drug_number = drug.get("drug_num", 0)
+            if spec_number in (None, ""):
+                spec_number = 1
+            if drug_number in (None, ""):
+                drug_number = 0
+            try:
+                origin_drug_num = Decimal(str(spec_number)) * Decimal(str(drug_number))
+                rounded_drug_num = int(origin_drug_num.to_integral_value(rounding=ROUND_CEILING))
+                origin_drug_num_float = float(origin_drug_num)
+            except (InvalidOperation, OverflowError, TypeError, ValueError) as exc:
+                raise ValueError(f"药品数量无法转换为有效数字: {drug_name}") from exc
+
             result.append(
                 {
-                    "drug_name": drug.get("drug_name","") or drug.get("sub_drug_name", "") or drug.get("show_name", ""), 
-                    "drug_num": drug.get("drug_num", 0), 
-                    "unit_name": drug.get("unit_name", "") or drug.get("unit",""), 
-                    "max_use": drug.get("max_use", ""), 
+                    "drug_name": drug_name,
+                    "drug_num": rounded_drug_num,
+                    "origin_drug_num": origin_drug_num_float,
+                    "unit_name": "g",
+                    "max_use": drug.get("max_use", ""),
+                    "min_use": drug.get("min_use", ""),
+                    "decoction_name": drug.get("decoction_name", ""),
+                },
+            )
+        elif usage_type in ("西药", "保健品", "中成药", "经验方"):
+            result.append(
+                {
+                    "drug_name": drug_name,
+                    "drug_num": drug.get("drug_num", 0),
+                    "unit_name": drug.get("unit_name", "") or drug.get("unit", ""),
+                    "max_use": drug.get("max_use", ""),
                     "min_use": drug.get("min_use", ""),
                     "decoction_name": drug.get("decoction_name", ""),
                 },
@@ -463,7 +494,7 @@ def format_drugs(drugs: list[dict[str, Any]], usage_type: str) -> list[dict[str,
         else:
             # 不在这些类别中的药，需要进行单位转化
             result.append({
-                "drug_name": drug.get("drug_name", "") or drug.get("sub_drug_name", "") or drug.get("show_name", ""),
+                "drug_name": drug_name,
                 "drug_num": float(drug.get("spec_number",1)) * int(drug.get("drug_num", 0)), # 规格转化系数
                 "unit_name": "g", 
                 "max_use": drug.get("max_use", ""),
@@ -491,7 +522,9 @@ def format_ps(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # 解析西药结构
         if p.get("drug_process_name") in ("西药","保健品", "中成药"):
             format_p["usage_desc"] = p.get("prescription_items", {}).get("drugList", [])[-1].get("use_limit_text", "")
-            format_p["drugs"] = format_drugs(p.get("prescription_items", {}).get("drugList", []), usage_type)
+            format_p["drugs"] = format_drugs(
+                p.get("prescription_items", {}).get("drugList", []), usage_type, p.get("drug_process_name", "")
+            )
         # 解析经验方结构
         elif p.get("drug_process_name") == "经验方":
             format_p["usage_desc"] = p.get("prescription_items", {}).get("drugList", [])[-1].get("use_limit_text", "")
@@ -508,7 +541,9 @@ def format_ps(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # 解析饮片颗粒结构
         elif p.get("drug_process_name") in ("颗粒", "饮片","膏方", "蜜丸","水蜜丸","粉剂","浓缩丸","水丸","糊丸", "小蜜丸"):
             format_p["usage_desc"] = p.get("usage_desc", "")
-            format_p["drugs"] = format_drugs(p.get("prescription_items", {}).get("drugList", []), usage_type)
+            format_p["drugs"] = format_drugs(
+                p.get("prescription_items", {}).get("drugList", []), usage_type, p.get("drug_process_name", "")
+            )
         else:
             raise ValueError(f"不支持的药品类型: {p.get('drug_process_name')}")
         result.append(format_p)

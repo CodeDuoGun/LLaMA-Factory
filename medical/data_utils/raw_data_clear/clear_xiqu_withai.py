@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -25,6 +26,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if __package__ in (None, ""):
@@ -118,6 +120,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--timeout", type=float, default=300, help="单次模型请求超时秒数")
     parser.add_argument("--max-retries", type=int, default=2, help="底层请求失败时的重试次数")
+    parser.add_argument(
+        "--batchsize",
+        "--batch-size",
+        "--batch_size",
+        dest="batchsize",
+        type=int,
+        default=1,
+        help="每批并发处理的病历数，默认 1（顺序处理）",
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -363,13 +374,41 @@ def apply_clinical_extraction_result(record: dict[str, Any], result: Any) -> dic
     return record
 
 
+async def clean_record(
+    line_number: int,
+    source_record: dict[str, Any],
+    previous_context: dict[str, Any] | None,
+    agent: Any,
+    extraction_agent: Any,
+    human_message_type: Any,
+) -> dict[str, Any]:
+    """Clean one independent record without mutating the shared input data."""
+    record = copy.deepcopy(source_record)
+    order_sn = _text(record.get("order_sn"))
+    print(f"正在处理第 {line_number} 行，order_sn={order_sn}", flush=True)
+
+    payload = build_record_payload(record, previous_context)
+    response = await agent.ainvoke([human_message_type(content=json.dumps(payload, ensure_ascii=False))])
+    apply_result(record, response.output)
+
+    extraction_payload = build_clinical_extraction_payload(record)
+    print(f"正在抽取临床字段，第 {line_number} 行，order_sn={order_sn}", flush=True)
+    extraction_response = await extraction_agent.ainvoke(
+        [human_message_type(content=json.dumps(extraction_payload, ensure_ascii=False))]
+    )
+    apply_clinical_extraction_result(record, extraction_response.output)
+    return record
+
+
 async def clean_file(args: argparse.Namespace) -> int:
-    """Clean records sequentially and atomically replace the specified JSONL file."""
+    """Clean records in bounded batches and atomically replace the specified JSONL file."""
     input_path = args.input.expanduser().resolve()
     if not input_path.is_file():
         raise FileNotFoundError(f"输入文件不存在：{input_path}")
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit 必须大于 0")
+    if args.batchsize < 1:
+        raise ValueError("--batchsize 必须是大于 0 的整数")
     if not args.api_key:
         raise ValueError("未提供 API Key，请设置 DASHSCOPE_API_KEY 或使用 --api-key")
 
@@ -421,8 +460,43 @@ async def clean_file(args: argparse.Namespace) -> int:
     )
 
     original_mode = input_path.stat().st_mode & 0o777
-    temp_path: Path | None = None
+    line_numbers = list(records)
+    if args.limit is not None:
+        line_numbers = line_numbers[: args.limit]
+
     processed = 0
+    for start in range(0, len(line_numbers), args.batchsize):
+        batch_line_numbers = line_numbers[start : start + args.batchsize]
+        results = await asyncio.gather(
+            *(
+                clean_record(
+                    line_number,
+                    records[line_number],
+                    previous_contexts.get(line_number),
+                    agent,
+                    extraction_agent,
+                    HumanMessage,
+                )
+                for line_number in batch_line_numbers
+            ),
+            return_exceptions=True,
+        )
+
+        for line_number, result in zip(batch_line_numbers, results, strict=True):
+            if isinstance(result, BaseException):
+                raise RuntimeError(
+                    f"第 {line_number} 行处理失败（{type(result).__name__}）；原文件未覆盖"
+                ) from result
+
+        for line_number, result in zip(batch_line_numbers, results, strict=True):
+            records[line_number] = result
+
+        processed += len(batch_line_numbers)
+        print(f"已完成 {processed}/{len(line_numbers)} 条")
+
+    # Only one writer touches the file; no output is committed until every requested
+    # record has succeeded, and atomic replacement keeps the original intact on errors.
+    temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -434,45 +508,12 @@ async def clean_file(args: argparse.Namespace) -> int:
             delete=False,
         ) as target:
             temp_path = Path(target.name)
+            processed_line_numbers = set(line_numbers)
             for line_number, line in enumerate(lines, start=1):
-                if not line.strip():
+                if line_number in processed_line_numbers:
+                    target.write(json.dumps(records[line_number], ensure_ascii=False, separators=(",", ":")) + "\n")
+                else:
                     target.write(line)
-                    continue
-
-                if args.limit is not None and processed >= args.limit:
-                    target.write(line)
-                    continue
-
-                try:
-                    record = records[line_number]
-                    print(
-                        f"正在处理第 {line_number} 行，order_sn={_text(record.get('order_sn'))}",
-                        flush=True,
-                    )
-                    payload = build_record_payload(record, previous_contexts.get(line_number))
-                    response = await agent.ainvoke(
-                        [HumanMessage(content=json.dumps(payload, ensure_ascii=False))]
-                    )
-                    apply_result(record, response.output)
-                    extraction_payload = build_clinical_extraction_payload(record)
-                    print(
-                        f"正在抽取临床字段，第 {line_number} 行，order_sn={_text(record.get('order_sn'))}",
-                        flush=True,
-                    )
-                    extraction_response = await extraction_agent.ainvoke(
-                        [HumanMessage(content=json.dumps(extraction_payload, ensure_ascii=False))]
-                    )
-                    apply_clinical_extraction_result(record, extraction_response.output)
-                    target.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"第 {line_number} 行处理失败（{type(exc).__name__}）；原文件未覆盖"
-                    ) from exc
-
-                processed += 1
-                if processed % 20 == 0:
-                    print(f"已完成 {processed} 条")
-
             target.flush()
             os.fsync(target.fileno())
 

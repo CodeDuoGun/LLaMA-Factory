@@ -22,7 +22,7 @@ import os
 import re
 import stat
 import tempfile
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATA_DIR = PROJECT_ROOT / "medical/data/二期西区"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "medical/processed_data"
 ALLOWED_CATEGORIES = {"中成药费", "中草药费", "中草药颗粒费", "西药费"}
+COUNT_BASED_CATEGORIES = {"中成药费", "西药费"}
 HERBAL_CATEGORIES = {"中草药费", "中草药颗粒费"}
 DRUG_PROCESS_NAMES = {
     "中成药费": "中成药",
@@ -54,7 +55,6 @@ PRESCRIPTION_REQUIRED_COLUMNS = (
     "处方号",
     "证件号",
     "项目名称",
-    "单量",
     "单位",
     "剂数",
     "频次",
@@ -445,9 +445,12 @@ def prepare_prescription_data(path: Path) -> pd.DataFrame:
         & prescriptions["_category"].isin(ALLOWED_CATEGORIES)
         & prescriptions["收费标志"].map(clean_text).eq("正常")
     ].copy()
-    has_western_drug = prescriptions["_category"].eq("西药费").any()
-    if "数量" not in prescriptions.columns and has_western_drug:
-        raise ValueError(f"{path} 中有西药处方，但缺少用于 drug_num 的“数量”列")
+    has_count_based_drugs = prescriptions["_category"].isin(COUNT_BASED_CATEGORIES).any()
+    if "数量" not in prescriptions.columns and has_count_based_drugs:
+        raise ValueError(f"{path} 中有中成药或西药处方，但缺少用于 drug_num 的“数量”列")
+    has_herbal_drugs = prescriptions["_category"].isin(HERBAL_CATEGORIES).any()
+    if "单量" not in prescriptions.columns and has_herbal_drugs:
+        raise ValueError(f"{path} 中有中草药处方，但缺少用于 drug_num 的“单量”列")
     return prescriptions.reset_index(drop=True)
 
 
@@ -479,7 +482,9 @@ def select_prescriptions_for_record(
 
 
 def build_drug_entry(row: pd.Series) -> dict[str, Any]:
-    drug_num_column = "数量" if clean_text(row.get("_category")) == "西药费" else "单量"
+    """根据费用类别选择处方数量列，单位统一取处方表的“单位”列。"""
+    category = clean_text(row.get("_category"))
+    drug_num_column = "数量" if category in COUNT_BASED_CATEGORIES else "单量"
     return OrderedDict(
         drug_name=clean_text(row.get("项目名称")),
         drug_num=normalize_number(row.get(drug_num_column)),
@@ -548,6 +553,7 @@ def build_record(
     personal_history = clean_text(row.get("个人史"))
     family_history = clean_text(row.get("家族史"))
     patient_idcard = _first_value(prescription_rows, "证件号")
+    admin_face_describe = clean_text(row.get("体格检查"))
 
     return OrderedDict(
         order_sn=normalize_outpatient_no(row.get("门诊号")),
@@ -585,7 +591,7 @@ def build_record(
         tongue_face_img=[],
         admin_report_img=[],
         admin_face_img=[],
-        admin_face_describe="",
+        admin_face_describe=admin_face_describe,
         diagnosis_illness=diagnoses["diagnosis_illness"],
         diagnosis_sickness=diagnoses["diagnosis_sickness"],
         diagnosis_disease=diagnoses["diagnosis_disease"],
@@ -799,19 +805,281 @@ def process_doctor(
     return out_path
 
 
+def normalize_patient_name(value: Any) -> str:
+    """规范患者姓名用于和同次病历匹配."""
+    return re.sub(r"\s+", "", clean_text(value)).casefold()
+
+
+def get_base_order_no(order_sn: Any, visit_time: Any, source_order_nos: set[str]) -> str:
+    """还原清洗时为重复门诊号追加的就诊日期和序号."""
+    normalized_order_no = normalize_outpatient_no(order_sn)
+    if normalized_order_no in source_order_nos:
+        return normalized_order_no
+
+    parsed_visit_time = parse_datetime(visit_time)
+    if parsed_visit_time is None:
+        return ""
+    date_suffix = f"_{parsed_visit_time:%Y%m%d}"
+    candidate = re.sub(rf"{re.escape(date_suffix)}(?:_\d{{2,}})?$", "", normalized_order_no)
+    return candidate if candidate in source_order_nos else ""
+
+
+def build_admin_face_describe_index(
+    record_path: Path,
+    prescription_path: Path,
+) -> tuple[dict[tuple[str, str, str, str], set[str]], set[str]]:
+    """按门诊号、就诊时间、患者姓名和证件号索引体格检查."""
+    records = prepare_record_data(record_path)
+    require_columns(records, ("体格检查",), record_path)
+    prescriptions = prepare_prescription_data(prescription_path)
+    card_by_mzh_and_date: dict[tuple[str, Any], str] = {}
+    card_by_mzh: dict[str, str] = {}
+    dates_by_mzh: dict[str, set[Any]] = defaultdict(set)
+    for mzh, group in prescriptions.groupby("_mzh", sort=False):
+        card_by_mzh[mzh] = normalize_patient_idcard(_first_value(group, "证件号"))
+        dated_rows = group[group["_fee_date"].notna()]
+        for fee_date, date_rows in dated_rows.groupby("_fee_date", sort=False):
+            dates_by_mzh[mzh].add(fee_date)
+            card_by_mzh_and_date[(mzh, fee_date)] = normalize_patient_idcard(_first_value(date_rows, "证件号"))
+
+    exam_by_visit: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
+
+    for _, record in records.iterrows():
+        mzh = record["_mzh"]
+        record_date = record.get("_visit_date")
+        fee_dates = dates_by_mzh.get(mzh, set())
+        if record_date is not None:
+            if (mzh, record_date) in card_by_mzh_and_date:
+                patient_idcard = card_by_mzh_and_date[(mzh, record_date)]
+            elif not fee_dates:
+                patient_idcard = card_by_mzh.get(mzh, "")
+            else:
+                patient_idcard = ""
+        elif len(fee_dates) == 1:
+            only_date = next(iter(fee_dates))
+            patient_idcard = card_by_mzh_and_date[(mzh, only_date)]
+        elif not fee_dates:
+            patient_idcard = card_by_mzh.get(mzh, "")
+        else:
+            patient_idcard = ""
+
+        visit_time = datetime_text(record.get("时间"))
+        patient_name = normalize_patient_name(record.get("患者姓名"))
+        if not patient_idcard or not visit_time or not patient_name:
+            continue
+
+        key = (mzh, visit_time, patient_name, patient_idcard)
+        exam_by_visit[key].add(clean_text(record.get("体格检查")))
+
+    return dict(exam_by_visit), set(records["_mzh"])
+
+
+def _output_file_for_doctor(output_dir: Path, doctor_name: str) -> Path:
+    """查找指定医生现有的西区处理文件."""
+    matches = sorted(
+        path
+        for path in output_dir.glob("doctor_*/medical_records_ai.jsonl")
+        if "二期西区" in path.parent.name and path.parent.name.endswith(f"_{doctor_name}")
+    )
+    if len(matches) != 1:
+        raise FileNotFoundError(
+            f"{doctor_name} 对应的处理文件应有且仅有一个，实际找到 {len(matches)} 个"
+        )
+    return matches[0]
+
+
+def _atomic_replace_files(file_plans: list[tuple[Path, bytes, bytes]]) -> None:
+    """先完整写好临时文件，再原子替换；发生失败时恢复已替换文件."""
+    temporary_paths: dict[Path, Path] = {}
+    replaced_paths: list[tuple[Path, bytes, int]] = []
+    modes = {path: stat.S_IMODE(path.stat().st_mode) for path, _, _ in file_plans}
+    try:
+        for path, original_bytes, new_bytes in file_plans:
+            if path.read_bytes() != original_bytes:
+                raise RuntimeError(f"{path} 在准备写回期间发生变化，已取消更新")
+            with tempfile.NamedTemporaryFile(
+                "wb",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as file:
+                temporary_path = Path(file.name)
+                file.write(new_bytes)
+            os.chmod(temporary_path, modes[path])
+            temporary_paths[path] = temporary_path
+
+        for path, original_bytes, _ in file_plans:
+            if path.read_bytes() != original_bytes:
+                raise RuntimeError(f"{path} 在提交前发生变化，已取消更新")
+
+        for path, original_bytes, _ in file_plans:
+            os.replace(temporary_paths.pop(path), path)
+            replaced_paths.append((path, original_bytes, modes[path]))
+    except Exception:
+        for path, original_bytes, mode in reversed(replaced_paths):
+            with tempfile.NamedTemporaryFile(
+                "wb",
+                dir=path.parent,
+                prefix=f".{path.name}.rollback.",
+                suffix=".tmp",
+                delete=False,
+            ) as file:
+                rollback_path = Path(file.name)
+                file.write(original_bytes)
+            os.chmod(rollback_path, mode)
+            os.replace(rollback_path, path)
+        raise
+    finally:
+        for temporary_path in temporary_paths.values():
+            if temporary_path.exists():
+                temporary_path.unlink()
+
+
+def update_processed_admin_face_describe(
+    data_dir: Path,
+    output_dir: Path,
+    doctor_name: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """只将现有西区 JSONL 的 admin_face_describe 回填为匹配问诊的体格检查."""
+    doctor_names = [doctor_name] if doctor_name else discover_doctors(data_dir)
+    if not doctor_names:
+        raise FileNotFoundError(f"在 {data_dir} 下没有找到西区医生病历")
+
+    file_plans: list[tuple[Path, bytes, bytes]] = []
+    total_records = 0
+    matched_records = 0
+    unmatched_records = 0
+    changed_records = 0
+    ambiguous_records = 0
+
+    for name in doctor_names:
+        record_path = data_dir / f"{name} 病历.xlsx"
+        prescription_path = data_dir / f"{name}.xlsx"
+        output_path = _output_file_for_doctor(output_dir, name)
+        exam_by_visit, source_order_nos = build_admin_face_describe_index(record_path, prescription_path)
+        original_bytes = output_path.read_bytes()
+        original_text = original_bytes.decode("utf-8")
+        output_lines: list[str] = []
+        doctor_total = 0
+        doctor_matched = 0
+        doctor_unmatched = 0
+        doctor_changed = 0
+
+        for line_number, raw_line in enumerate(original_text.splitlines(keepends=True), start=1):
+            line_ending = "\r\n" if raw_line.endswith("\r\n") else "\n" if raw_line.endswith("\n") else ""
+            content = raw_line[: -len(line_ending)] if line_ending else raw_line
+            if not content.strip():
+                output_lines.append(raw_line)
+                continue
+
+            try:
+                record = json.loads(content)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{output_path}:{line_number} 不是有效 JSON: {error.msg}") from error
+            if not isinstance(record, dict):
+                raise ValueError(f"{output_path}:{line_number} 的 JSON 根节点不是对象")
+
+            doctor_total += 1
+            base_order_no = get_base_order_no(record.get("order_sn"), record.get("created_at"), source_order_nos)
+            key = (
+                base_order_no,
+                datetime_text(record.get("created_at")),
+                normalize_patient_name(record.get("patient_name")),
+                normalize_patient_idcard(record.get("patient_idcard")),
+            )
+            exam_values = exam_by_visit.get(key) if all(key) else None
+            if not exam_values:
+                doctor_unmatched += 1
+                output_lines.append(raw_line)
+                continue
+            if len(exam_values) != 1:
+                ambiguous_records += 1
+                output_lines.append(raw_line)
+                continue
+
+            doctor_matched += 1
+            desired_value = next(iter(exam_values))
+            original_other_fields = {
+                field: value for field, value in record.items() if field != "admin_face_describe"
+            }
+            if record.get("admin_face_describe") != desired_value:
+                record["admin_face_describe"] = desired_value
+                doctor_changed += 1
+            if original_other_fields != {
+                field: value for field, value in record.items() if field != "admin_face_describe"
+            }:
+                raise AssertionError(f"{output_path}:{line_number} 除 admin_face_describe 外的字段发生变化")
+            output_lines.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + line_ending)
+
+        file_plans.append((output_path, original_bytes, "".join(output_lines).encode("utf-8")))
+        total_records += doctor_total
+        matched_records += doctor_matched
+        unmatched_records += doctor_unmatched
+        changed_records += doctor_changed
+        print(
+            f"[{name}] 病历 {doctor_total} 条，匹配 {doctor_matched} 条，"
+            f"未匹配 {doctor_unmatched} 条，待修改 {doctor_changed} 条"
+        )
+
+    if ambiguous_records:
+        raise ValueError(f"发现 {ambiguous_records} 条病历对应多种体格检查，已取消全部写回")
+    if not dry_run:
+        _atomic_replace_files(file_plans)
+
+    return {
+        "doctor_files": len(file_plans),
+        "total_records": total_records,
+        "matched_records": matched_records,
+        "unmatched_records": unmatched_records,
+        "changed_records": changed_records,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="清洗二期西区医生病历与收费处方明细，生成 medical_records_ai.jsonl")
-    parser.add_argument("--doctorname", "--doctor-name", dest="doctor_name", help="只处理指定医生；默认处理目录中的全部医生")
+    parser.add_argument(
+        "--doctorname", "--doctor-name", dest="doctor_name", help="只处理指定医生；默认处理目录中的全部医生"
+    )
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help="二期西区源数据目录")
-    parser.add_argument("--record-path", "--record_path", type=Path, help="指定病历文件，需要同时指定处方文件和医生姓名")
+    parser.add_argument(
+        "--record-path", "--record_path", type=Path, help="指定病历文件，需要同时指定处方文件和医生姓名"
+    )
     parser.add_argument("--prescription-path", "--prescription_path", type=Path, help="指定收费处方明细文件")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="处理结果根目录")
     parser.add_argument("--doctor-id-map", type=Path, help="医生 ID 映射 JSON，键为医生姓名、值为医生 ID")
+    parser.add_argument(
+        "--update-admin-face-describe",
+        action="store_true",
+        help="只将现有处理结果中的 admin_face_describe 更新为匹配问诊的体格检查",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="仅统计更新匹配结果，不写回文件")
     return parser
 
 
 def main() -> list[Path]:
     args = build_parser().parse_args()
+    if args.dry_run and not args.update_admin_face_describe:
+        raise SystemExit("--dry-run 需要与 --update-admin-face-describe 一起使用")
+
+    if args.update_admin_face_describe:
+        if args.record_path or args.prescription_path:
+            raise SystemExit("--update-admin-face-describe 使用 --data-dir 中的医生配对文件，不接受指定单个源文件")
+        summary = update_processed_admin_face_describe(
+            args.data_dir,
+            args.output_dir,
+            doctor_name=args.doctor_name,
+            dry_run=args.dry_run,
+        )
+        action = "匹配预览完成，未写回" if args.dry_run else "更新完成"
+        print(
+            f"{action}：医生文件 {summary['doctor_files']} 份，病历 {summary['total_records']} 条，"
+            f"匹配 {summary['matched_records']} 条，未匹配 {summary['unmatched_records']} 条，"
+            f"修改 admin_face_describe {summary['changed_records']} 条。"
+        )
+        return []
+
     id_map = load_doctor_id_map(args.doctor_id_map)
 
     if args.record_path or args.prescription_path:
