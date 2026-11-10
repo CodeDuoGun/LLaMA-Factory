@@ -39,6 +39,32 @@ DEFAULT_INPUT = (
 PROMPT_PATH = PROJECT_ROOT / "medical/prompts/xiqu_cleaner.txt"
 EXTRACTION_PROMPT_PATH = PROJECT_ROOT / "medical/data_utils/prompts/extract_prompt.txt"
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+CLEANER_OUTPUT_FIELDS = (
+    "patient_appeal",
+    "new_medical_history",
+    "old_medical_history",
+    "allergic_history",
+    "diagnosis_illness",
+    "diagnosis_sickness",
+    "diagnosis_disease",
+    "marriage_history",
+    "birth_detail",
+    "personal_history",
+    "family_history",
+    "special_history",
+    "diagnosis_illness_reason",
+    "diagnosis_disease_reason",
+    "diagnosis_sickness_reason",
+)
+CLINICAL_EXTRACTION_FIELDS = (
+    "etiology",
+    "pathogenesis",
+    "disease_location",
+    "disease_stage",
+    "disease_course",
+    "key_symptoms",
+    "treatment_principle",
+)
 
 
 def load_system_prompt() -> str:
@@ -59,6 +85,16 @@ def load_extraction_prompt() -> str:
     if not prompt:
         raise ValueError(f"临床信息抽取提示词文件为空：{EXTRACTION_PROMPT_PATH}")
     return prompt
+
+
+def parse_bool(value: str) -> bool:
+    """Parse common command-line spellings for a boolean flag."""
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "是"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "否"}:
+        return False
+    raise argparse.ArgumentTypeError("布尔值请使用 true/false")
 
 
 def build_output_schema() -> type:
@@ -134,6 +170,26 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="最多处理的非空记录数；其余行原样保留",
+    )
+    parser.add_argument(
+        "--skip",
+        nargs="?",
+        const=True,
+        default=False,
+        type=parse_bool,
+        help="跳过已完成清洗和临床抽取的记录，可写 --skip 或 --skip true；默认 false",
+    )
+    parser.add_argument(
+        "--failed-output",
+        type=Path,
+        default=None,
+        help="失败记录另存路径；默认与输入文件同目录的 <文件名>_failed.jsonl",
+    )
+    parser.add_argument(
+        "--merge-target",
+        type=Path,
+        default=None,
+        help="将成功清洗结果按 order_sn 回写到指定 JSONL 主文件，只更新 ai_* 字段",
     )
     return parser.parse_args()
 
@@ -340,23 +396,7 @@ def build_clinical_extraction_payload(record: dict[str, Any]) -> dict[str, Any]:
 
 def apply_result(record: dict[str, Any], result: Any) -> dict[str, Any]:
     """Map structured output fields to their ai_* counterparts."""
-    for field in (
-        "patient_appeal",
-        "new_medical_history",
-        "old_medical_history",
-        "allergic_history",
-        "diagnosis_illness",
-        "diagnosis_sickness",
-        "diagnosis_disease",
-        "marriage_history",
-        "birth_detail",
-        "personal_history",
-        "family_history",
-        "special_history",
-        "diagnosis_illness_reason",
-        "diagnosis_disease_reason",
-        "diagnosis_sickness_reason",
-    ):
+    for field in CLEANER_OUTPUT_FIELDS:
         value = getattr(result, field)
         record[f"ai_{field}"] = value.strip() if isinstance(value, str) else value
     return record
@@ -372,6 +412,133 @@ def apply_clinical_extraction_result(record: dict[str, Any], result: Any) -> dic
             value = [item.strip() for item in value if isinstance(item, str) and item.strip()]
         record[f"ai_{field}"] = value
     return record
+
+
+def is_record_cleaned(record: dict[str, Any]) -> bool:
+    """Return true only when both cleaner and clinical extraction outputs exist."""
+    required_fields = (*CLEANER_OUTPUT_FIELDS, *CLINICAL_EXTRACTION_FIELDS)
+    return all(f"ai_{field}" in record for field in required_fields)
+
+
+def write_jsonl_atomic(output_path: Path, records: list[dict[str, Any]]) -> None:
+    """Atomically write records as JSONL, including an empty list when requested."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as target:
+            temp_path = Path(target.name)
+            for record in records:
+                target.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temp_path, output_path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def replace_jsonl_records(
+    output_path: Path,
+    original_lines: list[str],
+    records: dict[int, dict[str, Any]],
+    changed_line_numbers: set[int],
+) -> None:
+    """Atomically replace selected JSONL rows and preserve untouched lines."""
+    original_mode = output_path.stat().st_mode & 0o777
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as target:
+            temp_path = Path(target.name)
+            for line_number, line in enumerate(original_lines, start=1):
+                if line_number in changed_line_numbers:
+                    serialized = json.dumps(records[line_number], ensure_ascii=False, separators=(",", ":"))
+                    target.write(serialized + "\n")
+                else:
+                    target.write(line)
+            target.flush()
+            os.fsync(target.fileno())
+
+        os.chmod(temp_path, original_mode)
+        os.replace(temp_path, output_path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def index_merge_target(
+    target_records: dict[int, dict[str, Any]],
+    source_records: dict[int, dict[str, Any]],
+    selected_line_numbers: list[int],
+) -> dict[str, int]:
+    """Match selected retry rows to unique target rows by order_sn before model calls."""
+    source_orders = [_text(source_records[line].get("order_sn")) for line in selected_line_numbers]
+    if any(not order_sn for order_sn in source_orders):
+        raise ValueError("重试文件中存在空 order_sn，无法回写主文件")
+    if len(source_orders) != len(set(source_orders)):
+        raise ValueError("重试文件中存在重复 order_sn，无法唯一回写主文件")
+
+    wanted = set(source_orders)
+    target_order_to_line: dict[str, int] = {}
+    duplicate_targets: set[str] = set()
+    for line_number, record in target_records.items():
+        order_sn = _text(record.get("order_sn"))
+        if order_sn not in wanted:
+            continue
+        if order_sn in target_order_to_line:
+            duplicate_targets.add(order_sn)
+        else:
+            target_order_to_line[order_sn] = line_number
+
+    if duplicate_targets:
+        raise ValueError(f"主文件中存在重复 order_sn，无法唯一回写：{', '.join(sorted(duplicate_targets))}")
+    missing = wanted - target_order_to_line.keys()
+    if missing:
+        raise ValueError(f"以下 order_sn 未在主文件中找到：{', '.join(sorted(missing))}")
+    return target_order_to_line
+
+
+def merge_cleaned_records(
+    target_path: Path,
+    target_lines: list[str],
+    target_records: dict[int, dict[str, Any]],
+    target_order_to_line: dict[str, int],
+    cleaned_records: dict[int, dict[str, Any]],
+    successful_line_numbers: set[int],
+) -> int:
+    """Merge cleaner and extraction outputs into matching target rows by order_sn."""
+    changed_lines: set[int] = set()
+    fields = (*CLEANER_OUTPUT_FIELDS, *CLINICAL_EXTRACTION_FIELDS)
+    for source_line in successful_line_numbers:
+        cleaned = cleaned_records[source_line]
+        target_line = target_order_to_line[_text(cleaned.get("order_sn"))]
+        target = target_records[target_line]
+        for field in fields:
+            ai_field = f"ai_{field}"
+            if ai_field in cleaned:
+                target[ai_field] = cleaned[ai_field]
+        changed_lines.add(target_line)
+
+    if changed_lines:
+        replace_jsonl_records(target_path, target_lines, target_records, changed_lines)
+    return len(changed_lines)
 
 
 async def clean_record(
@@ -401,7 +568,7 @@ async def clean_record(
 
 
 async def clean_file(args: argparse.Namespace) -> int:
-    """Clean records in bounded batches and atomically replace the specified JSONL file."""
+    """Clean records in bounded batches, retaining and exporting failed source rows."""
     input_path = args.input.expanduser().resolve()
     if not input_path.is_file():
         raise FileNotFoundError(f"输入文件不存在：{input_path}")
@@ -409,8 +576,20 @@ async def clean_file(args: argparse.Namespace) -> int:
         raise ValueError("--limit 必须大于 0")
     if args.batchsize < 1:
         raise ValueError("--batchsize 必须是大于 0 的整数")
-    if not args.api_key:
-        raise ValueError("未提供 API Key，请设置 DASHSCOPE_API_KEY 或使用 --api-key")
+    failed_output = getattr(args, "failed_output", None)
+    if failed_output is None:
+        failed_output = input_path.with_name(f"{input_path.stem}_failed.jsonl")
+    else:
+        failed_output = failed_output.expanduser().resolve()
+    if failed_output == input_path:
+        raise ValueError("--failed-output 不能与 --input 指向同一个文件")
+    merge_target = getattr(args, "merge_target", None)
+    if merge_target is not None:
+        merge_target = merge_target.expanduser().resolve()
+        if not merge_target.is_file():
+            raise FileNotFoundError(f"回写主文件不存在：{merge_target}")
+        if merge_target in {input_path, failed_output}:
+            raise ValueError("--merge-target 不能与 --input 或 --failed-output 指向同一个文件")
 
     lines = input_path.read_text(encoding="utf-8").splitlines(keepends=True)
     records: dict[int, dict[str, Any]] = {}
@@ -425,6 +604,41 @@ async def clean_file(args: argparse.Namespace) -> int:
             raise ValueError(f"第 {line_number} 行必须是 JSON 对象；原文件未覆盖")
         records[line_number] = record
     previous_contexts = build_previous_visit_contexts(records)
+
+    skip_cleaned = bool(getattr(args, "skip", False))
+    line_numbers = [
+        line_number
+        for line_number, record in records.items()
+        if not skip_cleaned or not is_record_cleaned(record)
+    ]
+    skipped_count = len(records) - len(line_numbers)
+    if args.limit is not None:
+        line_numbers = line_numbers[: args.limit]
+    target_lines: list[str] = []
+    target_records: dict[int, dict[str, Any]] = {}
+    target_order_to_line: dict[str, int] = {}
+    if merge_target is not None and line_numbers:
+        target_lines = merge_target.read_text(encoding="utf-8").splitlines(keepends=True)
+        for line_number, line in enumerate(target_lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                target_record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"主文件第 {line_number} 行不是合法 JSON；主文件未覆盖") from exc
+            if not isinstance(target_record, dict):
+                raise ValueError(f"主文件第 {line_number} 行必须是 JSON 对象；主文件未覆盖")
+            target_records[line_number] = target_record
+        target_order_to_line = index_merge_target(target_records, records, line_numbers)
+    print(
+        f"记录 {len(records)} 条，跳过已完成清洗 {skipped_count} 条，"
+        f"本次计划处理 {len(line_numbers)} 条"
+    )
+    if not line_numbers:
+        print("没有待处理记录")
+        return 0
+    if not args.api_key:
+        raise ValueError("未提供 API Key，请设置 DASHSCOPE_API_KEY 或使用 --api-key")
 
     from langchain_core.messages import HumanMessage
 
@@ -459,12 +673,9 @@ async def clean_file(args: argparse.Namespace) -> int:
         validation_retries=1,
     )
 
-    original_mode = input_path.stat().st_mode & 0o777
-    line_numbers = list(records)
-    if args.limit is not None:
-        line_numbers = line_numbers[: args.limit]
-
-    processed = 0
+    attempted = 0
+    successful_line_numbers: set[int] = set()
+    failed_records: list[dict[str, Any]] = []
     for start in range(0, len(line_numbers), args.batchsize):
         batch_line_numbers = line_numbers[start : start + args.batchsize]
         results = await asyncio.gather(
@@ -483,49 +694,50 @@ async def clean_file(args: argparse.Namespace) -> int:
         )
 
         for line_number, result in zip(batch_line_numbers, results, strict=True):
+            if isinstance(result, Exception):
+                failed_records.append(records[line_number])
+                order_sn = _text(records[line_number].get("order_sn"))
+                print(
+                    f"[失败] 第 {line_number} 行，order_sn={order_sn}，"
+                    f"{type(result).__name__}: {result}；原记录保留"
+                )
+                continue
             if isinstance(result, BaseException):
-                raise RuntimeError(
-                    f"第 {line_number} 行处理失败（{type(result).__name__}）；原文件未覆盖"
-                ) from result
-
-        for line_number, result in zip(batch_line_numbers, results, strict=True):
+                raise result
             records[line_number] = result
+            successful_line_numbers.add(line_number)
 
-        processed += len(batch_line_numbers)
-        print(f"已完成 {processed}/{len(line_numbers)} 条")
+        attempted += len(batch_line_numbers)
+        print(
+            f"已处理 {attempted}/{len(line_numbers)} 条，成功 {len(successful_line_numbers)} 条，"
+            f"失败 {len(failed_records)} 条"
+        )
 
-    # Only one writer touches the file; no output is committed until every requested
-    # record has succeeded, and atomic replacement keeps the original intact on errors.
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="\n",
-            dir=input_path.parent,
-            prefix=f".{input_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as target:
-            temp_path = Path(target.name)
-            processed_line_numbers = set(line_numbers)
-            for line_number, line in enumerate(lines, start=1):
-                if line_number in processed_line_numbers:
-                    target.write(json.dumps(records[line_number], ensure_ascii=False, separators=(",", ":")) + "\n")
-                else:
-                    target.write(line)
-            target.flush()
-            os.fsync(target.fileno())
+    if failed_records:
+        write_jsonl_atomic(failed_output, failed_records)
+        print(f"失败记录已另存 {len(failed_records)} 条，可将该文件作为 --input 重试：{failed_output}")
 
-        os.chmod(temp_path, original_mode)
-        os.replace(temp_path, input_path)
-        temp_path = None
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+    merged_count = 0
+    if merge_target is not None and successful_line_numbers:
+        merged_count = merge_cleaned_records(
+            merge_target,
+            target_lines,
+            target_records,
+            target_order_to_line,
+            records,
+            successful_line_numbers,
+        )
+        print(f"已按 order_sn 将 {merged_count} 条成功结果回写到主文件：{merge_target}")
 
-    print(f"完成：处理 {processed} 条，已写回 {input_path}")
-    return processed
+    if successful_line_numbers:
+        replace_jsonl_records(input_path, lines, records, successful_line_numbers)
+
+    print(
+        f"完成：成功 {len(successful_line_numbers)} 条，失败 {len(failed_records)} 条，"
+        f"已更新 {input_path}"
+        + (f"，已回写主文件 {merged_count} 条" if merge_target is not None else "")
+    )
+    return len(successful_line_numbers)
 
 
 def main() -> None:
@@ -536,6 +748,16 @@ def main() -> None:
         load_dotenv(PROJECT_ROOT / ".env")
     except ImportError:
         pass
+    """
+    /Users/tangxueduo/anaconda3/envs/llamafactory/bin/python \
+  medical/data_utils/raw_data_clear/clear_xiqu_withai.py \
+  --input medical/processed_data/doctor_二期西区_张雪亮/medical_records_ai_failed.jsonl \
+  --merge-target medical/processed_data/doctor_二期西区_张雪亮/medical_records_ai.jsonl \
+  --failed-output medical/processed_data/doctor_二期西区_张雪亮/medical_records_ai_failed_remaining.jsonl \
+  --skip true \
+  --batchsize 1
+    
+    """
     args = parse_args()
     asyncio.run(clean_file(args))
 

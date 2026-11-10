@@ -111,7 +111,7 @@ def collect_diagnoses_by_doctor(data_dir: Path) -> tuple[dict[str, set[str]], di
 
                 total_records += 1
                 doctor = str(record.get("doctor_name") or folder_doctor).strip() or "未知医生"
-                diagnoses_by_doctor.setdefault(doctor, set())
+                diagnoses_by_doctor.setdefault(doctor, set[str]())
                 diagnoses = split_diagnoses(record.get("diagnosis_illness"))
                 if not diagnoses:
                     records_without_diagnosis += 1

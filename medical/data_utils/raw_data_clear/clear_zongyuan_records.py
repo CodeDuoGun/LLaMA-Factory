@@ -93,46 +93,6 @@ PHASE2_SECTION_STOP_LABELS = tuple(
     alias for aliases in PHASE2_SOURCE_FIELDS.values() for alias in aliases
 ) + ("体格检查", "辅助检查", "初步诊断", "处理措施", "治疗方案", "医师签名")
 
-DOCTOR_ALIASES = {
-    "hukaiwen": "hukaiwen",
-    "胡凯文": "hukaiwen",
-    "chuyuping": "chuyuping",
-    "初玉平": "chuyuping",
-    "liugenshang": "liugenshang",
-    "刘根尚": "liugenshang",
-    "liuluming": "liuluming",
-    "刘鲁明": "liuluming",
-    "wangsumei": "wangsumei",
-    "王素梅": "wangsumei",
-}
-
-DOCTOR_CONFIGS = {
-    "hukaiwen": {
-        "doctor_display_name": "胡凯文",
-        "record_file": PROJECT_ROOT / "medical/data/zongyuan_hukaiwen/胡凯文门诊病历-20240101-20260712.xlsx",
-        "prescription_file": PROJECT_ROOT / "medical/data/zongyuan_hukaiwen/胡凯文门诊收费明细20250101-20260630-2(1).xlsx",
-    },
-    "chuyuping": {
-        "doctor_display_name": "初玉平",
-        "record_file": PROJECT_ROOT / "medical/data/zongyuan_chuyuping/初玉平-门诊病历-20240101-20260706.xlsx",
-        "prescription_file": PROJECT_ROOT / "medical/data/zongyuan_chuyuping/初玉平-门诊收费明细-20240101-20260706.xlsx",
-    },
-    "liugenshang": {
-        "doctor_display_name": "刘根尚",
-        "record_file": PROJECT_ROOT / "medical/data/zongyuan_liugenshang/刘根尚-门诊病历-20240101-20260701.xlsx",
-        "prescription_file": PROJECT_ROOT / "medical/data/zongyuan_liugenshang/刘根尚-门诊收费明细-20240101-20260706.xlsx",
-    },
-    "liuluming": {
-        "doctor_display_name": "刘鲁明",
-        "record_file": PROJECT_ROOT / "medical/data/zongyuan_liuluming/刘鲁明-门诊病历-20240101-20260701.xlsx",
-        "prescription_file": PROJECT_ROOT / "medical/data/zongyuan_liuluming/刘鲁明-门诊收费明细-20240101-20260706.xlsx",
-    },
-    "wangsumei": {
-        "doctor_display_name": "王素梅",
-        "record_file": PROJECT_ROOT / "medical/data/zongyuan_wangsumei/王素梅-门诊病历-20240101-20260701.xlsx",
-        "prescription_file": PROJECT_ROOT / "medical/data/zongyuan_wangsumei/王素梅-门诊收费明细-20240101-20260706.xlsx",
-    },
-}
 
 ID_CANDIDATES = ("就诊ID", "门诊号", "病历ID")
 RECORD_DATE_CANDIDATES = ("就诊时间", "病历书写时间")
@@ -208,12 +168,6 @@ def clean_dose(value: Any) -> str:
     if inner:
         return clean_cell(inner[0])
     return text
-
-
-def normalize_doctorname(doctorname: str) -> str:
-    """统一 doctorname 参数。"""
-    key = (doctorname or "").strip()
-    return DOCTOR_ALIASES.get(key, key)
 
 
 def read_excel_all_sheets(path: Path) -> pd.DataFrame:
@@ -327,11 +281,10 @@ def filter_complete_same_day_records(
 
 def resolve_paths(args: argparse.Namespace) -> tuple[str, Path, Path, Path]:
     """根据 doctorname 和显式参数解析输入/输出路径。"""
-    doctorname = normalize_doctorname(args.doctorname)
-    config = DOCTOR_CONFIGS.get(doctorname, {})
+    doctorname = args.doctorname
 
-    record_file = args.record_file or config.get("record_file")
-    prescription_file = args.prescription_file or config.get("prescription_file")
+    record_file = args.record_file
+    prescription_file = args.prescription_file
     if record_file is None or prescription_file is None:
         raise ValueError("未知 doctorname 时必须同时传入 --record-file 和 --prescription-file")
 
@@ -603,7 +556,7 @@ def build_output_record(
     output = OrderedDict(
         inquiry_id=inquiry_id,
         order_sn=clean_cell(record.get("门诊号")),
-        inquiry_method="",
+        inquiry_method="门诊",
         is_first=clean_cell(record.get("初复诊")),
         patient_name=clean_cell(record.get("患者姓名")),
         patient_sex=clean_cell(record.get("患者性别")),
@@ -741,6 +694,50 @@ def resolve_phase2_paths(args: argparse.Namespace) -> tuple[str, Path, Path, Pat
     if output_path.suffix.lower() != ".jsonl":
         output_path = output_path.with_suffix(".jsonl")
     return doctorname, record_file, prescription_file, Path(output_path)
+
+
+def discover_phase2_doctor_files(source_dir: Path) -> list[tuple[str, Path, Path]]:
+    """扫描二期总院目录，校验并返回每位医生的病历表和收费明细表。"""
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"二期总院数据目录不存在: {source_dir}")
+
+    files_by_doctor: dict[str, dict[str, list[Path]]] = {}
+    for path in sorted(source_dir.iterdir()):
+        if not path.is_file() or path.name.startswith("~$") or path.suffix.lower() != ".xlsx":
+            continue
+        for marker, file_type in (("-门诊病历-", "record"), ("-门诊收费明细-", "prescription")):
+            if marker not in path.name:
+                continue
+            doctor_name = path.name.split(marker, maxsplit=1)[0].strip()
+            if doctor_name:
+                files_by_doctor.setdefault(doctor_name, {"record": [], "prescription": []})[file_type].append(path)
+            break
+
+    if not files_by_doctor:
+        raise FileNotFoundError(f"{source_dir} 下没有找到医生门诊病历或收费明细 Excel 文件")
+
+    incomplete = []
+    doctor_files = []
+    for doctor_name, files in sorted(files_by_doctor.items()):
+        record_files = files["record"]
+        prescription_files = files["prescription"]
+        if len(record_files) != 1 or len(prescription_files) != 1:
+            details = []
+            if not record_files:
+                details.append("缺少门诊病历表")
+            elif len(record_files) > 1:
+                details.append("门诊病历表有多个: " + ", ".join(path.name for path in record_files))
+            if not prescription_files:
+                details.append("缺少门诊收费明细表")
+            elif len(prescription_files) > 1:
+                details.append("门诊收费明细表有多个: " + ", ".join(path.name for path in prescription_files))
+            incomplete.append(f"{doctor_name}（{'；'.join(details)}）")
+            continue
+        doctor_files.append((doctor_name, record_files[0], prescription_files[0]))
+
+    if incomplete:
+        raise ValueError("二期总院医生文件未能一一配对：" + "；".join(incomplete))
+    return doctor_files
 
 
 def clean_body_text(value: Any) -> str:
@@ -1023,7 +1020,12 @@ def phase2_prescription_type(rows: list[pd.Series]) -> str:
 
 
 def phase2_build_prescriptions(rows: pd.DataFrame) -> list[OrderedDict[str, Any]]:
-    """按处方号和结算日归并收费明细，保留一个处方中的全部药品行。"""
+    """过滤西药和中成药明细，按处方号和结算日保留其他处方。"""
+    if rows.empty:
+        return []
+
+    if "费用类别" in rows.columns:
+        rows = rows[~rows["费用类别"].map(clean_cell).isin({"西药费", "中成药费"})]
     if rows.empty:
         return []
 
@@ -1294,8 +1296,39 @@ def process_phase2_records(args: argparse.Namespace) -> Path:
     return output_path
 
 
-def process_records(args: argparse.Namespace) -> Path:
+def process_all_phase2_records(args: argparse.Namespace) -> list[Path]:
+    """逐位处理二期总院目录中的所有医生，并分别写入医生目录。"""
+    if args.record_file or args.prescription_file or args.output:
+        raise ValueError(
+            "--all-doctors 模式下不使用 --record-file、--prescription-file 或 --output，"
+            "请用 --source-dir 和 --output-dir"
+        )
+
+    source_dir = Path(args.source_dir)
+    doctor_files = discover_phase2_doctor_files(source_dir)
+    print(f"发现 {len(doctor_files)} 位医生，将逐位清洗并写入 {args.output_dir}")
+
+    outputs = []
+    for index, (doctor_name, record_file, prescription_file) in enumerate(doctor_files, start=1):
+        print(f"\n===== [{index}/{len(doctor_files)}] {doctor_name} =====")
+        doctor_args = argparse.Namespace(**vars(args))
+        doctor_args.doctorname = doctor_name
+        doctor_args.record_file = record_file
+        doctor_args.prescription_file = prescription_file
+        doctor_args.output = None
+        outputs.append(process_phase2_records(doctor_args))
+
+    print(f"\n✅ 二期总院全部医生处理完成，共 {len(outputs)} 位")
+    return outputs
+
+
+def process_records(args: argparse.Namespace) -> Path | list[Path]:
     """读取两张表，按问诊单 ID 合并并写出最新结构化表。"""
+    if getattr(args, "all_doctors", False):
+        if args.source_layout == "legacy":
+            raise ValueError("--all-doctors 仅适用于二期总院数据，请移除 --source-layout legacy")
+        return process_all_phase2_records(args)
+
     if should_use_phase2_layout(args):
         return process_phase2_records(args)
 
@@ -1374,6 +1407,7 @@ def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="处理总院线下医生病历和收费明细为结构化合并表。")
     parser.add_argument("--doctorname", "--doctoname", default="hukaiwen", help="医生数据标识，如 hukaiwen。")
+    parser.add_argument("--all-doctors", action="store_true", help="清洗 --source-dir 中所有医生的二期总院数据。")
     parser.add_argument("--record-file", type=Path, help="门诊病历表路径。")
     parser.add_argument("--prescription-file", type=Path, help="门诊收费/处方明细表路径。")
     parser.add_argument("--output", type=Path, help="输出文件路径；二期总院模式写为 JSONL。")
@@ -1398,7 +1432,7 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="每批并发处理的病历数，默认 1（顺序处理）。",
     )
-    parser.add_argument("--limit", type=int, default=0, help="仅处理前 N 条病历，0 表示处理全部。")
+    parser.add_argument("--limit", type=int, default=0, help="每位医生仅处理前 N 条病历，0 表示处理全部。")
     return parser.parse_args()
 
 

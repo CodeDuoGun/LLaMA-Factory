@@ -47,6 +47,24 @@ DRUG_PROCESS_NAMES_BY_COOKING_METHOD = {
     "自煎": "饮片",
     "打粉": "饮片",
 }
+ANALYSIS_DOCTORS = {
+    "43": "朱子奇",
+    "97": "巢国俊",
+    "432": "杨钦河",
+    "567": "李同新",
+    "577": "郝建军",
+    "1314": "吴卫平",
+    "425": "于振宣",
+    "183": "刘兴志",
+    "181": "史大卓",
+    "177": "张文彭",
+    "769": "张雪亮",
+    "164": "李佩文",
+    "403": "李方洁",
+    "718": "杨宇飞",
+    "1332": "高秀梅",
+}
+DEFAULT_DOCTOR_ID_MAP = {doctor_name: int(doctor_id) for doctor_id, doctor_name in ANALYSIS_DOCTORS.items()}
 MAX_PATIENT_ID = 2_147_483_647
 
 RECORD_REQUIRED_COLUMNS = ("门诊号", "时间", "患者姓名", "主诉", "初步诊断")
@@ -494,11 +512,14 @@ def build_drug_entry(row: pd.Series) -> dict[str, Any]:
 
 
 def aggregate_prescriptions(rows: pd.DataFrame, treatment_plan: Any) -> list[dict[str, Any]]:
-    """按处方号和药品加工类型组装 ps；同一处方中的每个药品保留为一条明细。"""
+    """仅按中草药类别组装 ps；同一处方中的每个药品保留为一条明细。"""
     if rows.empty:
         return []
 
-    frame = rows.copy()
+    frame = rows[rows["_category"].isin(HERBAL_CATEGORIES)].copy()
+    if frame.empty:
+        return []
+
     frame["_group_rx_no"] = frame.apply(
         lambda row: row["_rx_no"] or f"__row_{row.name}", axis=1
     )
@@ -734,13 +755,15 @@ def discover_doctors(data_dir: Path) -> list[str]:
 
 
 def load_doctor_id_map(path: Path | None) -> dict[str, int]:
+    doctor_id_map = dict(DEFAULT_DOCTOR_ID_MAP)
     if path is None:
-        return {}
+        return doctor_id_map
     with path.open(encoding="utf-8") as file:
         raw = json.load(file)
     if not isinstance(raw, dict):
         raise ValueError("医生 ID 映射文件必须是 JSON 对象，例如 {\"于振宣\": 123}")
-    return {str(name): int(doctor_id) for name, doctor_id in raw.items() if doctor_id is not None}
+    doctor_id_map.update({str(name): int(doctor_id) for name, doctor_id in raw.items() if doctor_id is not None})
+    return doctor_id_map
 
 
 def process_doctor(
@@ -750,6 +773,7 @@ def process_doctor(
     output_dir: Path,
     doctor_id: int | None = None,
     patient_id_allocator: PatientIdAllocator | None = None,
+    use_id_in_output_dir: bool = False,
 ) -> Path:
     if patient_id_allocator is None:
         patient_id_allocator = PatientIdAllocator(output_dir, [(doctor_name, doctor_id)])
@@ -784,10 +808,10 @@ def process_doctor(
 
     dated_order_sns = disambiguate_duplicate_order_sns(output_records)
 
-    if doctor_id is None:
-        folder_name = f"doctor_二期西区_{doctor_name}"
-    else:
+    if use_id_in_output_dir and doctor_id is not None:
         folder_name = f"doctor_{doctor_id}_{doctor_name}"
+    else:
+        folder_name = f"doctor_二期西区_{doctor_name}"
     target_dir = output_dir / folder_name
     target_dir.mkdir(parents=True, exist_ok=True)
     out_path = target_dir / "medical_records_ai.jsonl"
@@ -1105,7 +1129,10 @@ def main() -> list[Path]:
 
     patient_id_allocator = PatientIdAllocator(
         args.output_dir,
-        [(name, id_map.get(name)) for name, _, _ in doctors],
+        [
+            (name, id_map.get(name) if args.doctor_id_map is not None else None)
+            for name, _, _ in doctors
+        ],
     )
     output_paths = [
         process_doctor(
@@ -1115,6 +1142,7 @@ def main() -> list[Path]:
             args.output_dir,
             id_map.get(name),
             patient_id_allocator,
+            use_id_in_output_dir=args.doctor_id_map is not None,
         )
         for name, record_path, prescription_path in doctors
     ]
