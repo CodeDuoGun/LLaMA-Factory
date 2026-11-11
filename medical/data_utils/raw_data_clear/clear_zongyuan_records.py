@@ -4,7 +4,7 @@
 门诊病历表：medical/data/zongyuan_hukaiwen/胡凯文门诊病历-20240101-20260712.xlsx
     问诊单ID、费用类别【中药费、中成药费、西药费】、数量、剂数、计价单位、剂量【数量/剂数】
 处方明细表：medical/data/zongyuan_hukaiwen/胡凯文门诊收费明细20250101-20260630-2.xlsx
-    问诊单ID\患者性别、挂号年龄、正文【需要调用llm，提取患者主诉、现病史、过敏史、既往史、家族史、个人史、婚育史】、中医主诊断、西医主诊断、中医症候名称
+    问诊单ID\患者性别、挂号年龄、正文中的结构化字段、体格检查及辅助检查、三个诊断
 处理步骤：
 1、分别读取两个文件，获取数据 raw_data
 2、根据病历表的【问诊单ID】,获取相同问诊单ID的处方明细表中的数据
@@ -17,9 +17,9 @@ import argparse
 import json
 import os
 import re
+import sys
 import tempfile
-import threading
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -29,11 +29,17 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from medical.constants import DOCTORS_MAPPING  # noqa: E402
+from medical.data_utils.raw_data_clear.clear_xiqu_records import normalize_number, datetime_text
+
+
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "medical/processed_data"
 DEFAULT_PHASE2_DATA_DIR = PROJECT_ROOT / "medical/data/二期总院"
 PHASE2_DOCTORS = {"冯春祥", "崔霞", "杨宗艳", "王素梅", "钱彦方"}
-PHASE2_PROMPT_PATH = PROJECT_ROOT / "medical/prompts/zongyuan_cleaner.txt"
-PHASE2_LLM_LOCAL = threading.local()
+DOCTOR_ID_BY_NAME = {doctor_name: doctor_id for doctor_id, doctor_name in DOCTORS_MAPPING.items()}
 PHASE2_RECORD_REQUIRED_COLUMNS = (
     "就诊ID",
     "病历ID",
@@ -91,7 +97,7 @@ PHASE2_SOURCE_FIELDS = {
 }
 PHASE2_SECTION_STOP_LABELS = tuple(
     alias for aliases in PHASE2_SOURCE_FIELDS.values() for alias in aliases
-) + ("体格检查", "辅助检查", "初步诊断", "处理措施", "治疗方案", "医师签名")
+) + ("就诊类型", "体格检查", "辅助检查", "初步诊断", "处理措施", "治疗方案", "医师签名")
 
 
 ID_CANDIDATES = ("就诊ID", "门诊号", "病历ID")
@@ -99,8 +105,6 @@ RECORD_DATE_CANDIDATES = ("就诊时间", "病历书写时间")
 PRESCRIPTION_DATE_CANDIDATES = ("项目开单时间", "结算时间")
 FEE_CATEGORIES = ("中药费", "中成药费", "西药费")
 CLINICAL_FIELDS = ("患者主诉", "现病史", "过敏史", "既往史", "家族史", "个人史", "婚育史")
-DIAGNOSIS_FIELDS = ("中医主诊断", "西医主诊断", "中医症候名称")
-
 SECTION_ALIASES = {
     "患者主诉": ("患者主诉", "主诉"),
     "现病史": ("现病史",),
@@ -112,8 +116,10 @@ SECTION_ALIASES = {
 }
 
 SECTION_STOP_LABELS = (
+    "就诊类型",
     "患者主诉",
     "主诉",
+    "性别",
     "现病史",
     "过敏史",
     "药物过敏史",
@@ -206,6 +212,13 @@ def read_phase2_excel_all_sheets(path: Path) -> pd.DataFrame:
         frame["来源Sheet"] = sheet_name
         frames.append(frame)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def require_columns(frame: pd.DataFrame, columns: tuple[str, ...], path: Path) -> None:
+    """校验 Excel 是否包含清洗流程所需的字段。"""
+    missing_columns = [column for column in columns if column not in frame.columns]
+    if missing_columns:
+        raise ValueError(f"{path} 缺少必需列: {', '.join(missing_columns)}")
 
 
 def pick_id_column(record_df: pd.DataFrame, prescription_df: pd.DataFrame) -> str:
@@ -424,23 +437,55 @@ def aggregate_prescriptions(
 
     return prescription_map
 
+
+import re
+
+
 def extract_section(text: str, aliases: tuple[str, ...]) -> str:
-    """从正文中按标签抽取一个病历段落。"""
-    if not text:
+    """从病历正文中按标签提取段落，支持标签后有无冒号。"""
+    if not text or not aliases:
         return ""
+    
+    # 新增：兼容无冒号的就诊类型
+    if "就诊类型" in aliases:
+        match = re.search(
+            r"就诊类型\s*[：:]?\s*(初诊|复诊)",
+            text,
+        )
+        return match.group(1) if match else ""
 
     alias_pattern = "|".join(re.escape(alias) for alias in aliases)
-    match = re.search(rf"(?:^|\s)(?:{alias_pattern})\s*[：:]\s*", text)
+    stop_pattern = "|".join(
+        re.escape(label) for label in SECTION_STOP_LABELS
+    )
+
+    # 支持：
+    # 就诊类型：复诊
+    # 就诊类型:
+    # 复诊
+    # 就诊类型
+    # 复诊
+    match = re.search(
+        rf"(?m)^[ \t]*(?:{alias_pattern})[ \t]*[：:]?[ \t]*(?:\n[ \t]*)?",
+        text,
+    )
     if not match:
         return ""
 
     start = match.end()
-    stop_pattern = "|".join(re.escape(label) for label in SECTION_STOP_LABELS)
-    stop_match = re.search(rf"\s(?:{stop_pattern})\s*[：:]", text[start:])
+
+    # 匹配下一个字段标签，支持有无冒号
+    stop_match = re.search(
+        rf"(?m)^[ \t]*(?:{stop_pattern})[ \t]*[：:]?(?=\s|$)",
+        text[start:],
+    )
+
     end = start + stop_match.start() if stop_match else len(text)
+
     value = text[start:end].strip(" ，,。；;\n\t")
-    value = re.sub(rf"^(?:{alias_pattern})\s*[：:]\s*", "", value).strip()
+
     return value
+
 
 
 def regex_extract_clinical_fields(record: pd.Series) -> dict[str, str]:
@@ -453,111 +498,38 @@ def regex_extract_clinical_fields(record: pd.Series) -> dict[str, str]:
     return extracted
 
 
-def extract_json_payload(response_text: str) -> str:
-    """从 LLM 回复中提取 JSON 对象。"""
-    text = response_text.strip()
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-    if fenced:
-        text = fenced.group(1).strip()
-
-    start = text.find("{")
-    if start < 0:
-        return text
-
-    decoder = json.JSONDecoder()
-    _, end = decoder.raw_decode(text[start:])
-    return text[start : start + end]
+def extract_examination_sections(record: pd.Series) -> tuple[str, str]:
+    """分别提取体格检查和辅助检查内容。"""
+    text = clean_body_text(record.get("正文"))
+    physical_exam = extract_section(text, ("体格检查",)) or clean_cell(record.get("体格检查"))
+    auxiliary_exam = extract_section(text, ("辅助检查",)) or clean_cell(record.get("辅助检查"))
+    return physical_exam, auxiliary_exam
 
 
-def build_llm_prompt(text: str) -> list[dict[str, str]]:
-    """构造正文病史字段抽取提示词。"""
-    fields = "、".join(CLINICAL_FIELDS)
-    result_msg = [
-        {
-            "role": "system",
-            "content": (
-                "你是严谨的中医门诊病历结构化助手。"
-                "只根据输入的“正文”中出现的字段抽取信息，不要编造。"
-                "字段值必须在‘正文’中显示出现，才可提取，否则认定为'无'。不得从描述中推测字段，如正文中未提及“既往史”，不得根据“现病史”进行推测和提取"
-                "未提取到的字段必须返回“无”，不要返回空字符串。"
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"请从下面“正文”字段中抽取字段：{fields}。\n"
-                "要求：\n"
-                "1. 只返回 JSON 对象，不要输出解释。\n"
-                "2. JSON key 只能包含上述 7 个中文字段名，不能新增其他字段。\n"
-                "3. value 必须为字符串；未提取到的内容统一写“无”。\n\n"
-                "4. 禁止出现冗余字符，如果字段内容出现多余符号，一律删除。如：既往史：发现乙肝病史10余年，膀胱切除] , 结果应为：‘既往史：发现乙肝病史10余年，膀胱切除’ "
-                f"正文：\n{text}"
-            ),
-        },
-    ]
-    # print(result_msg)
-    return result_msg
-
-
-
-def llm_extract_clinical_fields(text: str, model: str) -> dict[str, str]:
-    """使用 Qwen 从正文字段抽取病史字段。"""
-    from openai import OpenAI
-
-    from medical.config import config
-
-    client = OpenAI(api_key=config.DASHSCOPE_API_KEY, base_url=config.DASHSCOPE_BASE_URL)
-    response = client.chat.completions.create(
-        model=model,
-        messages=build_llm_prompt(text),
-        response_format={"type": "json_object"},
-        # max_tokens=1200,
-        temperature=0.1,
-    )
-    response_text = response.choices[0].message.content or "{}"
-    parsed = json.loads(extract_json_payload(response_text))
-    print(parsed)
-    return {field: clean_cell(parsed.get(field)) or "无" for field in CLINICAL_FIELDS}
-
-
-def extract_clinical_fields(
-    record: pd.Series,
-    use_llm: bool,
-    llm_model: str,
-) -> dict[str, str]:
-    """优先使用表格结构化字段，必要时从正文抽取。"""
-    regex_result = regex_extract_clinical_fields(record)
-    if not use_llm:
-        return regex_result
-
-    text = clean_cell(record.get("正文"))
-    if not text:
-        return regex_result
-
-    try:
-        return llm_extract_clinical_fields(text, model=llm_model)
-    except Exception as exc:
-        print(f"      ⚠️ LLM 抽取失败，回退到正则抽取。问诊单ID={record.get('问诊单ID')}: {exc}")
-        return {field: regex_result[field] or "无" for field in CLINICAL_FIELDS}
+def extract_visit_type(record: pd.Series) -> str:
+    """从正文的“就诊类型”段落提取初诊/复诊，未提供或值不匹配时留空。"""
+    text = clean_body_text(record.get("正文"))
+    visit_type = extract_section(text, ("就诊类型",))
+    # print(f"{record.get("病历ID")} 患者 就诊类型为 {visit_type}, 正文 {text}")
+    return visit_type if visit_type in {"初诊", "复诊"} else ""
 
 
 def build_output_record(
     record: pd.Series,
     prescription_map: dict[str, dict[str, Any]],
-    use_llm: bool,
-    llm_model: str,
 ) -> OrderedDict[str, Any]:
     """构造最终输出的一条 JSON 记录。"""
     inquiry_id = clean_cell(record.get("问诊单ID"))
     prescription = prescription_map.get(inquiry_id, {})
     prescriptions = prescription.get("prescriptions", [])
-    clinical_fields = extract_clinical_fields(record, use_llm, llm_model)
+    clinical_fields = regex_extract_clinical_fields(record)
+    physical_exam, auxiliary_exam = extract_examination_sections(record)
 
     output = OrderedDict(
         inquiry_id=inquiry_id,
         order_sn=clean_cell(record.get("门诊号")),
         inquiry_method="门诊",
-        is_first=clean_cell(record.get("初复诊")),
+        is_first=extract_visit_type(record),
         patient_name=clean_cell(record.get("患者姓名")),
         patient_sex=clean_cell(record.get("患者性别")),
         patient_age=clean_cell(record.get("挂号年龄")),
@@ -569,8 +541,8 @@ def build_output_record(
         family_history=clinical_fields.get("家族史", "无"),
         personal_history=clinical_fields.get("个人史", "无"),
         birth_detail=clinical_fields.get("婚育史", "无"),
-        admin_report_describe="",
-        admin_face_describe="",
+        admin_report_describe=auxiliary_exam,
+        admin_face_describe=physical_exam,
         inspection_report_img=[],
         tongue_face_img=[],
         admin_report_img=[],
@@ -615,8 +587,6 @@ def write_output(records: list[dict[str, Any]], output_path: Path) -> None:
 def build_output_records(
     record_df: pd.DataFrame,
     prescription_map: dict[str, dict[str, Any]],
-    use_llm: bool,
-    llm_model: str,
     batchsize: int,
 ) -> list[OrderedDict[str, Any]]:
     """分批并发处理病历，按输入顺序收集结果。"""
@@ -634,7 +604,7 @@ def build_output_records(
             future_to_record = {}
             for offset, (_, row) in enumerate(batch.iterrows()):
                 index = start + offset
-                future = executor.submit(build_output_record, row, prescription_map, use_llm, llm_model)
+                future = executor.submit(build_output_record, row, prescription_map)
                 future_to_record[future] = (index, row)
 
             for future in as_completed(future_to_record):
@@ -754,155 +724,37 @@ def clean_body_text(value: Any) -> str:
 
 
 def phase2_extract_section(text: str, aliases: tuple[str, ...]) -> str:
-    """LLM 失败时，按病历标签从正文中做保守兜底抽取。"""
+    """按病历正文中的结构化标签，用正则抽取对应段落。"""
     if not text:
         return ""
     labels = "|".join(re.escape(label) for label in sorted(aliases, key=len, reverse=True))
-    match = re.search(rf"(?:^|[\s\n])(?:{labels})\s*[：:]\s*", text)
+    match = re.search(rf"(?:^|[\s\n，,。；;])(?:{labels})\s*[：:]\s*", text)
     if not match:
         return ""
     start = match.end()
     stops = "|".join(re.escape(label) for label in sorted(PHASE2_SECTION_STOP_LABELS, key=len, reverse=True))
-    stop_match = re.search(rf"(?:[\s\n])(?:{stops})\s*[：:]", text[start:])
+    stop_match = re.search(rf"(?:[\s\n，,。；;])(?:{stops})\s*[：:]", text[start:])
     end = start + stop_match.start() if stop_match else len(text)
     return text[start:end].strip(" ，,。；;\n\t")
 
 
-def phase2_structured_fallback(record: pd.Series) -> dict[str, str]:
-    """从门诊病历表已有字段和正文标签提供提示词目标结构的兜底值。"""
+def phase2_extract_raw_fields(record: pd.Series) -> dict[str, str]:
+    """优先按正文标签提取原始字段，正文缺少标签时回退到表格结构化列。"""
     body = clean_body_text(record.get("正文"))
     result = {field: "" for field in PHASE2_OUTPUT_FIELDS}
     for field, aliases in PHASE2_SOURCE_FIELDS.items():
-        result[field] = next(
-            (clean_cell(record.get(alias)) for alias in aliases if clean_cell(record.get(alias))),
-            "",
-        )
+        result[field] = phase2_extract_section(body, aliases)
         if not result[field]:
-            result[field] = phase2_extract_section(body, aliases)
-
-    return result
-
-
-def phase2_normalize_prompt_fields(fields: dict[str, str]) -> dict[str, str]:
-    """将婚姻和特殊时期字段约束到提示词规定的枚举值。"""
-    result = {field: fields.get(field, "") for field in PHASE2_OUTPUT_FIELDS}
-    if result["marriage_history"] not in {"", "已婚", "未婚"}:
-        result["marriage_history"] = ""
-    if result["special_history"] not in {"妊娠状态", "备孕", "哺乳期", "月经期", "无"}:
-        result["special_history"] = "无"
-    result["special_history"] = result["special_history"] or "无"
-    return result
-
-
-def load_phase2_prompt() -> str:
-    """读取二期总院正文抽取提示词。"""
-    if not PHASE2_PROMPT_PATH.is_file():
-        raise FileNotFoundError(f"二期总院正文抽取提示词不存在: {PHASE2_PROMPT_PATH}")
-    prompt = PHASE2_PROMPT_PATH.read_text(encoding="utf-8").strip()
-    if not prompt:
-        raise ValueError(f"二期总院正文抽取提示词为空: {PHASE2_PROMPT_PATH}")
-    return prompt
-
-
-def llm_extract_phase2_fields(
-    record: pd.Series,
-    text: str,
-    model: str,
-    system_prompt: str,
-) -> dict[str, str]:
-    """调用 LLM 并解析提示词定义的目标 JSON Schema。"""
-    from openai import OpenAI
-
-    from medical.config import config
-
-    client = getattr(PHASE2_LLM_LOCAL, "client", None)
-    if client is None:
-        client = OpenAI(api_key=config.DASHSCOPE_API_KEY, base_url=config.DASHSCOPE_BASE_URL)
-        PHASE2_LLM_LOCAL.client = client
-    fallback = phase2_structured_fallback(record)
-    see_doc_time = clean_cell(record.get("就诊时间")) or clean_cell(record.get("病历书写时间"))
-    input_payload = {
-        "see_doc_time": see_doc_time,
-        "visit_type": clean_cell(record.get("初复诊")),
-        "patient_appeal": fallback["patient_appeal"],
-        "doctor_appeal": next(
-            (
-                clean_cell(record.get(field))
-                for field in ("医生主诉", "医师主诉", "接诊主诉")
-                if clean_cell(record.get(field))
-            ),
-            "",
-        ),
-        "new_medical_history": text,
-        "allergic_history": fallback["allergic_history"],
-        "old_medical_history": fallback["old_medical_history"],
-        "personal_history": fallback["personal_history"],
-        "family_history": fallback["family_history"],
-        "marriage_history": fallback["marriage_history"],
-        "birth_detail": fallback["birth_detail"],
-        "source_marriage_and_birth_history": clean_cell(record.get("婚育史")),
-        "special_history": fallback["special_history"],
-        "original_diagnoses": {
-            "diagnosis_illness": fallback["diagnosis_illness"],
-            "diagnosis_sickness": fallback["diagnosis_sickness"],
-            "diagnosis_disease": fallback["diagnosis_disease"],
-            "初步诊断": clean_cell(record.get("初步诊断")),
-        },
-    }
-    for input_field, source_field in (
-        ("previous_visit_time", "previous_visit_time"),
-        ("previous_visit_diagnoses", "previous_visit_diagnoses"),
-    ):
-        value = clean_cell(record.get(source_field))
-        if value:
-            input_payload[input_field] = value
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": (
-                    "请根据系统提示清洗以下本次门诊病历，并且只返回规定 Schema 中的 JSON 对象。"
-                    "输入数据：\n" + json.dumps(input_payload, ensure_ascii=False, indent=2)
-                ),
-            },
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
+            result[field] = next(
+                (clean_cell(record.get(alias)) for alias in aliases if clean_cell(record.get(alias))),
+                "",
+            )
+    result["admin_face_describe"] = phase2_extract_section(body, ("体格检查",)) or clean_cell(record.get("体格检查"))
+    result["admin_report_describe"] = phase2_extract_section(body, ("辅助检查",)) or clean_cell(
+        record.get("辅助检查")
     )
-    response_text = response.choices[0].message.content or "{}"
-    parsed = json.loads(extract_json_payload(response_text))
-    if not isinstance(parsed, dict):
-        raise ValueError("LLM 返回内容不是 JSON 对象")
-    return {field: clean_cell(parsed[field]) for field in PHASE2_OUTPUT_FIELDS if field in parsed}
 
-
-def extract_phase2_fields(
-    record: pd.Series,
-    use_llm: bool,
-    llm_model: str,
-    system_prompt: str,
-) -> dict[str, str]:
-    """调用 LLM 清洗提示词输出字段；缺失字段回退到原表明确内容。"""
-    fallback = phase2_structured_fallback(record)
-    if not use_llm:
-        return phase2_normalize_prompt_fields(fallback)
-
-    text = clean_body_text(record.get("正文"))
-    if not text:
-        return phase2_normalize_prompt_fields(fallback)
-
-    try:
-        extracted = llm_extract_phase2_fields(record, text, llm_model, system_prompt)
-    except Exception as exc:
-        print(f"      ⚠️ LLM 抽取失败，回退到表格/正文标签。order_sn={normalize_id(record.get('病历ID'))}: {exc}")
-        extracted = {}
-    result = {
-        field: extracted[field] if field in extracted else fallback.get(field, "")
-        for field in PHASE2_OUTPUT_FIELDS
-    }
-    return phase2_normalize_prompt_fields(result)
+    return result
 
 
 def phase2_history_is_positive(value: Any) -> bool:
@@ -1084,14 +936,11 @@ def build_phase2_output_record(
     record: pd.Series,
     prescription_rows: pd.DataFrame,
     doctor_name: str,
-    use_llm: bool,
-    llm_model: str,
-    system_prompt: str,
 ) -> OrderedDict[str, Any]:
     """构造一条符合 medical_records_ai.jsonl 格式的二期总院病历。"""
     order_sn = normalize_id(record.get("病历ID"))
     print(f"处理中 order_sn={order_sn}")
-    clinical = extract_phase2_fields(record, use_llm, llm_model, system_prompt)
+    raw_clinical = phase2_extract_raw_fields(record)
     prescriptions = phase2_build_prescriptions(prescription_rows)
     visit_time = phase2_format_datetime(record.get("病历书写时间"))
     encounter_time = phase2_format_datetime(record.get("就诊时间")) or visit_time
@@ -1101,19 +950,20 @@ def build_phase2_output_record(
         if not settlement_times.empty:
             stop_time = settlement_times.max().strftime("%Y-%m-%d %H:%M:%S")
 
-    old_history = clinical.get("old_medical_history", "")
-    allergy_history = clinical.get("allergic_history", "")
-    family_history = clinical.get("family_history", "")
-    personal_history = clinical.get("personal_history", "")
-    special_history = clinical.get("special_history", "无")
-    marriage_history = clinical.get("marriage_history", "")
-    birth_detail = clinical.get("birth_detail", "")
+    old_history = raw_clinical.get("old_medical_history", "")
+    allergy_history = raw_clinical.get("allergic_history", "")
+    family_history = raw_clinical.get("family_history", "")
+    personal_history = raw_clinical.get("personal_history", "")
+    special_history = raw_clinical.get("special_history", "")
+    marriage_history = raw_clinical.get("marriage_history", "")
+    birth_detail = raw_clinical.get("birth_detail", "")
     doctor_name = clean_cell(record.get("就诊医师")) or doctor_name
+    doctor_id = DOCTOR_ID_BY_NAME.get(doctor_name)
 
-    return OrderedDict(
+    output = OrderedDict(
         order_sn=order_sn,
         inquiry_method="门诊",
-        is_first=clean_cell(record.get("初复诊")),
+        is_first=extract_visit_type(record),
         created_at=encounter_time,
         start_time=encounter_time,
         stop_time=stop_time,
@@ -1126,16 +976,16 @@ def build_phase2_output_record(
         patient_mobile=clean_cell(record.get("移动电话")),
         patient_height=to_number(record.get("身高")),
         patient_weight=to_number(record.get("体重")),
-        patient_appeal=clinical.get("patient_appeal", ""),
-        doc_ass_stu_appeal=clinical.get("patient_appeal", ""),
-        new_medical_history=clinical.get("new_medical_history", ""),
+        patient_appeal=raw_clinical.get("patient_appeal", ""),
+        doc_ass_stu_appeal=raw_clinical.get("patient_appeal", ""),
+        new_medical_history=raw_clinical.get("new_medical_history", ""),
         is_old_medical_history="是" if phase2_history_is_positive(old_history) else "否",
         old_medical_history=old_history,
         is_allergic_history="是" if phase2_history_is_positive(allergy_history) else "否",
         allergic_history=allergy_history,
         is_personal_history="是" if phase2_history_is_positive(personal_history) else "否",
         personal_history=personal_history,
-        is_special="否" if special_history == "无" else ("是" if special_history else ""),
+        is_special="是" if special_history else "否",
         special_history=special_history,
         is_child_history=phase2_child_history_flag(birth_detail),
         birth_detail=birth_detail,
@@ -1146,33 +996,28 @@ def build_phase2_output_record(
         tongue_face_img=[],
         admin_report_img=[],
         admin_face_img=[],
-        admin_report_describe=None,
-        admin_face_describe="",
-        diagnosis_illness=clinical.get("diagnosis_illness", ""),
-        diagnosis_sickness=clinical.get("diagnosis_sickness", ""),
-        diagnosis_disease=clinical.get("diagnosis_disease", ""),
-        ai_diagnosis_illness_reason=clinical.get("diagnosis_illness_reason", ""),
-        ai_diagnosis_disease_reason=clinical.get("diagnosis_disease_reason", ""),
-        ai_diagnosis_sickness_reason=clinical.get("diagnosis_sickness_reason", ""),
+        admin_report_describe=raw_clinical.get("admin_report_describe", ""),
+        admin_face_describe=raw_clinical.get("admin_face_describe", ""),
+        diagnosis_illness=raw_clinical.get("diagnosis_illness", ""),
+        diagnosis_sickness=raw_clinical.get("diagnosis_sickness", ""),
+        diagnosis_disease=raw_clinical.get("diagnosis_disease", ""),
         disposition=clean_cell(record.get("治疗方案")),
         see_doc_time=visit_time,
-        doctor_id=None,
+        doctor_id=doctor_id,
         doctor_name=doctor_name,
         ps=prescriptions,
         im_msg=[],
     )
+    return output
 
 
 def build_phase2_output_records(
     record_df: pd.DataFrame,
     prescription_map: dict[str, pd.DataFrame],
     doctor_name: str,
-    use_llm: bool,
-    llm_model: str,
-    system_prompt: str,
     batchsize: int,
 ) -> list[OrderedDict[str, Any]]:
-    """按 batch 并发调用 LLM 处理病历，最终按源表顺序输出。"""
+    """按 batch 并发提取原始字段和处方，最终按源表顺序输出。"""
     if batchsize < 1:
         raise ValueError("batchsize 必须是大于 0 的整数")
     records: list[OrderedDict[str, Any] | None] = [None] * len(record_df)
@@ -1189,9 +1034,6 @@ def build_phase2_output_records(
                     row,
                     prescription_rows,
                     doctor_name,
-                    use_llm,
-                    llm_model,
-                    system_prompt,
                 )
                 futures[future] = (index, row)
             for future in as_completed(futures):
@@ -1278,16 +1120,11 @@ def process_phase2_records(args: argparse.Namespace) -> Path:
         needed_ids = set(record_df["_join_id"])
         prescription_map = {key: value for key, value in prescription_map.items() if key in needed_ids}
 
-    use_llm = not getattr(args, "no_llm", False)
-    system_prompt = load_phase2_prompt() if use_llm and not record_df.empty else ""
-    print(f"[3/4] 使用就诊ID关联，batch 并发数={args.batchsize}，LLM={'开启' if use_llm else '关闭'}")
+    print(f"[3/4] 使用就诊ID关联，batch 并发数={args.batchsize}，通过标签正则提取原始字段")
     records = build_phase2_output_records(
         record_df,
         prescription_map,
         doctor_name,
-        use_llm,
-        args.llm_model,
-        system_prompt,
         args.batchsize,
     )
     print("[4/4] 原子写出 JSONL...")
@@ -1392,8 +1229,6 @@ def process_records(args: argparse.Namespace) -> Path | list[Path]:
     records = build_output_records(
         raw_record_df,
         prescription_map,
-        args.use_llm,
-        args.llm_model,
         args.batchsize,
     )
     write_output(records, output_path)
@@ -1420,9 +1255,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--source-dir", type=Path, default=DEFAULT_PHASE2_DATA_DIR, help="二期总院 Excel 所在目录。")
     parser.add_argument("--fee-categories", nargs="*", default=list(FEE_CATEGORIES), help="需要合并的费用类别。")
-    parser.add_argument("--use-llm", action="store_true", help="调用 LLM 从正文抽取病史字段。")
-    parser.add_argument("--no-llm", action="store_true", help="二期总院模式下跳过 LLM，使用表格字段和正文标签兜底。")
-    parser.add_argument("--llm-model", default="qwen3.6-flash", help="LLM 模型名。")
     parser.add_argument(
         "--batchsize",
         "--batch-size",

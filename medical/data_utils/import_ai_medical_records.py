@@ -110,7 +110,7 @@ def main() -> None:
     """
     批量写入某医生数据到
 PYTHONPATH=. python -m medical.data_utils.import_ai_medical_records import \
-  --input medical/processed_data/doctor_二期西区_张雪亮/medical_records_ai.jsonl \
+  --input medical/processed_data/doctor_二期西区_李方洁/medical_records_ai.jsonl \
   --batch-size 100
     """
     repository = AIMedicalRecordRepository(

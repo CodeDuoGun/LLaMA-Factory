@@ -21,6 +21,7 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
 from collections import Counter, OrderedDict, defaultdict
 from pathlib import Path
@@ -30,6 +31,12 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from medical.constants import DOCTORS_MAPPING  # noqa: E402
+
+
 DEFAULT_DATA_DIR = PROJECT_ROOT / "medical/data/二期西区"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "medical/processed_data"
 ALLOWED_CATEGORIES = {"中成药费", "中草药费", "中草药颗粒费", "西药费"}
@@ -47,24 +54,7 @@ DRUG_PROCESS_NAMES_BY_COOKING_METHOD = {
     "自煎": "饮片",
     "打粉": "饮片",
 }
-ANALYSIS_DOCTORS = {
-    "43": "朱子奇",
-    "97": "巢国俊",
-    "432": "杨钦河",
-    "567": "李同新",
-    "577": "郝建军",
-    "1314": "吴卫平",
-    "425": "于振宣",
-    "183": "刘兴志",
-    "181": "史大卓",
-    "177": "张文彭",
-    "769": "张雪亮",
-    "164": "李佩文",
-    "403": "李方洁",
-    "718": "杨宇飞",
-    "1332": "高秀梅",
-}
-DEFAULT_DOCTOR_ID_MAP = {doctor_name: int(doctor_id) for doctor_id, doctor_name in ANALYSIS_DOCTORS.items()}
+DOCTOR_ID_BY_NAME = {doctor_name: doctor_id for doctor_id, doctor_name in DOCTORS_MAPPING.items()}
 MAX_PATIENT_ID = 2_147_483_647
 
 RECORD_REQUIRED_COLUMNS = ("门诊号", "时间", "患者姓名", "主诉", "初步诊断")
@@ -118,6 +108,10 @@ class PatientIdAllocator:
         self.card_to_id: dict[str, int] = {}
         self.id_to_card: dict[int, str] = {}
         output_paths = set(output_dir.glob("doctor_二期西区_*/medical_records_ai.jsonl"))
+        for doctor_id, doctor_name in DOCTORS_MAPPING.items():
+            mapped_output_path = output_dir / f"doctor_{doctor_id}_{doctor_name}" / "medical_records_ai.jsonl"
+            if mapped_output_path.is_file():
+                output_paths.add(mapped_output_path)
         for doctor_name, doctor_id in doctor_outputs or []:
             folder_name = (
                 f"doctor_二期西区_{doctor_name}"
@@ -575,6 +569,7 @@ def build_record(
     family_history = clean_text(row.get("家族史"))
     patient_idcard = _first_value(prescription_rows, "证件号")
     admin_face_describe = clean_text(row.get("体格检查"))
+    admin_report_describe = clean_text(row.get("辅助检查"))
 
     return OrderedDict(
         order_sn=normalize_outpatient_no(row.get("门诊号")),
@@ -612,6 +607,7 @@ def build_record(
         tongue_face_img=[],
         admin_report_img=[],
         admin_face_img=[],
+        admin_report_describe=admin_report_describe,
         admin_face_describe=admin_face_describe,
         diagnosis_illness=diagnoses["diagnosis_illness"],
         diagnosis_sickness=diagnoses["diagnosis_sickness"],
@@ -754,18 +750,6 @@ def discover_doctors(data_dir: Path) -> list[str]:
     return names
 
 
-def load_doctor_id_map(path: Path | None) -> dict[str, int]:
-    doctor_id_map = dict(DEFAULT_DOCTOR_ID_MAP)
-    if path is None:
-        return doctor_id_map
-    with path.open(encoding="utf-8") as file:
-        raw = json.load(file)
-    if not isinstance(raw, dict):
-        raise ValueError("医生 ID 映射文件必须是 JSON 对象，例如 {\"于振宣\": 123}")
-    doctor_id_map.update({str(name): int(doctor_id) for name, doctor_id in raw.items() if doctor_id is not None})
-    return doctor_id_map
-
-
 def process_doctor(
     doctor_name: str,
     record_path: Path,
@@ -773,7 +757,6 @@ def process_doctor(
     output_dir: Path,
     doctor_id: int | None = None,
     patient_id_allocator: PatientIdAllocator | None = None,
-    use_id_in_output_dir: bool = False,
 ) -> Path:
     if patient_id_allocator is None:
         patient_id_allocator = PatientIdAllocator(output_dir, [(doctor_name, doctor_id)])
@@ -808,7 +791,7 @@ def process_doctor(
 
     dated_order_sns = disambiguate_duplicate_order_sns(output_records)
 
-    if use_id_in_output_dir and doctor_id is not None:
+    if doctor_id is not None:
         folder_name = f"doctor_{doctor_id}_{doctor_name}"
     else:
         folder_name = f"doctor_二期西区_{doctor_name}"
@@ -848,13 +831,13 @@ def get_base_order_no(order_sn: Any, visit_time: Any, source_order_nos: set[str]
     return candidate if candidate in source_order_nos else ""
 
 
-def build_admin_face_describe_index(
+def build_examination_descriptions_index(
     record_path: Path,
     prescription_path: Path,
-) -> tuple[dict[tuple[str, str, str, str], set[str]], set[str]]:
-    """按门诊号、就诊时间、患者姓名和证件号索引体格检查."""
+) -> tuple[dict[tuple[str, str, str, str], set[tuple[str, str]]], set[str]]:
+    """按门诊号、就诊时间、患者姓名和证件号索引两类检查描述。"""
     records = prepare_record_data(record_path)
-    require_columns(records, ("体格检查",), record_path)
+    require_columns(records, ("体格检查", "辅助检查"), record_path)
     prescriptions = prepare_prescription_data(prescription_path)
     card_by_mzh_and_date: dict[tuple[str, Any], str] = {}
     card_by_mzh: dict[str, str] = {}
@@ -866,7 +849,7 @@ def build_admin_face_describe_index(
             dates_by_mzh[mzh].add(fee_date)
             card_by_mzh_and_date[(mzh, fee_date)] = normalize_patient_idcard(_first_value(date_rows, "证件号"))
 
-    exam_by_visit: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
+    examinations_by_visit: dict[tuple[str, str, str, str], set[tuple[str, str]]] = defaultdict(set)
 
     for _, record in records.iterrows():
         mzh = record["_mzh"]
@@ -893,17 +876,23 @@ def build_admin_face_describe_index(
             continue
 
         key = (mzh, visit_time, patient_name, patient_idcard)
-        exam_by_visit[key].add(clean_text(record.get("体格检查")))
+        examinations_by_visit[key].add(
+            (clean_text(record.get("体格检查")), clean_text(record.get("辅助检查")))
+        )
 
-    return dict(exam_by_visit), set(records["_mzh"])
+    return dict(examinations_by_visit), set(records["_mzh"])
 
 
 def _output_file_for_doctor(output_dir: Path, doctor_name: str) -> Path:
     """查找指定医生现有的西区处理文件."""
+    folder_names = {f"doctor_二期西区_{doctor_name}"}
+    doctor_id = DOCTOR_ID_BY_NAME.get(doctor_name)
+    if doctor_id is not None:
+        folder_names.add(f"doctor_{doctor_id}_{doctor_name}")
     matches = sorted(
         path
-        for path in output_dir.glob("doctor_*/medical_records_ai.jsonl")
-        if "二期西区" in path.parent.name and path.parent.name.endswith(f"_{doctor_name}")
+        for folder_name in folder_names
+        if (path := output_dir / folder_name / "medical_records_ai.jsonl").is_file()
     )
     if len(matches) != 1:
         raise FileNotFoundError(
@@ -960,13 +949,13 @@ def _atomic_replace_files(file_plans: list[tuple[Path, bytes, bytes]]) -> None:
                 temporary_path.unlink()
 
 
-def update_processed_admin_face_describe(
+def update_processed_examination_descriptions(
     data_dir: Path,
     output_dir: Path,
     doctor_name: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, int]:
-    """只将现有西区 JSONL 的 admin_face_describe 回填为匹配问诊的体格检查."""
+    """只更新现有西区 JSONL 中的体格检查和辅助检查描述字段。"""
     doctor_names = [doctor_name] if doctor_name else discover_doctors(data_dir)
     if not doctor_names:
         raise FileNotFoundError(f"在 {data_dir} 下没有找到西区医生病历")
@@ -982,7 +971,9 @@ def update_processed_admin_face_describe(
         record_path = data_dir / f"{name} 病历.xlsx"
         prescription_path = data_dir / f"{name}.xlsx"
         output_path = _output_file_for_doctor(output_dir, name)
-        exam_by_visit, source_order_nos = build_admin_face_describe_index(record_path, prescription_path)
+        examinations_by_visit, source_order_nos = build_examination_descriptions_index(
+            record_path, prescription_path
+        )
         original_bytes = output_path.read_bytes()
         original_text = original_bytes.decode("utf-8")
         output_lines: list[str] = []
@@ -1013,28 +1004,39 @@ def update_processed_admin_face_describe(
                 normalize_patient_name(record.get("patient_name")),
                 normalize_patient_idcard(record.get("patient_idcard")),
             )
-            exam_values = exam_by_visit.get(key) if all(key) else None
-            if not exam_values:
+            examination_values = examinations_by_visit.get(key) if all(key) else None
+            if not examination_values:
                 doctor_unmatched += 1
                 output_lines.append(raw_line)
                 continue
-            if len(exam_values) != 1:
+            if len(examination_values) != 1:
                 ambiguous_records += 1
                 output_lines.append(raw_line)
                 continue
 
             doctor_matched += 1
-            desired_value = next(iter(exam_values))
+            desired_face_value, desired_report_value = next(iter(examination_values))
             original_other_fields = {
-                field: value for field, value in record.items() if field != "admin_face_describe"
+                field: value
+                for field, value in record.items()
+                if field not in {"admin_face_describe", "admin_report_describe"}
             }
-            if record.get("admin_face_describe") != desired_value:
-                record["admin_face_describe"] = desired_value
+            face_changed = record.get("admin_face_describe") != desired_face_value
+            report_changed = record.get("admin_report_describe") != desired_report_value
+            if face_changed:
+                record["admin_face_describe"] = desired_face_value
+            if report_changed:
+                record["admin_report_describe"] = desired_report_value
+            if face_changed or report_changed:
                 doctor_changed += 1
             if original_other_fields != {
-                field: value for field, value in record.items() if field != "admin_face_describe"
+                field: value
+                for field, value in record.items()
+                if field not in {"admin_face_describe", "admin_report_describe"}
             }:
-                raise AssertionError(f"{output_path}:{line_number} 除 admin_face_describe 外的字段发生变化")
+                raise AssertionError(
+                    f"{output_path}:{line_number} 除 admin_face_describe、admin_report_describe 外的字段发生变化"
+                )
             output_lines.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + line_ending)
 
         file_plans.append((output_path, original_bytes, "".join(output_lines).encode("utf-8")))
@@ -1072,11 +1074,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prescription-path", "--prescription_path", type=Path, help="指定收费处方明细文件")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="处理结果根目录")
-    parser.add_argument("--doctor-id-map", type=Path, help="医生 ID 映射 JSON，键为医生姓名、值为医生 ID")
     parser.add_argument(
         "--update-admin-face-describe",
+        "--update-examination-descriptions",
+        dest="update_examination_descriptions",
         action="store_true",
-        help="只将现有处理结果中的 admin_face_describe 更新为匹配问诊的体格检查",
+        help="只将现有处理结果中的体格检查和辅助检查更新到对应描述字段",
     )
     parser.add_argument("--dry-run", action="store_true", help="仅统计更新匹配结果，不写回文件")
     return parser
@@ -1084,13 +1087,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> list[Path]:
     args = build_parser().parse_args()
-    if args.dry_run and not args.update_admin_face_describe:
-        raise SystemExit("--dry-run 需要与 --update-admin-face-describe 一起使用")
+    if args.dry_run and not args.update_examination_descriptions:
+        raise SystemExit("--dry-run 需要与 --update-examination-descriptions 一起使用")
 
-    if args.update_admin_face_describe:
+    if args.update_examination_descriptions:
         if args.record_path or args.prescription_path:
             raise SystemExit("--update-admin-face-describe 使用 --data-dir 中的医生配对文件，不接受指定单个源文件")
-        summary = update_processed_admin_face_describe(
+        summary = update_processed_examination_descriptions(
             args.data_dir,
             args.output_dir,
             doctor_name=args.doctor_name,
@@ -1100,11 +1103,9 @@ def main() -> list[Path]:
         print(
             f"{action}：医生文件 {summary['doctor_files']} 份，病历 {summary['total_records']} 条，"
             f"匹配 {summary['matched_records']} 条，未匹配 {summary['unmatched_records']} 条，"
-            f"修改 admin_face_describe {summary['changed_records']} 条。"
+            f"更新检查描述字段的病历 {summary['changed_records']} 条。"
         )
         return []
-
-    id_map = load_doctor_id_map(args.doctor_id_map)
 
     if args.record_path or args.prescription_path:
         if not args.doctor_name or not args.record_path or not args.prescription_path:
@@ -1129,10 +1130,7 @@ def main() -> list[Path]:
 
     patient_id_allocator = PatientIdAllocator(
         args.output_dir,
-        [
-            (name, id_map.get(name) if args.doctor_id_map is not None else None)
-            for name, _, _ in doctors
-        ],
+        [(name, DOCTOR_ID_BY_NAME.get(name)) for name, _, _ in doctors],
     )
     output_paths = [
         process_doctor(
@@ -1140,9 +1138,8 @@ def main() -> list[Path]:
             record_path,
             prescription_path,
             args.output_dir,
-            id_map.get(name),
+            DOCTOR_ID_BY_NAME.get(name),
             patient_id_allocator,
-            use_id_in_output_dir=args.doctor_id_map is not None,
         )
         for name, record_path, prescription_path in doctors
     ]

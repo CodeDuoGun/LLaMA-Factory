@@ -749,13 +749,16 @@ def main() -> None:
     except ImportError:
         pass
     """
-    /Users/tangxueduo/anaconda3/envs/llamafactory/bin/python \
-  medical/data_utils/raw_data_clear/clear_xiqu_withai.py \
-  --input medical/processed_data/doctor_二期西区_张雪亮/medical_records_ai_failed.jsonl \
-  --merge-target medical/processed_data/doctor_二期西区_张雪亮/medical_records_ai.jsonl \
-  --failed-output medical/processed_data/doctor_二期西区_张雪亮/medical_records_ai_failed_remaining.jsonl \
+    # 重新跑失败case
+    python medical/data_utils/raw_data_clear/clear_xiqu_withai.py \
+  --input medical/processed_data/doctor_二期西区_李方洁/medical_records_ai_failed.jsonl\
+  --merge-target medical/processed_data/doctor_二期西区_李方洁/medical_records_ai.jsonl \
+  --failed-output medical/processed_data/doctor_二期西区_李方洁/medical_records_ai_failed_remaining.jsonl \
   --skip true \
   --batchsize 1
+
+    # 跑数据doctor A
+    python medical/data_utils/raw_data_clear/clear_xiqu_withai.py --batchsize 6 --input medical/processed_data/doctor_二期西区_李方洁/medical_records_ai.jsonl
     
     """
     args = parse_args()
