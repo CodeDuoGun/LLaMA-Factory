@@ -740,4 +740,25 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    """
+    # 跑一条数据
+    PYTHONPATH=. python medical/data_utils/raw_data_clear/clear_zongyuan_withai.py \
+  --input "medical/processed_data/doctor_二期总院_冯春祥/medical_records_ai.jsonl" \
+  --limit 1 \
+  --batchsize 1
+    
+    # 批量跑
+    PYTHONPATH=. python medical/data_utils/raw_data_clear/clear_zongyuan_withai.py \
+  --input "medical/processed_data/doctor_二期总院_钱彦方/medical_records_ai.jsonl" \
+  --batchsize 6
+
+    # 重新跑失败记录
+    PYTHONPATH=. python medical/data_utils/raw_data_clear/clear_xiqu_withai.py \
+    --input medical/processed_data/doctor_二期西区_高秀梅/medical_records_ai_failed.jsonl \
+    --merge-target medical/processed_data/doctor_二期西区_高秀梅/medical_records_ai.jsonl \
+    --failed-output medical/processed_data/doctor_二期西区_高秀梅/medical_records_ai_failed_remaining.jsonl \
+    --skip true \
+    --batchsize 1
+    """
+    
     main()
