@@ -103,16 +103,13 @@ class PatientIdAllocator:
     def __init__(
         self,
         output_dir: Path,
-        doctor_outputs: list[tuple[str, int | None]] | None = None,
+        doctor_outputs: list[tuple[str, int | None]],
     ) -> None:
         self.card_to_id: dict[str, int] = {}
         self.id_to_card: dict[int, str] = {}
-        output_paths = set(output_dir.glob("doctor_二期西区_*/medical_records_ai.jsonl"))
-        for doctor_id, doctor_name in DOCTORS_MAPPING.items():
-            mapped_output_path = output_dir / f"doctor_{doctor_id}_{doctor_name}" / "medical_records_ai.jsonl"
-            if mapped_output_path.is_file():
-                output_paths.add(mapped_output_path)
-        for doctor_name, doctor_id in doctor_outputs or []:
+        output_paths: set[Path] = set()
+        # Seed IDs only from the doctors selected for this run.
+        for doctor_name, doctor_id in doctor_outputs:
             folder_name = (
                 f"doctor_二期西区_{doctor_name}"
                 if doctor_id is None
