@@ -872,12 +872,7 @@ def phase2_prescription_type(rows: list[pd.Series]) -> str:
 
 
 def phase2_build_prescriptions(rows: pd.DataFrame) -> list[OrderedDict[str, Any]]:
-    """过滤西药和中成药明细，按处方号和结算日保留其他处方。"""
-    if rows.empty:
-        return []
-
-    if "费用类别" in rows.columns:
-        rows = rows[~rows["费用类别"].map(clean_cell).isin({"西药费", "中成药费"})]
+    """按处方号和结算日组装中药、中成药及西药明细。"""
     if rows.empty:
         return []
 

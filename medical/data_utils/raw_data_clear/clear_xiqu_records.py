@@ -506,13 +506,11 @@ def build_drug_entry(row: pd.Series) -> dict[str, Any]:
 
 
 def aggregate_prescriptions(rows: pd.DataFrame, treatment_plan: Any) -> list[dict[str, Any]]:
-    """仅按中草药类别组装 ps；同一处方中的每个药品保留为一条明细。"""
+    """按处方和药品加工类型组装 ps，保留中药、中成药和西药明细。"""
     if rows.empty:
         return []
 
-    frame = rows[rows["_category"].isin(HERBAL_CATEGORIES)].copy()
-    if frame.empty:
-        return []
+    frame = rows.copy()
 
     frame["_group_rx_no"] = frame.apply(
         lambda row: row["_rx_no"] or f"__row_{row.name}", axis=1
