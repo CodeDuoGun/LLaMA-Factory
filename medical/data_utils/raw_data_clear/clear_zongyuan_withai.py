@@ -82,16 +82,6 @@ def load_extraction_prompt() -> str:
     return prompt
 
 
-def parse_bool(value: str) -> bool:
-    """Parse common command-line spellings for a boolean flag."""
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "y", "是"}:
-        return True
-    if normalized in {"0", "false", "no", "n", "否"}:
-        return False
-    raise argparse.ArgumentTypeError("布尔值请使用 true/false")
-
-
 def _without_image_references(value: Any) -> Any:
     """Keep readable report metadata while dropping image paths, URLs, and binary data."""
     if isinstance(value, dict):
@@ -182,12 +172,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--limit", type=int, default=None, help="最多处理的记录数；其余行原样保留")
     parser.add_argument(
-        "--skip",
-        nargs="?",
-        const=True,
-        default=False,
-        type=parse_bool,
-        help="跳过已包含全部清洗和临床抽取 ai_* 字段的记录，可写 --skip 或 --skip true",
+        "--reclean",
+        action="store_true",
+        help="重新清洗所有记录，包括已有 ai_* 字段的记录",
     )
     parser.add_argument(
         "--failed-output",
@@ -408,10 +395,9 @@ def apply_clinical_extraction_result(record: dict[str, Any], result: Any) -> dic
     return record
 
 
-def is_record_cleaned(record: dict[str, Any]) -> bool:
-    """Return true only when every requested AI output field exists."""
-    required_fields = (*CLEANER_OUTPUT_FIELDS, *CLINICAL_EXTRACTION_FIELDS)
-    return all(f"ai_{field}" in record for field in required_fields)
+def get_ai_fields(record: dict[str, Any]) -> list[str]:
+    """Return the names of AI-prefixed fields already present in a record."""
+    return sorted(key for key in record if key.startswith("ai_"))
 
 
 def write_jsonl_atomic(output_path: Path, records: list[dict[str, Any]]) -> None:
@@ -595,14 +581,26 @@ async def clean_file(args: argparse.Namespace) -> int:
             raise ValueError(f"第 {line_number} 行必须是 JSON 对象；原文件未覆盖")
         records[line_number] = record
 
-    skip_cleaned = bool(args.skip)
-    line_numbers = [
-        line_number
-        for line_number, record in records.items()
-        if not skip_cleaned or not is_record_cleaned(record)
-    ]
-    skipped_count = len(records) - len(line_numbers)
+    skip_ai_fields = not args.reclean
+    line_numbers = []
+    skipped_ai_count = 0
+    for line_number, record in records.items():
+        ai_fields = get_ai_fields(record) if skip_ai_fields else []
+        if ai_fields:
+            skipped_ai_count += 1
+            print(
+                f"[跳过] 第 {line_number} 行：已有 ai_* 字段（{', '.join(ai_fields)}）；"
+                "如需重跑请使用 --reclean"
+            )
+            continue
+        line_numbers.append(line_number)
+
+    skipped_limit_count = 0
     if args.limit is not None:
+        skipped_limit_lines = line_numbers[args.limit :]
+        skipped_limit_count = len(skipped_limit_lines)
+        for line_number in skipped_limit_lines:
+            print(f"[跳过] 第 {line_number} 行：超出 --limit {args.limit} 条处理上限")
         line_numbers = line_numbers[: args.limit]
     previous_contexts = build_previous_visit_contexts(records)
 
@@ -624,7 +622,8 @@ async def clean_file(args: argparse.Namespace) -> int:
         target_order_to_line = index_merge_target(target_records, records, line_numbers)
 
     print(
-        f"记录 {len(records)} 条，跳过已完成清洗 {skipped_count} 条，"
+        f"记录 {len(records)} 条，因已有 ai_* 字段跳过 {skipped_ai_count} 条，"
+        f"因 --limit 上限跳过 {skipped_limit_count} 条，"
         f"本次计划处理 {len(line_numbers)} 条"
     )
     if not line_numbers:
@@ -741,6 +740,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     """
+    默认跳过已有 ai_* 字段的病历；需要重跑时加 --reclean。
+
     # 跑一条数据
     PYTHONPATH=. python medical/data_utils/raw_data_clear/clear_zongyuan_withai.py \
   --input "medical/processed_data/doctor_二期总院_冯春祥/medical_records_ai.jsonl" \
@@ -753,11 +754,11 @@ if __name__ == "__main__":
   --batchsize 6
 
     # 重新跑失败记录
-    PYTHONPATH=. python medical/data_utils/raw_data_clear/clear_xiqu_withai.py \
-    --input medical/processed_data/doctor_二期西区_高秀梅/medical_records_ai_failed.jsonl \
-    --merge-target medical/processed_data/doctor_二期西区_高秀梅/medical_records_ai.jsonl \
-    --failed-output medical/processed_data/doctor_二期西区_高秀梅/medical_records_ai_failed_remaining.jsonl \
-    --skip true \
+    PYTHONPATH=. python medical/data_utils/raw_data_clear/clear_zongyuan_withai.py \
+    --input medical/processed_data/doctor_二期总院_钱彦方/medical_records_ai_failed.jsonl \
+    --merge-target medical/processed_data/doctor_二期总院_钱彦方/medical_records_ai.jsonl \
+    --failed-output medical/processed_data/doctor_二期总院_钱彦方/medical_records_ai_failed_remaining.jsonl \
+    --reclean \
     --batchsize 1
     """
     
