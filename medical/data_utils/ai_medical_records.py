@@ -16,6 +16,7 @@
 
 import json
 from collections.abc import Iterable, Iterator, Mapping
+from datetime import datetime
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -42,6 +43,9 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.dialects.mssql import DATETIME2
+from sqlalchemy.dialects.mysql import DATETIME as MYSQL_DATETIME
+from sqlalchemy.dialects.postgresql import TIMESTAMP as POSTGRES_TIMESTAMP
 
 
 if TYPE_CHECKING:
@@ -182,6 +186,71 @@ def _bigint_type() -> BigInteger:
     return BigInteger().with_variant(Integer, "sqlite")
 
 
+def _datetime_second_precision_type() -> DateTime:
+    return (
+        DateTime()
+        .with_variant(MYSQL_DATETIME(fsp=0), "mysql")
+        .with_variant(DATETIME2(precision=0), "mssql")
+        .with_variant(POSTGRES_TIMESTAMP(precision=0), "postgresql")
+    )
+
+
+def _datetime_at_second_precision(value: Any) -> datetime | None:
+    """Convert a JSON datetime to a datetime value with fractional seconds removed."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(microsecond=0)
+    text_value = str(value).strip()
+    if not text_value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text_value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"无法解析 created_at 日期时间: {text_value!r}") from error
+    return parsed.replace(microsecond=0)
+
+
+def set_created_at_second_precision(manager: "DBManager", table_name: str) -> None:
+    """Alter an existing ``created_at`` column to store seconds without fractions."""
+    table = manager.refresh_table(table_name)
+    column = table.c.get("created_at")
+    if column is None:
+        raise ValueError(f"数据表 {table_name} 不存在 created_at 字段")
+
+    dialect = manager.engine.dialect
+    preparer = dialect.identifier_preparer
+    quoted_table = preparer.format_table(table)
+    quoted_column = preparer.quote(column.name)
+    nullable = "NULL" if column.nullable else "NOT NULL"
+    if dialect.name == "mysql":
+        definition = f"DATETIME(0) {nullable}"
+        if column.server_default is not None:
+            definition += f" DEFAULT {column.server_default.arg}"
+        if column.server_onupdate is not None:
+            onupdate = getattr(column.server_onupdate, "arg", None)
+            if onupdate is None:
+                raise ValueError("无法安全保留 created_at 的 ON UPDATE 子句，请先手动检查字段定义")
+            definition += f" ON UPDATE {onupdate}"
+        if column.comment is not None:
+            escaped_comment = column.comment.replace("'", "''")
+            definition += f" COMMENT '{escaped_comment}'"
+        statement = f"ALTER TABLE {quoted_table} MODIFY COLUMN {quoted_column} {definition}"
+    elif dialect.name == "mssql":
+        statement = f"ALTER TABLE {quoted_table} ALTER COLUMN {quoted_column} DATETIME2(0) {nullable}"
+    elif dialect.name == "postgresql":
+        statement = (
+            f"ALTER TABLE {quoted_table} ALTER COLUMN {quoted_column} "
+            f"TYPE TIMESTAMP(0) WITHOUT TIME ZONE USING date_trunc('second', {quoted_column})"
+        )
+    else:
+        raise ValueError(f"暂不支持 {dialect.name} 数据库自动调整 created_at 精度")
+
+    with manager.connection(transactional=True) as connection:
+        connection.execute(text(statement))
+    manager.refresh_table(table_name)
+
+
 def build_ai_medical_records_table(metadata: MetaData | None = None, *, table_name: str = DEFAULT_TABLE_NAME) -> Table:
     """构建 AI 病例标注表定义，一条 JSONL 记录对应一行数据."""
     metadata = metadata or MetaData()
@@ -193,7 +262,7 @@ def build_ai_medical_records_table(metadata: MetaData | None = None, *, table_na
         Column("order_sn", String(50), nullable=False, comment="订单编号；与 AI 处理版本组成唯一标识"),
         Column("inquiry_method", String(20), comment="问诊方式（文件中为中文名称）"),
         Column("is_first", String(10), comment="初复诊类型（文件中为初诊或复诊）"),
-        Column("created_at", DateTime, comment="挂号订单创建时间"),
+        Column("created_at", _datetime_second_precision_type(), comment="挂号订单创建时间（精确到秒）"),
         Column("start_time", DateTime, comment="问诊开始时间"),
         Column("stop_time", DateTime, comment="问诊结束时间"),
         Column("user_info_id", _bigint_type(), comment="就诊用户信息 ID【xlys_passport_user_info.id】"),
@@ -305,6 +374,7 @@ def record_to_row(record: Mapping[str, Any]) -> dict[str, Any]:
         for field_name in ORIGINAL_FIELDS + AI_FIELDS
         if field_name not in {"source_record_id", "order_sn", "ai_processing_version"}
     }
+    row["created_at"] = _datetime_at_second_precision(record.get("created_at"))
     row.update(
         {
             "source_record_id": source_record_id,

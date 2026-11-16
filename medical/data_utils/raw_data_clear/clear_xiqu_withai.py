@@ -759,7 +759,7 @@ def main() -> None:
   --batchsize 1
 
     # 跑数据doctor A
-    python medical/data_utils/raw_data_clear/clear_xiqu_withai.py --batchsize 6 --input medical/processed_data/doctor_769_张雪亮/medical_records_ai.jsonl --limit 600 --reclean
+    python medical/data_utils/raw_data_clear/clear_xiqu_withai.py --batchsize 8 --input medical/processed_data/doctor_二期西区_李方洁/medical_records_ai.jsonl --reclean
     
     """
     args = parse_args()

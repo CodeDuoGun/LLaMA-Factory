@@ -107,20 +107,36 @@ class PatientIdAllocator:
     ) -> None:
         self.card_to_id: dict[str, int] = {}
         self.id_to_card: dict[int, str] = {}
-        output_paths = set(output_dir.glob("doctor_二期西区_*/medical_records_ai.jsonl"))
-        for doctor_id, doctor_name in DOCTORS_MAPPING.items():
-            mapped_output_path = output_dir / f"doctor_{doctor_id}_{doctor_name}" / "medical_records_ai.jsonl"
-            if mapped_output_path.is_file():
-                output_paths.add(mapped_output_path)
-        for doctor_name, doctor_id in doctor_outputs or []:
-            folder_name = (
-                f"doctor_二期西区_{doctor_name}"
-                if doctor_id is None
-                else f"doctor_{doctor_id}_{doctor_name}"
-            )
-            output_path = output_dir / folder_name / "medical_records_ai.jsonl"
-            if output_path.is_file():
-                output_paths.add(output_path)
+        if doctor_outputs is None:
+            output_paths = set(output_dir.glob("doctor_二期西区_*/medical_records_ai.jsonl"))
+            for doctor_id, doctor_name in DOCTORS_MAPPING.items():
+                if doctor_name not in {
+                    "于振宣",
+                    "刘兴志",
+                    "史大卓",
+                    "张文彭",
+                    "张雪亮",
+                    "李佩文",
+                    "李方洁",
+                    "杨宇飞",
+                    "高秀梅",
+                }:
+                    continue
+                output_path = output_dir / f"doctor_{doctor_id}_{doctor_name}" / "medical_records_ai.jsonl"
+                if output_path.is_file():
+                    output_paths.add(output_path)
+        else:
+            output_paths = set()
+            for doctor_name, doctor_id in doctor_outputs:
+                folder_name = (
+                    f"doctor_二期西区_{doctor_name}"
+                    if doctor_id is None
+                    else f"doctor_{doctor_id}_{doctor_name}"
+                )
+                output_path = output_dir / folder_name / "medical_records_ai.jsonl"
+                if output_path.is_file():
+                    output_paths.add(output_path)
+        print(f"****output_paths: {output_paths}")
 
         for path in sorted(output_paths):
             with path.open(encoding="utf-8") as file:
@@ -145,7 +161,7 @@ class PatientIdAllocator:
             raise ValueError(f"{source} 的 patient_id 超出正整数范围: {patient_id}")
         existing_id = self.card_to_id.get(card)
         if existing_id is not None and existing_id != patient_id:
-            raise ValueError(f"同一证件号对应多个 patient_id，位置: {source}")
+            raise ValueError(f"同一证件号 {card} 对应多个 patient_id {patient_id}, 位置: {source}")
         existing_card = self.id_to_card.get(patient_id)
         if existing_card is not None and existing_card != card:
             raise ValueError(f"不同证件号对应相同 patient_id，位置: {source}")
@@ -611,7 +627,7 @@ def build_record(
         diagnosis_sickness=diagnoses["diagnosis_sickness"],
         diagnosis_disease=diagnoses["diagnosis_disease"],
         disposition=treatment_plan,
-        see_doc_time=f"{visit_time[:10]} 00:00:00" if visit_time else "",
+        see_doc_time=visit_time,
         doctor_id=doctor_id,
         doctor_name=doctor_name,
         ps=aggregate_prescriptions(prescription_rows, treatment_plan),
@@ -619,122 +635,32 @@ def build_record(
     )
 
 
-def disambiguate_duplicate_order_sns(records: list[dict[str, Any]]) -> int:
-    """为重复门诊号追加就诊日期，保证多次就诊记录有不同的 order_sn。"""
-    order_sn_counts = Counter(record["order_sn"] for record in records)
-    duplicate_order_sns = {order_sn for order_sn, count in order_sn_counts.items() if count > 1}
-    reserved_unique_order_sns = {order_sn for order_sn, count in order_sn_counts.items() if count == 1}
+def assign_date_prefixed_order_sns(records: list[dict[str, Any]]) -> int:
+    """Use the visit date and complete outpatient number for every record."""
+    candidates = []
+    for record in records:
+        outpatient_no = str(record["order_sn"]).strip().replace("_", "")
+        visit_time = parse_datetime(record.get("created_at"))
+        if not outpatient_no or visit_time is None:
+            raise ValueError(f"无法根据完整门诊号和就诊时间生成 order_sn: {record.get('order_sn')}")
+        candidates.append(f"{visit_time:%Y%m%d}{outpatient_no}")
+
+    candidate_counts = Counter(candidates)
+    reserved_unique = {candidate for candidate, count in candidate_counts.items() if count == 1}
     changed = 0
     used_order_sns: set[str] = set()
-
-    for record in records:
-        order_sn = record["order_sn"]
-        candidate = order_sn
-        if order_sn in duplicate_order_sns:
-            visit_time = parse_datetime(record.get("created_at"))
-            if visit_time is None:
-                raise ValueError(f"重复门诊号 {order_sn} 对应的病历缺少有效就诊日期")
-            candidate = f"{order_sn}_{visit_time:%Y%m%d}"
-            changed += 1
-
-        # 同一门诊号同一天有多条病历时，追加序号，避免 upsert 覆盖其中一条。
-        base = candidate
-        sequence = 2
-        while candidate in used_order_sns or (
-            order_sn in duplicate_order_sns and candidate in reserved_unique_order_sns
-        ):
-            candidate = f"{base}_{sequence:02d}"
-            sequence += 1
-
+    for record, base in zip(records, candidates):
+        candidate = base
+        if candidate in used_order_sns:
+            sequence = 2
+            candidate = f"{base}{sequence:02d}"
+            while candidate in used_order_sns or candidate in reserved_unique:
+                sequence += 1
+                candidate = f"{base}{sequence:02d}"
+        changed += candidate != record["order_sn"]
         record["order_sn"] = candidate
         used_order_sns.add(candidate)
-
     return changed
-
-
-def disambiguate_processed_order_sns(output_dir: Path) -> int:
-    """按所有西区医生的输出文件统一处理重复门诊号。"""
-    rows_by_path: dict[Path, list[dict[str, Any]]] = {}
-    base_order_sn_counts: Counter[str] = Counter()
-    for path in sorted(output_dir.glob("doctor_二期西区_*/medical_records_ai.jsonl")):
-        with path.open(encoding="utf-8") as file:
-            rows = [json.loads(line) for line in file if line.strip()]
-        rows_by_path[path] = rows
-        base_order_sn_counts.update(
-            re.sub(r"_\d{8}(?:_\d{2,})?$", "", str(row.get("order_sn") or "").strip())
-            for row in rows
-        )
-
-    duplicate_base_order_sns = {
-        order_sn for order_sn, count in base_order_sn_counts.items() if order_sn and count > 1
-    }
-    if not duplicate_base_order_sns:
-        return 0
-
-    reserved_unique = {
-        str(row.get("order_sn") or "").strip()
-        for rows in rows_by_path.values()
-        for row in rows
-        if str(row.get("order_sn") or "").strip()
-        and re.sub(r"_\d{8}(?:_\d{2,})?$", "", str(row.get("order_sn") or "").strip())
-        not in duplicate_base_order_sns
-    }
-    used: set[str] = set()
-    changes_by_path: dict[Path, int] = {}
-    for path, rows in rows_by_path.items():
-        changed = 0
-        for row in rows:
-            order_sn = str(row.get("order_sn") or "").strip()
-            candidate = order_sn
-            base_order_sn = re.sub(r"_\d{8}(?:_\d{2,})?$", "", order_sn)
-            if base_order_sn in duplicate_base_order_sns:
-                visit_time = parse_datetime(
-                    row.get("created_at") or row.get("start_time") or row.get("see_doc_time")
-                )
-                if visit_time is None:
-                    raise ValueError(f"重复门诊号 {order_sn} 对应的病历缺少有效就诊日期: {path}")
-                candidate = f"{base_order_sn}_{visit_time:%Y%m%d}"
-
-            base = candidate
-            sequence = 2
-            while candidate in used or (
-                base_order_sn in duplicate_base_order_sns and candidate in reserved_unique
-            ):
-                candidate = f"{base}_{sequence:02d}"
-                sequence += 1
-            changed += candidate != order_sn
-            row["order_sn"] = candidate
-            used.add(candidate)
-
-        if changed:
-            changes_by_path[path] = changed
-
-    for path, rows in rows_by_path.items():
-        if path not in changes_by_path:
-            continue
-        content = "".join(
-            json.dumps(row, ensure_ascii=False, separators=(",", ":"), default=str) + "\n" for row in rows
-        )
-        mode = stat.S_IMODE(path.stat().st_mode)
-        temporary_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                dir=path.parent,
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as file:
-                temporary_path = Path(file.name)
-                file.write(content)
-            os.chmod(temporary_path, mode)
-            os.replace(temporary_path, path)
-        finally:
-            if temporary_path is not None and temporary_path.exists():
-                temporary_path.unlink()
-
-    return sum(changes_by_path.values())
 
 
 def discover_doctors(data_dir: Path) -> list[str]:
@@ -787,7 +713,7 @@ def process_doctor(
             build_record(record, matching_rows, doctor_name, doctor_id, patient_id_allocator)
         )
 
-    dated_order_sns = disambiguate_duplicate_order_sns(output_records)
+    formatted_order_sns = assign_date_prefixed_order_sns(output_records)
 
     if doctor_id is not None:
         folder_name = f"doctor_{doctor_id}_{doctor_name}"
@@ -804,7 +730,7 @@ def process_doctor(
     print(f"[{doctor_name}] 已写出 {len(output_records)} 条 -> {out_path}")
     print(
         f"  无匹配处方的病历行: {unmatched}；"
-        f"已追加就诊日期的重复门诊号记录: {dated_order_sns}；"
+        f"已转换为日期加完整门诊号的病历: {formatted_order_sns}；"
         f"处理后重复 order_sn: {duplicate_order_sn}"
     )
     return out_path
@@ -816,7 +742,7 @@ def normalize_patient_name(value: Any) -> str:
 
 
 def get_base_order_no(order_sn: Any, visit_time: Any, source_order_nos: set[str]) -> str:
-    """还原清洗时为重复门诊号追加的就诊日期和序号."""
+    """还原清洗时采用日期前缀和同日序号编码的门诊号."""
     normalized_order_no = normalize_outpatient_no(order_sn)
     if normalized_order_no in source_order_nos:
         return normalized_order_no
@@ -824,6 +750,22 @@ def get_base_order_no(order_sn: Any, visit_time: Any, source_order_nos: set[str]
     parsed_visit_time = parse_datetime(visit_time)
     if parsed_visit_time is None:
         return ""
+
+    date_prefix = f"{parsed_visit_time:%Y%m%d}"
+    if normalized_order_no.startswith(date_prefix):
+        outpatient_no = normalized_order_no[len(date_prefix) :]
+        if outpatient_no in source_order_nos:
+            return outpatient_no
+        candidates = [
+            source_no
+            for source_no in source_order_nos
+            if outpatient_no.startswith(source_no)
+            and len(outpatient_no[len(source_no) :]) >= 2
+            and outpatient_no[len(source_no) :].isdigit()
+        ]
+        if candidates:
+            return max(candidates, key=len)
+
     date_suffix = f"_{parsed_visit_time:%Y%m%d}"
     candidate = re.sub(rf"{re.escape(date_suffix)}(?:_\d{{2,}})?$", "", normalized_order_no)
     return candidate if candidate in source_order_nos else ""
@@ -1126,10 +1068,12 @@ def main() -> list[Path]:
     if not doctors:
         raise SystemExit(f"在 {args.data_dir} 下没有找到“医生名 病历.xlsx”与“医生名.xlsx”配对文件")
 
+    print(f"***doctors {doctors}, output_dir {args.output_dir}")
     patient_id_allocator = PatientIdAllocator(
         args.output_dir,
         [(name, DOCTOR_ID_BY_NAME.get(name)) for name, _, _ in doctors],
     )
+
     output_paths = [
         process_doctor(
             name,
@@ -1141,9 +1085,14 @@ def main() -> list[Path]:
         )
         for name, record_path, prescription_path in doctors
     ]
-    globally_dated = disambiguate_processed_order_sns(args.output_dir)
-    if globally_dated:
-        print(f"西区医生文件间重复 order_sn 已追加就诊日期: {globally_dated} 条记录")
+    if len(output_paths) > 1:
+        from medical.data_utils.raw_data_clear import reprocess_xiqu_order_sn as reprocess
+
+        plans = reprocess.build_file_plans(output_paths, args.data_dir)
+        changed_plans = [plan for plan in plans if plan.original_bytes != plan.new_bytes]
+        if changed_plans:
+            reprocess.atomic_replace_many(changed_plans)
+        print(f"西区医生文件间重复 order_sn 已去重: {sum(plan.changed_count for plan in plans)} 条记录")
     return output_paths
 
 
