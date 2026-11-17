@@ -752,14 +752,14 @@ def main() -> None:
     """
     # 重新跑失败case
     python medical/data_utils/raw_data_clear/clear_xiqu_withai.py \
-  --input medical/processed_data/doctor_二期西区_李方洁/medical_records_ai_failed.jsonl\
-  --merge-target medical/processed_data/doctor_二期西区_李方洁/medical_records_ai.jsonl \
-  --failed-output medical/processed_data/doctor_二期西区_李方洁/medical_records_ai_failed_remaining.jsonl \
+  --input medical/processed_data/doctor_1332_高秀梅/medical_records_ai_failed_remaining.jsonl \
+  --merge-target medical/processed_data/doctor_1332_高秀梅/medical_records_ai.jsonl \
+  --failed-output medical/processed_data/doctor_1332_高秀梅/medical_records_ai_failed.jsonl \
   --reclean \
-  --batchsize 1
+  --batchsize 3
 
     # 跑数据doctor A
-    python medical/data_utils/raw_data_clear/clear_xiqu_withai.py --batchsize 8 --input medical/processed_data/doctor_二期西区_李方洁/medical_records_ai.jsonl --reclean
+    python medical/data_utils/raw_data_clear/clear_xiqu_withai.py --batchsize 8 --input medical/processed_data/doctor_769_张雪亮/medical_records_ai.jsonl --reclean --limit 200
     
     """
     args = parse_args()
