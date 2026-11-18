@@ -71,7 +71,9 @@ from medical.schema.clear_record_basemodel import (
     HistoryCleaningResult,
     ImageClassificationResult,
     InspectionResult,
-    TongueFaceResult,
+    TongueFeatures,
+    FaceFeatures,
+    LesionFeatures,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -97,7 +99,7 @@ MYSQL_NON_STAGE_AI_FIELDS = {
 }
 DOCTOR_RECORD_FILE_NAME = "medical_records_ai_clean.jsonl"
 FAILURE_FILE_NAME = "medical_record_agent_failures.jsonl"
-FILTER_FILE_NAME = "filter.json"
+FILTER_FILE_NAME = "filter.jsonl"
 MYSQL_UPDATE_PROGRESS_FILE_NAME = "mysql_stage_update_progress.json"
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 DASHSCOPE_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -594,8 +596,22 @@ def _filtered_record_identity(record: Mapping[str, Any]) -> str:
     return _record_identity(dict(record))
 
 
+def _read_filter_records(path: Path) -> list[dict[str, Any]]:
+    """Read current JSONL and legacy JSON-array filter files."""
+    if not path.is_file():
+        return []
+    if path.suffix == ".jsonl":
+        with path.open(encoding="utf-8") as file:
+            records = [json.loads(line) for line in file if line.strip()]
+    else:
+        records = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(records, list) or any(not isinstance(item, dict) for item in records):
+        raise ValueError(f"过滤文件必须包含 JSON 病历对象: {path}")
+    return records
+
+
 def write2filter_json(record: Mapping[str, Any], path: Path | None = None) -> bool:
-    """Append a filtered record to a JSON array, deduplicated by order_sn or record identity."""
+    """Append one filtered record per line, deduplicated by record identity."""
     target = path or (DEFAULT_OUTPUT_DIR / FILTER_FILE_NAME)
     target.parent.mkdir(parents=True, exist_ok=True)
     filtered_record = dict(record)
@@ -609,20 +625,12 @@ def write2filter_json(record: Mapping[str, Any], path: Path | None = None) -> bo
         with lock_path.open("a+", encoding="utf-8") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
-                records: list[dict[str, Any]] = []
-                if target.is_file():
-                    try:
-                        existing = json.loads(target.read_text(encoding="utf-8"))
-                    except json.JSONDecodeError as exc:
-                        raise ValueError(f"过滤文件不是合法 JSON: {target}") from exc
-                    if not isinstance(existing, list) or not all(isinstance(item, dict) for item in existing):
-                        raise ValueError(f"过滤文件必须是 JSON 对象数组: {target}")
-                    records = existing
+                records = _read_filter_records(target)
                 if any(_filtered_record_identity(item) == identity for item in records):
                     return False
                 records.append(filtered_record)
                 temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-                temporary.write_text(_json_dumps(records, indent=2), encoding="utf-8")
+                temporary.write_text("".join(_json_dumps(item) + "\n" for item in records), encoding="utf-8")
                 temporary.replace(target)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -1152,12 +1160,11 @@ class MedicalRecordAgents:
             system_prompt=_load_prompt("inspection_report_analysis_prompt.txt"),
             name="inspection_report_agent",
         )
-        self.tongue_face_agent = StructuredAgent[TongueFaceResult](
-            vlm_model,
-            TongueFaceResult,
-            system_prompt=_load_prompt("tongue_face_analysis_prompt_v2.txt"),
-            name="tongue_face_agent",
-        )
+        self.tongue_face_agents = {
+            "舌": StructuredAgent(vlm_model, TongueFeatures, system_prompt=_load_prompt("tongue_analysis_prompt.txt"), name="tongue_agent"),
+            "面": StructuredAgent(vlm_model, FaceFeatures, system_prompt=_load_prompt("face_analysis_prompt.txt"), name="face_agent"),
+            "患处": StructuredAgent(vlm_model, LesionFeatures, system_prompt=_load_prompt("lesions_analysis_prompt.txt"), name="lesions_agent"),
+        }
 
     @staticmethod
     def _build_history_agent(model: ChatOpenAI) -> Any:
@@ -1396,22 +1403,6 @@ class MedicalRecordAgents:
                 summaries.append(summary)
         return InspectionResult(reports=reports, history_evidence_summary="\n".join(summaries))
 
-    async def _extract_tongue_face_from_ocr(self, ocr_text: str) -> TongueFaceResult:
-        prompt = (
-            "以下内容是多张舌象、面象和患处图片按批次转写后的 OCR/可见事实文本。"
-            "请只依据这些文本，按结构化模型提取可见舌象、面象和患处内容；"
-            "不得补充文本中没有的疾病、证候、病因或病机推断。\n"
-            f"{ocr_text}"
-        )
-        return await _invoke_structured_agent(
-            self.tongue_face_agent,
-            HumanMessage(content=prompt),
-            TongueFaceResult,
-            reviewer_agent=self.reviewer_agent,
-            agent_name="tongue_face_agent",
-            system_prompt=_load_prompt("tongue_face_analysis_prompt_v2.txt"),
-        )
-
     async def classify_images(self, record: dict[str, Any]) -> dict[str, list[str]]:
         """不依赖字段名，对四个图片字段中的图片逐张分类."""
         images = _record_images(record)
@@ -1476,53 +1467,67 @@ class MedicalRecordAgents:
             _model_dump(result, by_alias=True)
         )
 
-    async def analyze_tongue_face_images(self, record: dict[str, Any], images: list[str] | None = None) -> None:
-        record_id = (
-            _text(record.get("order_sn"))
-            or _text(record.get("id"))
-            or _text(record.get("record_id"))
-            or "<unknown>"
-        )
-        if images is None:
-            classified_images = await self.classify_images(record)
-            images = [image for category in TONGUE_FACE_IMAGE_CATEGORIES for image in classified_images[category]]
-        logger.info(f"[TONGUE_FACE] record={record_id} 共有 images={len(images)}")
-        if not images:
-            record["ai_tongue_face_img"] = _model_dump(TongueFaceResult())
-            return
-        prompt = (
-            "按结构化模型分析图片中的可见舌象、面象和患处。分别记录舌体、舌苔、舌下络脉、"
-            "面神、面色、光泽、面部形态、五官局部和皮损。只描述图像可见事实，不作疾病、证候、"
-            "病因或病机推断；无法辨认的字符串字段返回空字符串，多选字段返回空数组。"
-        )
-        if len(images) > MAX_VLM_IMAGES_PER_REQUEST:
-            logger.info(
-                f"[TONGUE_FACE] record={record_id} tongue_face_images={len(images)} exceeds "
-                f"{MAX_VLM_IMAGES_PER_REQUEST}, using OCR batches"
-            )
-            ocr_text = await self._ocr_image_batches(
-                images,
-                (
-                    "你是舌象、面象和患处图片转写助手。请逐张记录图片中清晰可见的客观事实："
-                    "舌体、舌苔、舌下络脉、面部神色、五官局部、皮肤或患处形态颜色分布。"
-                ),
-                agent_name="tongue_face",
-            )
-            result = await self._extract_tongue_face_from_ocr(ocr_text)
-        else:
-            logger.info(f"[TONGUE_FACE] record={record_id} building multimodal message")
-            message = _multimodal_message(prompt, images, self.input_dir)
-            logger.info(f"[TONGUE_FACE] record={record_id} invoking model")
+    async def analyze_tongue_face_images(
+        self,
+        record: dict[str, Any],
+        images: list[str] | None = None,
+        *,
+        classified_images: dict[str, list[str]] | None = None,
+    ) -> None:
+        """Analyze each present image category with its own prompt and output schema."""
+        record_id = _text(record.get("order_sn")) or _text(record.get("id")) or "<unknown>"
+        if classified_images is None:
+            if images is None:
+                classified_images = await self.classify_images(record)
+            else:
+                classified_images = await self.classify_images({"tongue_face_img": images})
+        if images is not None:
+            allowed = set(images)
+            classified_images = {
+                category: [image for image in classified_images.get(category, []) if image in allowed]
+                for category in TONGUE_FACE_IMAGE_CATEGORIES
+            }
+
+        category_configs = {
+            "舌": ("tongue", TongueFeatures, "tongue_analysis_prompt.txt"),
+            "面": ("face", FaceFeatures, "face_analysis_prompt.txt"),
+            "患处": ("lesions", LesionFeatures, "lesions_analysis_prompt.txt"),
+        }
+        output: dict[str, Any] = {"tongue": {}, "face": {}, "lesions": {}}
+
+        async def analyze_category(category: str, category_images: list[str]) -> tuple[str, dict[str, Any]]:
+            field, schema, prompt_file = category_configs[category]
+            prompt = _load_prompt(prompt_file)
+            agent = self.tongue_face_agents[category]
+            logger.info(f"[TONGUE_FACE START] record={record_id} category={category} images={len(category_images)}")
+            if len(category_images) > MAX_VLM_IMAGES_PER_REQUEST:
+                ocr_text = await self._ocr_image_batches(
+                    category_images,
+                    f"只转写{category}图片中清晰可见的客观形态和颜色，不作诊断。",
+                    agent_name=field,
+                )
+                message = HumanMessage(content=f"仅根据以下图片转写内容分析{category}：\n{ocr_text}")
+            else:
+                message = _multimodal_message(f"请仅分析这些{category}图片的可见特征。", category_images, self.input_dir)
             result = await _invoke_structured_agent(
-                self.tongue_face_agent,
+                agent,
                 message,
-                TongueFaceResult,
+                schema,
                 reviewer_agent=self.reviewer_agent,
-                agent_name="tongue_face_agent",
-                system_prompt=_load_prompt("tongue_face_analysis_prompt_v2.txt"),
+                agent_name=f"{field}_agent",
+                system_prompt=prompt,
             )
-        logger.info(f"[TONGUE_FACE] record={record_id} model returned")
-        record["ai_tongue_face_img"] = _model_dump(result)
+            logger.info(f"[TONGUE_FACE END] record={record_id} category={category}")
+            return field, _model_dump(result)
+
+        tasks = [
+            analyze_category(category, classified_images.get(category, []))
+            for category in TONGUE_FACE_IMAGE_CATEGORIES
+            if classified_images.get(category)
+        ]
+        for field, result in await asyncio.gather(*tasks):
+            output[field] = result
+        record["ai_tongue_face_img"] = output
 
     async def extract_clinical_fields(self, record: dict[str, Any], use_rag:bool=False) -> None:
         diagnoses = {
@@ -1655,11 +1660,12 @@ class MedicalRecordAgents:
                 image for category in TONGUE_FACE_IMAGE_CATEGORIES for image in classified_images[category]
             ]
             image_stages = {
-                "inspection_vlm": (
-                    self.analyze_inspection_images,
-                    classified_images["检验检查报告类"],
+                "inspection_vlm": lambda: self.analyze_inspection_images(
+                    output, classified_images["检验检查报告类"]
                 ),
-                "tongue_face_vlm": (self.analyze_tongue_face_images, tongue_face_images),
+                "tongue_face_vlm": lambda: self.analyze_tongue_face_images(
+                    output, tongue_face_images, classified_images=classified_images
+                ),
             }
             image_stages = {name: value for name, value in image_stages.items() if name in selected_stages}
             tasks = {
@@ -1668,10 +1674,10 @@ class MedicalRecordAgents:
                         name,
                         record_id,
                         doctor_name,
-                        lambda stage=stage, images=images: stage(output, images),
+                        stage,
                     )
                 )
-                for name, (stage, images) in image_stages.items()
+                for name, stage in image_stages.items()
             }
             results = await asyncio.gather(*tasks.values(), return_exceptions=True)
             for stage_name, result in zip(tasks, results, strict=True):
@@ -2086,14 +2092,11 @@ def load_processed_record_keys(
                     order_sn = _text(record.get("order_sn"))
                     if order_sn:
                         processed_order_sns.add(order_sn)
-    for path in output_dir.rglob(FILTER_FILE_NAME):
+    for path in (*output_dir.rglob(FILTER_FILE_NAME), *output_dir.rglob("filter.json")):
         try:
-            filtered_records = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+            filtered_records = _read_filter_records(path)
+        except (json.JSONDecodeError, ValueError):
             logger.warning(f"忽略无法解析的过滤文件: {path}")
-            continue
-        if not isinstance(filtered_records, list):
-            logger.warning(f"忽略非 JSON 数组过滤文件: {path}")
             continue
         for record in filtered_records:
             if not isinstance(record, dict):

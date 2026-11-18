@@ -97,7 +97,8 @@ async def run(args: argparse.Namespace) -> int:
         working = dict(record)
         print(f"{name}: 开始，图片数={len(images)}，超时={args.timeout:g}s", flush=True)
         try:
-            await asyncio.wait_for(method(working, images), timeout=args.timeout)
+            options = {"classified_images": grouped} if args.classify and name == "tongue_face" else {}
+            await asyncio.wait_for(method(working, images, **options), timeout=args.timeout)
         except Exception as exc:
             print(f"{name}: 失败 {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
             traceback.print_exc()
@@ -117,7 +118,7 @@ async def run(args: argparse.Namespace) -> int:
 def main() -> None:
     from dotenv import load_dotenv
 
-    load_dotenv(ROOT / "medical/.env")
+    load_dotenv(ROOT / ".env")
     raise SystemExit(asyncio.run(run(parse_args())))
 
 
