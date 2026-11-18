@@ -35,7 +35,7 @@ import re
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
 from datetime import date, datetime, time as datetime_time
 from decimal import Decimal
@@ -2890,7 +2890,11 @@ async def _process_record_batch(
     return [outcomes_by_item[id(item)] for item in batch]
 
 
-async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int]:
+async def process_mysql_records(
+    args: argparse.Namespace,
+    *,
+    agent_factory: type[MedicalRecordAgents] = MedicalRecordAgents,
+) -> tuple[int, int, int]:
     """Process the full MySQL filter result in batches using raw source records.
 
     Flow:
@@ -2974,7 +2978,7 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
             api_key=getattr(args, "reviewer_api_key", ""),
         )
 
-    agents = MedicalRecordAgents(
+    agents = agent_factory(
         text_model,
         vlm_model,
         DEFAULT_INPUT,
@@ -3119,9 +3123,13 @@ async def process_mysql_records(args: argparse.Namespace) -> tuple[int, int, int
     return succeeded, failed, skipped
 
 
-async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
+async def process_records(
+    args: argparse.Namespace,
+    *,
+    agent_factory: type[MedicalRecordAgents] = MedicalRecordAgents,
+) -> tuple[int, int, int]:
     if getattr(args, "data_source", "local") == "mysql":
-        return await process_mysql_records(args)
+        return await process_mysql_records(args, agent_factory=agent_factory)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     requested_stage_names = list(getattr(args, "stage_name", None) or [])
@@ -3181,7 +3189,7 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
             api_key=getattr(args, "reviewer_api_key", ""),
         )
     input_dir = args.input if args.input.is_dir() else args.input.parent
-    agents = MedicalRecordAgents(
+    agents = agent_factory(
         text_model,
         vlm_model,
         input_dir,
@@ -3407,8 +3415,11 @@ async def process_records(args: argparse.Namespace) -> tuple[int, int, int]:
     return succeeded, failed, skipped
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="基于 LangChain 的多医生病历 AI 清洗与结构化脚本")
+def parse_args(
+    description: str = "基于 LangChain 的多医生病历 AI 清洗与结构化脚本",
+    argv: Sequence[str] | None = None,
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--data-source",
         choices=("local", "mysql"),
@@ -3622,11 +3633,15 @@ def parse_args() -> argparse.Namespace:
         default="records.jsonl",
         help="导出的 JSONL 文件名，默认 records.jsonl。仅与 --export-mode 一起使用",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(
+    *,
+    agent_factory: type[MedicalRecordAgents] = MedicalRecordAgents,
+    description: str = "基于 LangChain 的多医生病历 AI 清洗与结构化脚本",
+) -> None:
+    args = parse_args(description)
     if args.data_source == "local" and not args.input.exists():
         raise FileNotFoundError(f"输入路径不存在: {args.input}")
     # save_to 默认为与 data_source 一致
@@ -3641,7 +3656,7 @@ def main() -> None:
         logger.info(f"导出完成，共 {count} 条记录到 {args.output_dir}")
         return
 
-    succeeded, failed, skipped = asyncio.run(process_records(args))
+    succeeded, failed, skipped = asyncio.run(process_records(args, agent_factory=agent_factory))
     output_location = (
         str(args.output_dir) if args.save_to in ("local", "both") else f"MySQL 表 {MYSQL_RECORD_TABLE}"
     )
