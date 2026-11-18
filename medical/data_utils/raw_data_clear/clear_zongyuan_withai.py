@@ -750,8 +750,9 @@ if __name__ == "__main__":
    medical/processed_data/doctor_二期总院_钱彦方/medical_records_ai.jsonl 
     # 批量跑
     PYTHONPATH=. python medical/data_utils/raw_data_clear/clear_zongyuan_withai.py \
-  --input "medical/processed_data/doctor_二期总院_冯春祥/medical_records_ai.jsonl" \
-  --limit 20000 \
+  --input "medical/processed_data/doctor_二期总院_杨宗艳/medical_records_ai.jsonl" \
+  --limit 300 \
+  --reclean \
   --batchsize 6
 
     # 重新跑失败记录

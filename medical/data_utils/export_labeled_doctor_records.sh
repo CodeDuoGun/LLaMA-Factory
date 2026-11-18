@@ -20,7 +20,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/medical/processed_data}"
 CONDA_BIN="${CONDA_BIN:-$(command -v conda || true)}"
 CONDA_ENV="${CONDA_ENV:-llamafactory}"
-AGENT_SCRIPT="${SCRIPT_DIR}/medical_record_agents.py"
+AGENT_SCRIPT="${SCRIPT_DIR}/online_record_processor.py"
 
 usage() {
   echo "用法: $0 <doctor_id> <doctor_name> [output_dir]" >&2

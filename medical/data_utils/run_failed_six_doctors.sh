@@ -26,7 +26,7 @@ RECORD_TIMEOUT="${RECORD_TIMEOUT:-0}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-5}"
 CONDA_BIN="${CONDA_BIN:-$(command -v conda)}"
 CONDA_ENV="${CONDA_ENV:-${CONDA_DEFAULT_ENV:-llama_factory}}"
-AGENT_SCRIPT="${REPO_ROOT}/medical/data_utils/medical_record_agents.py"
+AGENT_SCRIPT="${REPO_ROOT}/medical/data_utils/online_record_processor.py"
 PID_FILE="${LOG_DIR}/workers.pid"
 
 mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"

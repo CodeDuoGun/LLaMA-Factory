@@ -23,7 +23,7 @@ PROGRESS_EVERY="${PROGRESS_EVERY:-10}"
 CONDA_BIN="${CONDA_BIN:-$(command -v conda || true)}"
 CONDA_ENV="${CONDA_ENV:-${CONDA_DEFAULT_ENV:-llama_factory}}"
 
-AGENT_SCRIPT="${REPO_ROOT}/medical/data_utils/medical_record_agents.py"
+AGENT_SCRIPT="${REPO_ROOT}/medical/data_utils/online_record_processor.py"
 
 mkdir -p "${LOG_DIR}" "$(dirname "${PROGRESS_FILE}")"
 

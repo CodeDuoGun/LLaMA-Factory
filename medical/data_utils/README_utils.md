@@ -8,7 +8,7 @@ SFT 数据构造工具。除非脚本另有说明，以下命令均在项目根�
 ```text
 原始问诊/处方数据
   → raw_data_clear 数据清洗
-  → medical_record_agents.py AI 结构化和诊断归一化
+  → online_record_processor.py AI 结构化和诊断归一化
   → medical_records_ai.jsonl
   → import_ai_medical_records.py 导入 MySQL
   → analysis 病历标注页人工审核
@@ -23,7 +23,7 @@ export DATABASE_URL='mysql+pymysql://user:password@host:port/database?charset=ut
 
 ## AI 病历结构化
 
-### `medical_record_agents.py`
+### `online_record_processor.py`
 
 主处理脚本。它按医生读取 JSON/JSONL，调用文本、视觉、诊断和可选评审 Agent，生成带 `ai_` 前缀的
 结构化病历，结果按医生增量写入：
@@ -38,12 +38,13 @@ medical/processed_data/doctor_<doctor_id>_<doctor_name>/medical_records_ai.jsonl
 单医生示例：
 
 ```bash
-python medical/data_utils/medical_record_agents.py \
-  --input medical/data/202301_online/朱子奇_AI医生分身混合问诊数据_43_20260729175534.json \
+python medical/data_utils/online_record_processor.py \
+  --input medical/data/二期online/刘根尚_AI医生分身混合问诊数据_678_20261117152544.json \
   --output-dir medical/processed_data \
-  --doctor-id 43 \
-  --batch-size 8 \
-  --progress-every 10
+  --doctor-id 678 \
+  --batch-size 1 \
+  --limit 2 \
+ --timeout 60 --record-timeout 90 --max-retries 0 --progress-every 1
 ```
 
 常用参数：
@@ -64,15 +65,15 @@ python medical/data_utils/medical_record_agents.py \
 只清洗病史和诊断的示例：
 
 ```bash
-python medical/data_utils/medical_record_agents.py \
+python medical/data_utils/online_record_processor.py \
   --input <input.jsonl> \
   --output-dir medical/processed_data \
-  --stage-name clinical_cleaning diagnosis_completion
+  --stage-name clinical_cleaning diagnosis_normalization
 ```
 
 可选阶段为 `diagnosis_normalization`、`image_classification`、`inspection_vlm`、`tongue_face_vlm`、
-`clinical_cleaning`、`diagnosis_completion` 和 `clinical_extraction`。不传 `--stage-name` 时保持原有行为并运行全部阶段；传入阶段后，输出文件名会记录
-阶段组合，例如 `medical_records_ai__stage_clinical_cleaning__diagnosis_completion.jsonl`。选择
+`clinical_cleaning` 和 `clinical_extraction`。不传 `--stage-name` 时运行全部阶段；传入阶段后，输出文件名会记录
+阶段组合，例如 `medical_records_ai__stage_clinical_cleaning__diagnosis_normalization.jsonl`。选择
 `inspection_vlm` 或 `tongue_face_vlm` 时会自动加入其必要依赖 `image_classification`，文件名以实际执行阶段为准。
 
 无论运行全部阶段还是只指定部分阶段，输出均以输入病历为基础做字段 upsert：本次生成的字段覆盖同名旧值，
@@ -81,7 +82,7 @@ JSONL 始终是 upsert 后的完整病历，不额外写入 `ai_processing_stage
 
 `clinical_cleaning` 会将 `admin_face_describe`（舌象及面相）、`birth_detail`（生育史）、
 `is_marriage_history`（婚恋史）及三个原始诊断字段一并提供给模型作为上下文，输出主诉、现病史一致性、
-五史和三个 AI 诊断及其修正理由；它也负责从按日期累积的病史中定位并清洗本次就诊现病史。
+五史和三个 AI 诊断及其修正理由，使用 `prompts/record_clear.txt`；它也负责从按日期累积的病史中定位并清洗本次就诊现病史。
 生育史和婚恋史本身保持原病历值，不生成对应 AI 字段。`clinical_extraction` 在提取病因、病机、病位、
 病期、病程和关键症状的同一次调用中生成 `ai_treatment_principle`。
 
@@ -89,7 +90,7 @@ JSONL 始终是 upsert 后的完整病历，不额外写入 `ai_processing_stage
 与历史 JSONL 取交集，只执行图片管线和 `clinical_cleaning`，并仅回写原表的 `ai_` 字段：
 
 ```bash
-python medical/data_utils/medical_record_agents.py \
+python medical/data_utils/online_record_processor.py \
   --data-source mysql \
   --save-to mysql \
   --doctor-id 97 \
@@ -213,7 +214,7 @@ OVERWRITE=1 bash medical/data_utils/normalize_ai_diagnosis_six_doctors.sh
 分别写入 `doctor_<doctor_id>_<doctor_name>/records.jsonl`：
 
 ```bash
-python medical/data_utils/medical_record_agents.py \
+python medical/data_utils/online_record_processor.py \
   --data-source mysql \
   --export-mode \
   --output-dir medical/processed_data \
@@ -472,7 +473,7 @@ python medical/data_utils/evaluate_prescription_rag.py \
 ```bash
 PYTHONPATH=. WANDB_DISABLED=true pytest -q --import-mode=importlib \
   medical/data_utils/test_ai_medical_records.py \
-  medical/data_utils/test_medical_record_agents.py \
+  medical/data_utils/online_record_processor.py \
   medical/data_utils/test_normalize_ai_diagnosis_labels.py \
   medical/data_utils/test_structured_agent.py
 ```
