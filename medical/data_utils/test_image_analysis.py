@@ -75,30 +75,29 @@ async def run(args: argparse.Namespace) -> int:
     record = load_record(args.input, args.order_sn)
     vlm = build_model(args.vlm_model or args.model, args, base_url=args.base_url, api_key=args.api_key)
     agents = MedicalRecordAgents(vlm, vlm, args.input.parent, stage_timeout=args.timeout)
-    if args.classify:
+    grouped = None
+    if args.classify or args.stage in ("tongue_face", "both"):
         grouped = await asyncio.wait_for(agents.classify_images(record), timeout=args.timeout)
+    if args.classify:
         inspection = grouped["检验检查报告类"]
-        tongue_face = [url for category in TONGUE_FACE_IMAGE_CATEGORIES for url in grouped[category]]
     else:
         inspection = list(dict.fromkeys(
             url for field in ("inspection_report_img", "admin_report_img")
             for url in _as_images(record.get(field))
         ))
-        tongue_face = list(dict.fromkeys(
-            url for field in ("tongue_face_img", "admin_face_img")
-            for url in _as_images(record.get(field))
-        ))
-    print(f"record={args.order_sn} inspection_images={len(inspection)} tongue_face_images={len(tongue_face)}", flush=True)
+    tongue_face = {category: grouped[category] for category in TONGUE_FACE_IMAGE_CATEGORIES} if grouped else {}
+    tongue_face_count = sum(map(len, tongue_face.values()))
+    print(f"record={args.order_sn} inspection_images={len(inspection)} tongue_face_images={tongue_face_count}", flush=True)
 
-    async def check(name: str, images: list[str], output_field: str, method: Any) -> bool:
-        if not images:
+    async def check(name: str, images: list[str] | dict[str, list[str]], output_field: str, method: Any) -> bool:
+        image_count = sum(map(len, images.values())) if isinstance(images, dict) else len(images)
+        if not image_count:
             print(f"{name}: 无图片，跳过", flush=True)
             return True
         working = dict(record)
-        print(f"{name}: 开始，图片数={len(images)}，超时={args.timeout:g}s", flush=True)
+        print(f"{name}: 开始，图片数={image_count}，超时={args.timeout:g}s", flush=True)
         try:
-            options = {"classified_images": grouped} if args.classify and name == "tongue_face" else {}
-            await asyncio.wait_for(method(working, images, **options), timeout=args.timeout)
+            await asyncio.wait_for(method(working, images), timeout=args.timeout)
         except Exception as exc:
             print(f"{name}: 失败 {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
             traceback.print_exc()

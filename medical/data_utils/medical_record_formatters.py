@@ -152,7 +152,7 @@ def format_inspection_result_text(result: InspectionResult | Mapping[str, Any] |
         )
         # 兼容新增“异常结果”字段前已落库的影像/检查解析结果。
         if not abnormal_results and "abnormal_results" not in report and "异常结果" not in report:
-            if image_type in {"检查报告", "CT诊断报告", "影像检查报告", "病理报告", "门诊病历"}:
+            if image_type in {"检查报告", "CT诊断报告", "影像检查报告", "病理报告", "门诊病历", "诊断书/诊断证明"}:
                 abnormal_results = _format_tongue_face_value(
                     _inspection_field(report, "conclusion", "报告结论")
                 )

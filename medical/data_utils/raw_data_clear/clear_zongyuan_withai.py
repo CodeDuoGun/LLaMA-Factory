@@ -756,11 +756,11 @@ if __name__ == "__main__":
 
     # 重新跑失败记录
     PYTHONPATH=. python medical/data_utils/raw_data_clear/clear_zongyuan_withai.py \
-    --input medical/processed_data/doctor_二期总院_钱彦方/medical_records_ai_failed.jsonl \
-    --merge-target medical/processed_data/doctor_二期总院_钱彦方/medical_records_ai.jsonl \
-    --failed-output medical/processed_data/doctor_二期总院_钱彦方/medical_records_ai_failed_remaining.jsonl \
+    --input medical/processed_data/doctor_二期总院_杨宗艳/medical_records_ai_failed.jsonl \
+    --merge-target medical/processed_data/doctor_二期总院_杨宗艳/medical_records_ai.jsonl \
+    --failed-output medical/processed_data/doctor_二期总院_杨宗艳/medical_records_ai_failed_remaining.jsonl \
     --reclean \
-    --batchsize 1
+    --batchsize 3
     """
     
     main()

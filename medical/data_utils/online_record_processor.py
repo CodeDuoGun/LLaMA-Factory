@@ -56,7 +56,6 @@ from medical.data_utils.structured_agent import (
     AgentModelConfig,
     StructuredAgent,
     model_json_schema,
-    response_text,
 )
 from medical.utils.log import logger
 from medical.data_utils.medical_record_formatters import (
@@ -172,6 +171,7 @@ EXAMINATION_REPORT_TYPES = {
     "影像检查报告",
     "病理报告",
     "其他检查报告",
+    "诊断书/诊断证明",
 }
 DISCHARGE_REPORT_TYPES = {"住院/出院报告"}
 OUTPATIENT_RECORD_TYPES = {"门诊病历"}
@@ -365,6 +365,8 @@ def _normalize_inspection_finding(report: Any) -> None:
         report.abnormal_indicators = []
         report.discharge_diagnosis = ""
         report.discharge_condition = ""
+        if image_type == "诊断书/诊断证明" and not report.abnormal_results:
+            report.is_valid_report = False
     elif image_type in DISCHARGE_REPORT_TYPES:
         report.content = ""
         report.abnormal_indicators = []
@@ -909,11 +911,6 @@ async def _invoke_structured_agent(
     raise RuntimeError(f"{agent_name or schema.__name__} 评审流程异常结束")
 
 
-def _response_text(response: Any) -> str:
-    """兼容 OpenAI 风格响应的字符串或内容块格式."""
-    return response_text(response)
-
-
 def _image_value(item: Any) -> str:
     if isinstance(item, str):
         return item.strip()
@@ -1271,61 +1268,6 @@ class MedicalRecordAgents:
         """根据不同医生--不同疾病--不同病期---不同治则治法—不同配伍用药知识库召回疾病知识."""
         return ''
 
-    async def _ocr_image_batches(self, images: list[str], prompt: str, *, agent_name: str) -> str:
-        """Run OCR batches concurrently and return their text in original image order."""
-        batches = list(_chunked(images, MAX_VLM_IMAGES_PER_REQUEST))
-        semaphore = getattr(self, "ocr_batch_semaphore", None)
-        if semaphore is None:
-            semaphore = asyncio.Semaphore(OCR_BATCH_CONCURRENCY)
-            self.ocr_batch_semaphore = semaphore
-
-        async def run_batch(batch_index: int, batch_images: list[str]) -> str:
-            start_index = (batch_index - 1) * MAX_VLM_IMAGES_PER_REQUEST + 1
-            numbered_prompt = (
-                f"{prompt}\n"
-                f"本批共 {len(batch_images)} 张图片，对应原始图片序号 {start_index} 到 "
-                f"{start_index + len(batch_images) - 1}。"
-                "请逐张输出可识别文字或可见客观事实；无法识别的图片也要保留图片序号并说明无法识别。"
-            )
-            started = time.perf_counter()
-            logger.info(
-                f"[OCR BATCH START] agent={agent_name} batch={batch_index}/{len(batches)} "
-                f"images={len(batch_images)}"
-            )
-            try:
-                async with semaphore:
-                    response = await self.vlm_model.ainvoke(
-                        [_multimodal_message(numbered_prompt, batch_images, self.input_dir)]
-                    )
-            except Exception as exc:
-                elapsed = time.perf_counter() - started
-                logger.error(
-                    f"[OCR BATCH ERROR] agent={agent_name} batch={batch_index}/{len(batches)} "
-                    f"elapsed={elapsed:.1f}s error={type(exc).__name__}: {exc}"
-                )
-                raise RuntimeError(
-                    f"{agent_name} OCR 批次 {batch_index}/{len(batches)} 失败: {type(exc).__name__}: {exc}"
-                ) from exc
-            elapsed = time.perf_counter() - started
-            logger.info(
-                f"[OCR BATCH END] agent={agent_name} batch={batch_index}/{len(batches)} "
-                f"images={len(batch_images)} elapsed={elapsed:.1f}s"
-            )
-            text = _response_text(response)
-            return f"【{agent_name} OCR 批次 {batch_index}】\n{text}"
-
-        results = await asyncio.gather(
-            *(run_batch(batch_index, batch_images) for batch_index, batch_images in enumerate(batches, 1)),
-            return_exceptions=True,
-        )
-        errors = [result for result in results if isinstance(result, BaseException)]
-        if errors:
-            raise RuntimeError(
-                f"{agent_name} OCR 共 {len(errors)}/{len(batches)} 个批次失败: "
-                + "; ".join(str(error) for error in errors)
-            ) from errors[0]
-        return "\n\n".join(result for result in results if isinstance(result, str))
-
     async def _analyze_inspection_batches(self, images: list[str], visit_time: str) -> InspectionResult:
         """Extract one structured result per image batch and merge without a second model call."""
         batches = list(_chunked(images, MAX_VLM_IMAGES_PER_REQUEST))
@@ -1470,23 +1412,14 @@ class MedicalRecordAgents:
     async def analyze_tongue_face_images(
         self,
         record: dict[str, Any],
-        images: list[str] | None = None,
-        *,
-        classified_images: dict[str, list[str]] | None = None,
+        classified_images: dict[str, list[str]],
     ) -> None:
-        """Analyze each present image category with its own prompt and output schema."""
+        """Analyze preclassified tongue, face, and lesion images directly with the VLM."""
         record_id = _text(record.get("order_sn")) or _text(record.get("id")) or "<unknown>"
-        if classified_images is None:
-            if images is None:
-                classified_images = await self.classify_images(record)
-            else:
-                classified_images = await self.classify_images({"tongue_face_img": images})
-        if images is not None:
-            allowed = set(images)
-            classified_images = {
-                category: [image for image in classified_images.get(category, []) if image in allowed]
-                for category in TONGUE_FACE_IMAGE_CATEGORIES
-            }
+        counts = {category: len(classified_images.get(category, [])) for category in TONGUE_FACE_IMAGE_CATEGORIES}
+        logger.info(
+            f"[TONGUE_FACE INPUT] record={record_id} classified_counts={counts}"
+        )
 
         category_configs = {
             "舌": ("tongue", TongueFeatures, "tongue_analysis_prompt.txt"),
@@ -1496,29 +1429,61 @@ class MedicalRecordAgents:
         output: dict[str, Any] = {"tongue": {}, "face": {}, "lesions": {}}
 
         async def analyze_category(category: str, category_images: list[str]) -> tuple[str, dict[str, Any]]:
+            started = time.monotonic()
             field, schema, prompt_file = category_configs[category]
             prompt = _load_prompt(prompt_file)
             agent = self.tongue_face_agents[category]
-            logger.info(f"[TONGUE_FACE START] record={record_id} category={category} images={len(category_images)}")
-            if len(category_images) > MAX_VLM_IMAGES_PER_REQUEST:
-                ocr_text = await self._ocr_image_batches(
-                    category_images,
-                    f"只转写{category}图片中清晰可见的客观形态和颜色，不作诊断。",
-                    agent_name=field,
-                )
-                message = HumanMessage(content=f"仅根据以下图片转写内容分析{category}：\n{ocr_text}")
-            else:
-                message = _multimodal_message(f"请仅分析这些{category}图片的可见特征。", category_images, self.input_dir)
-            result = await _invoke_structured_agent(
-                agent,
-                message,
-                schema,
-                reviewer_agent=self.reviewer_agent,
-                agent_name=f"{field}_agent",
-                system_prompt=prompt,
+            logger.info(
+                f"[TONGUE_FACE START] record={record_id} category={category} images={len(category_images)} "
+                f"remote_images={sum(image.startswith(('http://', 'https://')) for image in category_images)} "
+                f"model={getattr(self.vlm_model, 'model_name', '<unknown>')}"
             )
-            logger.info(f"[TONGUE_FACE END] record={record_id} category={category}")
-            return field, _model_dump(result)
+            try:
+                prepare_started = time.monotonic()
+                message = _multimodal_message(
+                    f"请仅分析这些{category}图片的可见特征。", category_images, self.input_dir
+                )
+                logger.info(
+                    f"[TONGUE_FACE REQUEST] record={record_id} category={category} "
+                    f"prepare_elapsed={time.monotonic() - prepare_started:.1f}s "
+                    f"total_elapsed={time.monotonic() - started:.1f}s"
+                )
+
+                async def log_waiting() -> None:
+                    while True:
+                        await asyncio.sleep(15)
+                        logger.warning(
+                            f"[TONGUE_FACE WAITING] record={record_id} category={category} "
+                            f"model_elapsed={time.monotonic() - model_started:.1f}s"
+                        )
+
+                model_started = time.monotonic()
+                heartbeat = asyncio.create_task(log_waiting())
+                logger.debug(prompt)
+                try:
+                    result = await _invoke_structured_agent(
+                        agent,
+                        message,
+                        schema,
+                        reviewer_agent=self.reviewer_agent,
+                        agent_name=f"{field}_agent",
+                        system_prompt=prompt,
+                    )
+                finally:
+                    heartbeat.cancel()
+                    await asyncio.gather(heartbeat, return_exceptions=True)
+                logger.info(
+                    f"[TONGUE_FACE END] record={record_id} category={category} "
+                    f"model_elapsed={time.monotonic() - model_started:.1f}s "
+                    f"total_elapsed={time.monotonic() - started:.1f}s"
+                )
+                return field, _model_dump(result)
+            except Exception as exc:
+                logger.exception(
+                    f"[TONGUE_FACE ERROR] record={record_id} category={category} "
+                    f"elapsed={time.monotonic() - started:.1f}s error={type(exc).__name__}: {exc}"
+                )
+                raise
 
         tasks = [
             analyze_category(category, classified_images.get(category, []))
@@ -1656,15 +1621,12 @@ class MedicalRecordAgents:
                     )
 
             # 报告类与舌/面/患处类图片互不依赖，并行解析。
-            tongue_face_images = [
-                image for category in TONGUE_FACE_IMAGE_CATEGORIES for image in classified_images[category]
-            ]
             image_stages = {
                 "inspection_vlm": lambda: self.analyze_inspection_images(
                     output, classified_images["检验检查报告类"]
                 ),
                 "tongue_face_vlm": lambda: self.analyze_tongue_face_images(
-                    output, tongue_face_images, classified_images=classified_images
+                    output, classified_images
                 ),
             }
             image_stages = {name: value for name, value in image_stages.items() if name in selected_stages}
