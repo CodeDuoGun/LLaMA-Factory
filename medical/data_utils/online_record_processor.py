@@ -1459,7 +1459,7 @@ class MedicalRecordAgents:
 
                 model_started = time.monotonic()
                 heartbeat = asyncio.create_task(log_waiting())
-                logger.debug(prompt)
+                # logger.debug(prompt)
                 try:
                     result = await _invoke_structured_agent(
                         agent,

@@ -47,6 +47,16 @@ python medical/data_utils/online_record_processor.py \
  --timeout 60 --record-timeout 90 --max-retries 0 --progress-every 1
 ```
 
+```bash
+python medical/data_utils/online_record_processor.py \
+  --input medical/data/二期online/刘根尚_AI医生分身混合问诊数据_678_20261117152544.json \
+  --output-dir medical/processed_data \
+  --doctor-id 678 \
+  --batch-size 1 \
+  --limit 100 \
+  --progress-every 1
+```
+
 常用参数：
 
 | 参数 | 作用 |
