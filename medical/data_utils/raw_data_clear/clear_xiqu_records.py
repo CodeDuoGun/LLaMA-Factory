@@ -537,7 +537,7 @@ def aggregate_prescriptions(rows: pd.DataFrame, treatment_plan: Any) -> list[dic
     ):
         dose_count = _first_value(group, "剂数")
         frequency = _first_value(group, "频次")
-        usage = _first_value(group, "用法")
+        usage = _first_value(group, "煎法")
         usage_desc = build_usage_desc(dose_count, frequency)
         drugs = [build_drug_entry(row) for _, row in group.iterrows() if clean_text(row.get("项目名称"))]
         if not drugs:
