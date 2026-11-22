@@ -19,7 +19,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -31,15 +33,19 @@ DEFAULT_SOURCE = PROJECT_ROOT / "medical/data/二期西区"
 TABLE_NAME = "mlops_annotation_medical_record"
 
 
-def discover_files(processed_dir: Path, source_dir: Path) -> list[Path]:
+def discover_files(processed_dir: Path, source_dir: Path, doctor_name: str | None = None) -> list[Path]:
     names = {path.stem.removesuffix(" 病历") for path in source_dir.glob("* 病历.xlsx")}
+    if doctor_name:
+        if doctor_name not in names:
+            raise ValueError(f"西区源表中未找到医生: {doctor_name}")
+        names = {doctor_name}
     paths = sorted(
         path
         for path in processed_dir.glob("doctor_*/medical_records_ai.jsonl")
         if path.parent.name.rsplit("_", 1)[-1] in names
     )
     if not paths:
-        raise FileNotFoundError("未找到西区医生的 medical_records_ai.jsonl")
+        raise FileNotFoundError(f"未找到西区医生{doctor_name or ''}的 medical_records_ai.jsonl")
     return paths
 
 
@@ -65,19 +71,55 @@ def load_updates(paths: list[Path]) -> dict[tuple[int, int, str], list]:
     return updates
 
 
+def write_batch(manager: Any, table: Any, batch: list[tuple[tuple[int, int, str], Any]], updates: dict) -> int:
+    """Update one batch in its own transaction and connection."""
+    from sqlalchemy import and_, update
+
+    count = 0
+    with manager.connection(transactional=True) as connection:
+        for key, row_id in batch:
+            doctor_id, patient_id, order_sn = key
+            statement = (
+                update(table)
+                .where(
+                    and_(
+                        table.c.id == row_id,
+                        table.c.doctor_id == doctor_id,
+                        table.c.patient_id == patient_id,
+                        table.c.order_sn == order_sn,
+                    )
+                )
+                .values(ps=updates[key])
+            )
+            result = connection.execute(statement)
+            if result.rowcount != 1:
+                raise ValueError(f"更新影响行数异常，当前批次事务回滚: {key} rowcount={result.rowcount}")
+            count += 1
+    return count
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--processed-dir", type=Path, default=DEFAULT_PROCESSED)
     parser.add_argument("--source-dir", type=Path, default=DEFAULT_SOURCE)
+    parser.add_argument("--doctor-name", help="只预检或更新指定西区医生，例如 李佩文")
     parser.add_argument("--table-name", default=TABLE_NAME)
-    parser.add_argument("--batch-size", type=int, default=200)
+    parser.add_argument(
+        "--batchsize",
+        "--batch-size",
+        dest="batch_size",
+        type=int,
+        default=200,
+        help="预检查询及写入事务每批处理的病历数，默认 200",
+    )
+    parser.add_argument("--concurrency", type=int, default=4, help="并发写入批次数，默认 4")
     parser.add_argument("--yes", action="store_true", help="执行更新；默认只预检")
     args = parser.parse_args()
     if args.batch_size < 1:
-        parser.error("--batch-size 必须为正数")
-    updates = load_updates(discover_files(args.processed_dir, args.source_dir))
-    from sqlalchemy import and_, update
-
+        parser.error("--batchsize 必须为正数")
+    if args.concurrency < 1:
+        parser.error("--concurrency 必须为正数")
+    updates = load_updates(discover_files(args.processed_dir, args.source_dir, args.doctor_name))
     from medical.data_utils.db_manager import DBManager
 
     manager = DBManager()
@@ -126,30 +168,33 @@ def main() -> None:
         if not args.yes:
             print("只预检，未写入 MySQL；传入 --yes 执行更新")
             return
+        batches = [changed[start : start + args.batch_size] for start in range(0, len(changed), args.batch_size)]
         count = 0
-        with manager.connection(transactional=True) as connection:
-            for key, row_id in changed:
-                doctor_id, patient_id, order_sn = key
-                statement = (
-                    update(table)
-                    .where(
-                        and_(
-                            table.c.id == row_id,
-                            table.c.doctor_id == doctor_id,
-                            table.c.patient_id == patient_id,
-                            table.c.order_sn == order_sn,
-                        )
-                    )
-                    .values(ps=updates[key])
-                )
-                result = connection.execute(statement)
-                if result.rowcount != 1:
-                    raise ValueError(f"更新影响行数异常，事务回滚: {key} rowcount={result.rowcount}")
-                count += 1
+        failures = []
+        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            futures = {
+                executor.submit(write_batch, manager, table, batch, updates): index
+                for index, batch in enumerate(batches, 1)
+            }
+            for future in as_completed(futures):
+                batch_number = futures[future]
+                try:
+                    written = future.result()
+                except Exception as exc:
+                    failures.append(batch_number)
+                    print(f"[失败] batch={batch_number}/{len(batches)}: {type(exc).__name__}: {exc}", flush=True)
+                    continue
+                count += written
+                print(f"[完成] batch={batch_number}/{len(batches)} 更新={written} 条", flush=True)
+        if failures:
+            raise RuntimeError(f"{len(failures)} 个批次失败，已完成 {count} 条；失败批次: {sorted(failures)}")
         print(f"写入完成: 仅更新 ps，共 {count} 条；未插入任何病历")
     finally:
         manager.close()
 
 
 if __name__ == "__main__":
+    """
+    python medical/data_utils/raw_data_clear/update_xiqu_ps_mysql.py --doctor-name 李方洁 --batchsize 200 --concurrency 4 --yes
+    """
     main()

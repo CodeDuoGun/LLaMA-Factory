@@ -517,7 +517,7 @@ def build_drug_entry(row: pd.Series) -> dict[str, Any]:
         drug_name=clean_text(row.get("项目名称")),
         drug_num=normalize_number(row.get(drug_num_column)),
         unit_name=clean_text(row.get("单位")),
-        decoction_name="",
+        decoction_name=clean_text(row.get("煎法")),
     )
 
 
@@ -537,7 +537,7 @@ def aggregate_prescriptions(rows: pd.DataFrame, treatment_plan: Any) -> list[dic
     ):
         dose_count = _first_value(group, "剂数")
         frequency = _first_value(group, "频次")
-        usage = _first_value(group, "煎法")
+        usage = _first_value(group, "用法")
         usage_desc = build_usage_desc(dose_count, frequency)
         drugs = [build_drug_entry(row) for _, row in group.iterrows() if clean_text(row.get("项目名称"))]
         if not drugs:

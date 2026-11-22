@@ -45,8 +45,8 @@ if TYPE_CHECKING:
 DEFAULT_INPUT = PROJECT_ROOT / "medical/data/二期南区/zhangzongqi"
 DEFAULT_OUTPUT = PROJECT_ROOT / "medical/processed_data/doctor_二期南区_张宗岐"
 PROMPT_PATH = PROJECT_ROOT / "medical/data_utils/prompts/zhangzongqi_recordimg_clean.txt"
+MERGE_PROMPT_PATH = PROJECT_ROOT / "medical/data_utils/prompts/zhangzongqi_record_merge_clean.txt"
 RECORD_RULES_PATH = PROJECT_ROOT / "medical/data_utils/prompts/record_clear.txt"
-PROMPT_SEPARATOR = "\n=== 时间窗口合并 ===\n"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 IMAGE_NAME = re.compile(r"^(\d+)(?:_mask)?$", re.IGNORECASE)
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -168,21 +168,22 @@ class MergedVisits(BaseModel):
     items: list[VisitItem]
 
 
-def load_prompts(path: Path = PROMPT_PATH) -> tuple[str, str]:
-    parts = path.read_text(encoding="utf-8").split(PROMPT_SEPARATOR)
-    if len(parts) != 2 or not all(part.strip() for part in parts):
-        raise ValueError(f"提示词应包含单图和合并两段，以 {PROMPT_SEPARATOR.strip()} 分隔: {path}")
+def load_prompts(image_path: Path = PROMPT_PATH, merge_path: Path = MERGE_PROMPT_PATH) -> tuple[str, str]:
+    image_prompt = image_path.read_text(encoding="utf-8").strip()
+    merge_base = merge_path.read_text(encoding="utf-8").strip()
+    if not image_prompt or not merge_base:
+        raise ValueError(f"单图或合并提示词为空: {image_path}, {merge_path}")
     rules = RECORD_RULES_PATH.read_text(encoding="utf-8")
     clinical_rules = rules.split("【主诉清洗规则】", 1)[1].split("【三个诊断清洗规则】", 1)[0]
     history_rules = rules.split("【过敏史清洗过则】", 1)[1].split("【结构化输出】", 1)[0]
     merge_prompt = (
-        parts[1].strip() + "\n\n以下是 record_clear.txt 中主诉、现病史及病史字段的详细规则；"
+        merge_base + "\n\n以下是 record_clear.txt 中主诉、现病史及病史字段的详细规则；"
         "其诊断字段映射和原输出格式不适用于本任务：\n【主诉清洗规则】"
         + clinical_rules
         + "\n【过敏史清洗过则】"
         + history_rules
     )
-    return parts[0].strip(), merge_prompt
+    return image_prompt, merge_prompt
 
 
 def select_images(patient_dir: Path) -> list[Path]:
@@ -250,12 +251,33 @@ def build_record(item: dict[str, Any], patient_name: str, visit_order: int) -> d
 
 
 async def call_model(agent: StructuredAgent[Any], content: Any, retries: int) -> dict[str, Any]:
-    from langchain_core.messages import HumanMessage
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    def chunk_text(chunk: Any) -> str:
+        value = chunk.content
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(
+                block if isinstance(block, str) else str(block.get("text", ""))
+                for block in value
+                if isinstance(block, str) or (isinstance(block, dict) and block.get("type") in {"text", "output_text"})
+            )
+        return ""
 
     for attempt in range(retries + 1):
         try:
-            result = await agent.ainvoke(HumanMessage(content=content))
-            return result.output.model_dump()
+            messages = [SystemMessage(content=agent._json_system_prompt()), HumanMessage(content=content)]
+            parts = []
+            async for chunk in agent.runnable.astream(messages):
+                parts.append(chunk_text(chunk))
+            raw_text = "".join(parts).strip()
+            if not raw_text:
+                raise ValueError("合并 agent 的流式响应为空")
+            fence = chr(96) * 3
+            if raw_text.startswith(fence) and raw_text.endswith(fence):
+                raw_text = re.sub(r"^" + fence + r"(?:json)?\s*|\s*" + fence + r"$", "", raw_text, flags=re.I).strip()
+            return agent.schema.model_validate(json.loads(raw_text)).model_dump()
         except Exception as exc:
             if attempt == retries:
                 logger.error(f"模型调用失败 agent={agent.name} attempts={attempt + 1}: {type(exc).__name__}: {exc}")
@@ -385,7 +407,7 @@ async def run(args: argparse.Namespace) -> int:
         f"vision_model={args.vision_model} text_model={args.text_model}"
     )
 
-    def make_config(model: str, name: str) -> AgentModelConfig:
+    def make_config(model: str, name: str, *, streaming: bool) -> AgentModelConfig:
         config = AgentModelConfig(
             model=model,
             api_key=key,
@@ -394,17 +416,17 @@ async def run(args: argparse.Namespace) -> int:
             thinking=False,
             timeout=args.timeout,
             max_retries=0,
-            client_kwargs={"streaming": False},
+            client_kwargs={"streaming": streaming},
         )
         logger.info(
             f"模型参数 agent={name} model={config.model} base_url={config.base_url} "
-            f"temperature={config.temperature} thinking={config.thinking} streaming=False "
+            f"temperature={config.temperature} thinking={config.thinking} streaming={streaming} "
             f"timeout={config.timeout} max_retries={config.max_retries} validation_retries=1"
         )
         return config
 
-    image_config = make_config(args.vision_model, "zhangzongqi_image_extractor")
-    merge_config = make_config(args.text_model, "zhangzongqi_visit_merger")
+    image_config = make_config(args.vision_model, "zhangzongqi_image_extractor", streaming=False)
+    merge_config = make_config(args.text_model, "zhangzongqi_visit_merger", streaming=True)
     image_agent = TextExtractionAgent(image_config.build(), image_prompt)
     logger.debug(f"合并结果 schema={model_json_schema(MergedVisits).get('title')}")
     merge_agent = StructuredAgent.from_config(
