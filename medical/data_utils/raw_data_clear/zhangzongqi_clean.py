@@ -141,6 +141,7 @@ class PrescriptionItem(BaseModel):
 class VisitItem(BaseModel):
     """Cleaned fields for exactly one encounter."""
 
+    patient_name: str = ""
     patient_sex: str = ""
     is_first: str = ""
     see_doc_time: str = ""
@@ -236,6 +237,8 @@ def build_record(item: dict[str, Any], patient_name: str, visit_order: int) -> d
             continue
         if field == "marriage_history":
             record["is_marriage_history"] = clinical_text(item.get(field))
+        elif field == "patient_name":
+            record[field] = clinical_text(item.get(field)) or patient_name
         else:
             record[field] = clinical_text(item.get(field))
     record["doc_ass_stu_appeal"] = record["patient_appeal"]
