@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import filecmp
 import hashlib
 import json
 import os
@@ -48,8 +49,8 @@ logger.remove()
 logger.add(sys.stdout, format="{level} | {message}", level="INFO", colorize=False)
 
 
-DEFAULT_INPUT = PROJECT_ROOT / "medical/data/朴老病历943"
-DEFAULT_OUTPUT = PROJECT_ROOT / "medical/processed_data/doctor_朴老病历943"
+DEFAULT_INPUT = PROJECT_ROOT / "medical/data/二期南区/doctor_677_朴炳奎"
+DEFAULT_OUTPUT = PROJECT_ROOT / "medical/processed_data/doctor_677_朴炳奎"
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 PDF_SUFFIX = ".pdf"
 PIAO_IMAGE_PROMPT_PATH = PROJECT_ROOT / "medical/data_utils/prompts/piao_recordimg_clean.txt"
@@ -111,6 +112,23 @@ def record_belongs_to_pdf(record: dict[str, Any], pdf_path: Path) -> bool:
     return order_sn.startswith(current_prefix) or order_sn.startswith(legacy_prefix)
 
 
+def discover_pdf_paths(input_dir: Path, patient_root: Path) -> list[Path]:
+    """Find top-level PDFs and PDFs already archived in same-name patient folders."""
+    pdf_by_patient = {
+        path.stem: path
+        for path in input_dir.iterdir()
+        if path.is_file() and path.suffix.lower() == PDF_SUFFIX
+    }
+    if patient_root.is_dir():
+        for patient_dir in patient_root.iterdir():
+            if not patient_dir.is_dir():
+                continue
+            for path in patient_dir.iterdir():
+                if path.is_file() and path.suffix.lower() == PDF_SUFFIX and path.stem == patient_dir.name:
+                    pdf_by_patient.setdefault(patient_dir.name, path)
+    return sorted(pdf_by_patient.values(), key=lambda path: path.name.casefold())
+
+
 def convert_pdfs_to_images(
     input_dir: Path,
     *,
@@ -120,12 +138,10 @@ def convert_pdfs_to_images(
     patient_root: Path | None = None,
     pdftoppm: str = "pdftoppm",
 ) -> dict[Path, list[Path]]:
-    """Create one patient folder per PDF, copy the PDF there, and render its pages under img/."""
+    """Move each PDF into its patient folder and render pages under that folder's img/."""
     if pdf_paths is None:
-        pdf_paths = sorted(
-            (path for path in input_dir.iterdir() if path.is_file() and path.suffix.lower() == PDF_SUFFIX),
-            key=lambda path: path.name.lower(),
-        )
+        root = patient_root or input_dir
+        pdf_paths = discover_pdf_paths(input_dir, root)
     if limit is not None:
         pdf_paths = pdf_paths[:limit]
     if not pdf_paths:
@@ -139,7 +155,15 @@ def convert_pdfs_to_images(
         patient_dir.mkdir(parents=True, exist_ok=True)
         patient_pdf = patient_dir / pdf_path.name
         if pdf_path.resolve() != patient_pdf.resolve():
-            shutil.copy2(pdf_path, patient_pdf)
+            if patient_pdf.exists():
+                if not filecmp.cmp(pdf_path, patient_pdf, shallow=False):
+                    raise FileExistsError(f"同名患者文件夹中已有不同内容的 PDF，未覆盖: {patient_pdf}")
+                pdf_path.unlink()
+                logger.info(f"删除外层重复 PDF patient={patient_dir.name} pdf={pdf_path.name}")
+            else:
+                shutil.move(str(pdf_path), str(patient_pdf))
+                logger.info(f"PDF 已移入患者文件夹 patient={patient_dir.name} pdf={patient_pdf.name}")
+        pdf_path = patient_pdf
 
         image_dir = patient_dir / "img"
         image_dir.mkdir(parents=True, exist_ok=True)
@@ -228,8 +252,10 @@ def make_record(item: dict[str, Any], source_pdf: Path, visit_order: int, doctor
     else:
         date_key = re.sub(r"[^0-9A-Za-z-]", "", visit_date) or f"undated-{visit_order:03d}"
     order_sn = f"{source_pdf.stem}_{date_key}"
+    record["patient_id"] = source_pdf.stem
     record["order_sn"] = order_sn
     record["doctor_name"] = doctor_name
+    record["doctor_id"] = 677 
     for prescription_index, prescription in enumerate(record["ps"], start=1):
         prescription["order_sn"] = order_sn
         prescription["prescription_order_id"] = f"{order_sn}_p{prescription_index:02d}"
@@ -267,10 +293,8 @@ async def run(args: argparse.Namespace) -> int:
 
     target = args.output_dir / "medical_records_ai.jsonl"
     existing_records = read_existing_records(target)
-    pdf_paths = sorted(
-        (path for path in args.input_dir.iterdir() if path.is_file() and path.suffix.lower() == PDF_SUFFIX),
-        key=lambda path: path.name.lower(),
-    )
+    patient_root = args.patient_root or args.input_dir
+    pdf_paths = discover_pdf_paths(args.input_dir, patient_root)
     if args.limit is not None:
         pdf_paths = pdf_paths[: args.limit]
     if not pdf_paths:
@@ -365,12 +389,6 @@ async def run(args: argparse.Namespace) -> int:
         return 1
 
     extracted_by_path = dict(zip(all_images, extraction_results))
-    for pdf_path, pdf_images in images_by_pdf.items():
-        extracted = [extracted_by_path[image_path] for image_path in pdf_images]
-        raw_path = args.output_dir / f"{pdf_path.stem}_images.json"
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        raw_path.write_text(json.dumps(extracted, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
     logger.info("单图提取全部完成，开始按 PDF 分组生成时间窗口病史及处方")
 
     async def merge_pdf(pdf_path: Path, pdf_images: list[Path]) -> list[dict[str, Any]]:

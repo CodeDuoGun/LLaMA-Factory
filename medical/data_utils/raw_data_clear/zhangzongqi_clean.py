@@ -228,8 +228,10 @@ def build_record(item: dict[str, Any], patient_name: str, visit_order: int) -> d
             "inquiry_method": "门诊",
             "created_at": visit_date,
             "start_time": visit_date,
+            "stop_time": visit_date,
             "patient_name": patient_name,
             "doctor_name": "张宗岐",
+            "doctor_id": 168
         }
     )
     for field in VisitItem.model_fields:
