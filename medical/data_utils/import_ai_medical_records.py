@@ -19,7 +19,7 @@ import json
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
-
+from medical.utils.log import logger
 from medical.data_utils.ai_medical_records import (
     DEFAULT_TABLE_NAME,
     AIMedicalRecordRepository,
@@ -46,6 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     import_parser.add_argument("--batch-size", type=int, default=100)
+    import_parser.add_argument(
+        "--allow-no-ai",
+        "--allow-no-ai-fields",
+        dest="allow_no_ai_fields",
+        action="store_true",
+        help="允许写入不含 ai_ 字段的病历；默认跳过",
+    )
 
     migrate_parser = subparsers.add_parser(
         "add-treatment-principle-column",
@@ -91,12 +98,12 @@ def _print_json(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
 
 
-def _records_with_ai_fields(
-    records: Iterable[dict[str, Any]], skipped_count: list[int]
+def _records_for_import(
+    records: Iterable[dict[str, Any]], skipped_count: list[int], *, allow_no_ai_fields: bool = False
 ) -> Iterator[dict[str, Any]]:
-    """只传递至少包含一个 ai_ 字段的病历记录。"""
+    """默认只传递含 ai_ 字段的记录，显式允许时传递全部记录。"""
     for record in records:
-        if any(field.startswith("ai_") for field in record):
+        if allow_no_ai_fields or any(field.startswith("ai_") for field in record):
             yield record
             continue
 
@@ -108,10 +115,15 @@ def main() -> None:
     """运行导入或查询命令."""
     args = build_parser().parse_args()
     """
+PYTHONPATH=. python -m medical.data_utils.import_ai_medical_records import \
+  --input medical/processed_data/doctor_677_朴炳奎/medical_records_ai.jsonl \
+  --batch-size 100
+# 原始病历写入
     批量写入某医生数据到
 PYTHONPATH=. python -m medical.data_utils.import_ai_medical_records import \
-  --input medical/processed_data/doctor_二期总院_刘根尚/medical_records_ai.jsonl \
-  --batch-size 100
+  --input medical/processed_data/doctor_677_朴炳奎/medical_records_ai.jsonl \
+  --batch-size 100 \
+  --allow-no-ai
     """
     repository = AIMedicalRecordRepository(
         db_manager,
@@ -122,7 +134,9 @@ PYTHONPATH=. python -m medical.data_utils.import_ai_medical_records import \
         skipped_count = [0]
         repository.create_table()
         count = repository.batch_upsert_by_order_sn(
-            _records_with_ai_fields(iter_jsonl(args.input), skipped_count),
+            _records_for_import(
+                iter_jsonl(args.input), skipped_count, allow_no_ai_fields=args.allow_no_ai_fields
+            ),
             batch_size=args.batch_size,
         )
         print(

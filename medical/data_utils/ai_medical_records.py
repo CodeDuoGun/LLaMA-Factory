@@ -19,9 +19,11 @@ from collections.abc import Iterable, Iterator, Mapping
 from datetime import datetime
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from pathlib import Path
+import traceback
+from medical.utils.log import logger
 from typing import TYPE_CHECKING, Any
 
-from langchain_core.callbacks import usage
+
 from sqlalchemy import (
     JSON,
     BigInteger,
@@ -524,55 +526,57 @@ def format_drugs(
     if not drugs:
         return []
     result = []
+    try:
+        for drug in drugs:
+            drug_name = drug.get("drug_name", "") or drug.get("sub_drug_name", "") or drug.get("show_name", "")
+            if drug_process_name in ("饮片", "颗粒"):
+                spec_number = drug.get("spec_number", 1)
+                drug_number = drug.get("drug_num", 0)
+                if spec_number in (None, ""):
+                    spec_number = 1
+                if drug_number in (None, ""):
+                    drug_number = 0
+                try:
+                    origin_drug_num = Decimal(str(spec_number)) * Decimal(str(drug_number))
+                    rounded_drug_num = int(origin_drug_num.to_integral_value(rounding=ROUND_CEILING))
+                    origin_drug_num_float = float(origin_drug_num)
+                except (InvalidOperation, OverflowError, TypeError, ValueError) as exc:
+                    raise ValueError(f"药品数量无法转换为有效数字: {drug_name}") from exc
 
-    for drug in drugs:
-        drug_name = drug.get("drug_name", "") or drug.get("sub_drug_name", "") or drug.get("show_name", "")
-        if drug_process_name in ("饮片", "颗粒"):
-            spec_number = drug.get("spec_number", 1)
-            drug_number = drug.get("drug_num", 0)
-            if spec_number in (None, ""):
-                spec_number = 1
-            if drug_number in (None, ""):
-                drug_number = 0
-            try:
-                origin_drug_num = Decimal(str(spec_number)) * Decimal(str(drug_number))
-                rounded_drug_num = int(origin_drug_num.to_integral_value(rounding=ROUND_CEILING))
-                origin_drug_num_float = float(origin_drug_num)
-            except (InvalidOperation, OverflowError, TypeError, ValueError) as exc:
-                raise ValueError(f"药品数量无法转换为有效数字: {drug_name}") from exc
-
-            result.append(
-                {
+                result.append(
+                    {
+                        "drug_name": drug_name,
+                        "drug_num": rounded_drug_num,
+                        "origin_drug_num": origin_drug_num_float,
+                        "unit_name": "g",
+                        "max_use": drug.get("max_use", ""),
+                        "min_use": drug.get("min_use", ""),
+                        "decoction_name": drug.get("decoction_name", ""),
+                    },
+                )
+            elif drug_process_name in ("西药", "保健品", "中成药", "经验方"):
+                result.append(
+                    {
+                        "drug_name": drug_name,
+                        "drug_num": drug.get("drug_num", 0),
+                        "unit_name": drug.get("unit_name", "") or drug.get("unit", ""),
+                        "max_use": drug.get("max_use", ""),
+                        "min_use": drug.get("min_use", ""),
+                        "decoction_name": drug.get("decoction_name", ""),
+                    },
+                )
+            else:
+                # 不在这些类别中的药，需要进行单位转化
+                result.append({
                     "drug_name": drug_name,
-                    "drug_num": rounded_drug_num,
-                    "origin_drug_num": origin_drug_num_float,
-                    "unit_name": "g",
+                    "drug_num": float(drug.get("spec_number",1)) * int(drug.get("drug_num", 0)), # 规格转化系数
+                    "unit_name": "g", 
                     "max_use": drug.get("max_use", ""),
                     "min_use": drug.get("min_use", ""),
                     "decoction_name": drug.get("decoction_name", ""),
-                },
-            )
-        elif usage_type in ("西药", "保健品", "中成药", "经验方"):
-            result.append(
-                {
-                    "drug_name": drug_name,
-                    "drug_num": drug.get("drug_num", 0),
-                    "unit_name": drug.get("unit_name", "") or drug.get("unit", ""),
-                    "max_use": drug.get("max_use", ""),
-                    "min_use": drug.get("min_use", ""),
-                    "decoction_name": drug.get("decoction_name", ""),
-                },
-            )
-        else:
-            # 不在这些类别中的药，需要进行单位转化
-            result.append({
-                "drug_name": drug_name,
-                "drug_num": float(drug.get("spec_number",1)) * int(drug.get("drug_num", 0)), # 规格转化系数
-                "unit_name": "g", 
-                "max_use": drug.get("max_use", ""),
-                "min_use": drug.get("min_use", ""),
-                "decoction_name": drug.get("decoction_name", ""),
-            })
+                })
+    except Exception:
+        logger.error(f"drug ={drugs} err={traceback.format_exc()}")
     return result
 
 def format_ps(ps: list[dict[str, Any]]) -> list[dict[str, Any]]:

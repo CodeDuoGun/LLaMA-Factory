@@ -42,12 +42,11 @@ if TYPE_CHECKING:
     from medical.data_utils.structured_agent import StructuredAgent
 
 
-DEFAULT_INPUT = PROJECT_ROOT / "medical/data/二期南区/zhangzongqi"
+DEFAULT_INPUT = PROJECT_ROOT / "medical/data/二期南区/doctor_168_张宗岐"
 DEFAULT_OUTPUT = PROJECT_ROOT / "medical/processed_data/doctor_二期南区_张宗岐"
 PROMPT_PATH = PROJECT_ROOT / "medical/data_utils/prompts/zhangzongqi_recordimg_clean.txt"
 MERGE_PROMPT_PATH = PROJECT_ROOT / "medical/data_utils/prompts/zhangzongqi_record_merge_clean.txt"
 RECORD_RULES_PATH = PROJECT_ROOT / "medical/data_utils/prompts/record_clear.txt"
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 IMAGE_NAME = re.compile(r"^(\d+)(?:_mask)?$", re.IGNORECASE)
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 STRING_FIELDS = (
@@ -187,20 +186,6 @@ def load_prompts(image_path: Path = PROMPT_PATH, merge_path: Path = MERGE_PROMPT
     return image_prompt, merge_prompt
 
 
-def select_images(patient_dir: Path) -> list[Path]:
-    """Select the masked image first for each numeric sequence."""
-    selected: dict[int, Path] = {}
-    for path in sorted(patient_dir.iterdir(), key=lambda item: item.name.lower()):
-        match = IMAGE_NAME.fullmatch(path.stem)
-        if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES or not match:
-            continue
-        number = int(match.group(1))
-        current = selected.get(number)
-        if current is None or (path.stem.lower().endswith("_mask") and not current.stem.lower().endswith("_mask")):
-            selected[number] = path
-    return [selected[number] for number in sorted(selected)]
-
-
 def clinical_text(value: Any) -> str:
     """Keep clinical details readable in fields that expect strings."""
     if isinstance(value, str):
@@ -253,6 +238,12 @@ def build_record(item: dict[str, Any], patient_name: str, visit_order: int) -> d
         record[f"is_{field}_history"] = "是" if record[f"{field}_history"] else ""
     record["is_special"] = "是" if record["special_history"] else ""
     return record
+
+
+def record_belongs_to_pdf(record: dict[str, Any], pdf_path: Path) -> bool:
+    """Identify records created from the folder named after a PDF."""
+    patient_key = hashlib.sha256(pdf_path.stem.encode("utf-8")).hexdigest()[:12]
+    return str(record.get("order_sn") or "").startswith(f"zhangzongqi_{patient_key}_")
 
 
 async def call_model(agent: StructuredAgent[Any], content: Any, retries: int) -> dict[str, Any]:
@@ -313,7 +304,20 @@ class TextExtractionAgent:
 
 async def extract_image(agent: TextExtractionAgent, path: Path, retries: int) -> dict[str, Any]:
     sequence = int(IMAGE_NAME.fullmatch(path.stem).group(1))
-    logger.info(f"开始解析图片 patient={path.parent.name} sequence={sequence} image={path.name}")
+    patient_dir = path.parent.parent if path.parent.name == "img" else path.parent
+    source_pdf = next(
+        (
+            candidate
+            for candidate in sorted(patient_dir.iterdir(), key=lambda item: item.name.casefold())
+            if candidate.is_file() and candidate.suffix.lower() == ".pdf"
+        ),
+        None,
+    )
+    source_label = f"pdf={source_pdf.name}" if source_pdf else f"patient={path.parent.name}"
+    # print(source_label)
+    # if source_label != "pdf=18112026104115.pdf":
+    #     return
+    logger.info(f"开始解析图片 {source_label} sequence={sequence} image={path.name}")
     mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     content = [
@@ -330,7 +334,7 @@ async def extract_image(agent: TextExtractionAgent, path: Path, retries: int) ->
                 raise
             logger.warning(f"单图解析重试 sequence={sequence} image={path.name} attempt={attempt + 1}: {exc}")
             await asyncio.sleep(min(2**attempt, 8))
-    logger.info(f"单图解析结果 patient={path.parent.name} sequence={sequence} image={path.name}\n{result}")
+    logger.info(f"单图解析结果 {source_label} sequence={sequence} image={path.name}\n{result}")
     return {"image": path.name, "sequence": sequence, "extraction": result}
 
 
@@ -338,11 +342,11 @@ async def process_patient(
     image_agent: TextExtractionAgent,
     merge_agent: StructuredAgent[MergedVisits],
     patient_dir: Path,
+    images: list[Path],
     output_dir: Path,
     semaphore: asyncio.Semaphore,
     retries: int,
 ) -> list[dict[str, Any]]:
-    images = select_images(patient_dir)
     if not images:
         logger.warning(f"患者目录无可处理图片 patient={patient_dir.name}")
         return []
@@ -358,11 +362,12 @@ async def process_patient(
         json.dumps(extracted, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     logger.info(f"单图解析全部完成 patient={patient_dir.name} images={len(extracted)}，开始合并就诊窗口")
-    merged = await call_model(
-        merge_agent,
-        json.dumps({"patient_folder": patient_dir.name, "images": extracted}, ensure_ascii=False),
-        retries,
-    )
+    async with semaphore:
+        merged = await call_model(
+            merge_agent,
+            json.dumps({"patient_folder": patient_dir.name, "images": extracted}, ensure_ascii=False),
+            retries,
+        )
     if not isinstance(merged, dict) or not isinstance(merged.get("items"), list):
         raise ValueError(f"合并结果必须为包含 items 数组的 JSON 对象: {patient_dir.name}")
     if any(not isinstance(item, dict) for item in merged["items"]):
@@ -380,7 +385,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--patient", help="只处理指定患者文件夹；默认处理所有患者")
+    parser.add_argument("--limit", type=int, help="最多选择排序后的前 N 个 PDF")
+    parser.add_argument("--reclean", action="store_true", help="重新清洗已处理 PDF，并替换其旧病历")
+    parser.add_argument("--pdftoppm", default="pdftoppm", help="Poppler 的 pdftoppm 可执行文件")
+    parser.add_argument("--dpi", type=int, default=200, help="PDF 转图分辨率")
     parser.add_argument("--vision-model", default=default_model)
     parser.add_argument("--text-model", default=default_model)
     parser.add_argument("--base-url", default=os.getenv("DASHSCOPE_BASE_URL", BASE_URL))
@@ -392,23 +400,49 @@ def parse_args() -> argparse.Namespace:
 
 async def run(args: argparse.Namespace) -> int:
     from medical.data_utils.structured_agent import AgentModelConfig, StructuredAgent, model_json_schema
+    from medical.data_utils.raw_data_clear.piao_clean import (
+        convert_pdfs_to_images,
+        discover_pdf_paths,
+        read_existing_records,
+    )
 
-    if args.concurrency < 1 or args.retries < 0 or args.timeout <= 0:
-        raise ValueError("concurrency 和 timeout 必须为正数，retries 不能为负数")
+    if args.concurrency < 1 or args.retries < 0 or args.timeout <= 0 or args.dpi < 1:
+        raise ValueError("concurrency、timeout 和 dpi 必须为正数，retries 不能为负数")
+    if args.limit is not None and args.limit < 1:
+        raise ValueError("limit 必须为正整数")
+
+    target = args.output_dir / "medical_records_ai.jsonl"
+    existing_records = read_existing_records(target)
+    pdf_paths = discover_pdf_paths(args.input_dir, args.input_dir)
+    if args.limit is not None:
+        pdf_paths = pdf_paths[: args.limit]
+    if not pdf_paths:
+        raise ValueError(f"目录中没有可处理的 PDF 文件: {args.input_dir}")
+    if not args.reclean:
+        selected = [
+            pdf_path
+            for pdf_path in pdf_paths
+            if not any(record_belongs_to_pdf(record, pdf_path) for record in existing_records)
+        ]
+        skipped_count = len(pdf_paths) - len(selected)
+        if skipped_count:
+            logger.info(f"跳过已清洗 PDF count={skipped_count}，如需重跑请指定 --reclean")
+        pdf_paths = selected
+        if not pdf_paths:
+            logger.info("所选 PDF 均已清洗，无需处理")
+            return 0
+
     if not args.vision_model or not args.text_model:
         raise ValueError("请在 .env 中设置 MEDICAL_AGENT_MODEL，或通过 --vision-model 和 --text-model 指定模型")
     key = os.getenv("DASHSCOPE_API_KEY")
     if not key:
         raise ValueError("请设置 DASHSCOPE_API_KEY")
     image_prompt, merge_prompt = load_prompts()
-    if args.patient:
-        patient_dirs = [args.input_dir / args.patient]
-    else:
-        patient_dirs = sorted((path for path in args.input_dir.iterdir() if path.is_dir()), key=lambda path: path.name)
-    if not patient_dirs or any(not path.is_dir() for path in patient_dirs):
-        raise ValueError("未找到患者目录")
+    images_by_pdf = convert_pdfs_to_images(
+        args.input_dir, dpi=args.dpi, pdf_paths=pdf_paths, pdftoppm=args.pdftoppm
+    )
     logger.info(
-        f"开始张宗岐病历清洗 patients={len(patient_dirs)} concurrency={args.concurrency} "
+        f"开始张宗岐病历清洗 pdfs={len(images_by_pdf)} concurrency={args.concurrency} "
         f"vision_model={args.vision_model} text_model={args.text_model}"
     )
 
@@ -443,37 +477,50 @@ async def run(args: argparse.Namespace) -> int:
         validation_retries=1,
     )
     semaphore = asyncio.Semaphore(args.concurrency)
+    pdf_paths = list(images_by_pdf)
     results = await asyncio.gather(
         *(
             process_patient(
                 image_agent,
                 merge_agent,
-                patient_dir,
+                pdf_path.parent,
+                images_by_pdf[pdf_path],
                 args.output_dir,
                 semaphore,
                 args.retries,
             )
-            for patient_dir in patient_dirs
+            for pdf_path in pdf_paths
         ),
         return_exceptions=True,
     )
-    failures = [(path.name, result) for path, result in zip(patient_dirs, results) if isinstance(result, Exception)]
+    failures = [(path.name, result) for path, result in zip(pdf_paths, results) if isinstance(result, Exception)]
     for name, error in failures:
-        logger.error(f"患者清洗失败 patient={name}: {type(error).__name__}: {error}")
+        logger.error(f"PDF 清洗失败 pdf={name}: {type(error).__name__}: {error}")
     if failures:
-        logger.error(f"本次清洗失败 patients={len(failures)}/{len(patient_dirs)}，未覆盖最终 JSONL")
+        logger.error(f"本次清洗失败 pdfs={len(failures)}/{len(pdf_paths)}，未覆盖最终 JSONL")
         return 1
+
+    preserved_records = [
+        record
+        for record in existing_records
+        if not any(record_belongs_to_pdf(record, pdf_path) for pdf_path in pdf_paths)
+    ]
+    replaced_count = len(existing_records) - len(preserved_records)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    target = args.output_dir / "medical_records_ai.jsonl"
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=args.output_dir, prefix=".medical_records_", suffix=".jsonl", delete=False
     ) as stream:
         temporary = Path(stream.name)
+        for record in preserved_records:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
         for patient_records in results:
             for record in patient_records:
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
     temporary.replace(target)
-    logger.info(f"病历写入完成 path={target} records={sum(map(len, results))}")
+    logger.info(
+        f"病历写入完成 path={target} records={sum(map(len, results))} "
+        f"replaced_records={replaced_count} preserved_records={len(preserved_records)}"
+    )
     return 0
 
 

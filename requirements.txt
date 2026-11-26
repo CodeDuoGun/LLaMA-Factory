@@ -13,5 +13,8 @@ pymysql
 requests
 elasticsearch==8.17.1
 pandas
+numpy
+Pillow
+opencv-python-headless
 elasticsearch-dsl==8.17.1
 openpyxl

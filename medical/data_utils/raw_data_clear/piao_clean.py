@@ -30,6 +30,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
+from PIL import Image
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if __package__ in (None, ""):
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -42,11 +46,6 @@ from medical.data_utils.raw_data_clear.zhangzongqi_clean import (  # noqa: E402
     extract_image,
 )
 from medical.utils.log import logger  # noqa: E402
-
-# This cleaning run handles clinical text; keep logs local instead of forwarding
-# extracted content through the shared Redis logging sink.
-logger.remove()
-logger.add(sys.stdout, format="{level} | {message}", level="INFO", colorize=False)
 
 
 DEFAULT_INPUT = PROJECT_ROOT / "medical/data/二期南区/doctor_677_朴炳奎"
@@ -129,6 +128,40 @@ def discover_pdf_paths(input_dir: Path, patient_root: Path) -> list[Path]:
     return sorted(pdf_by_patient.values(), key=lambda path: path.name.casefold())
 
 
+def is_blank_image(
+    image: Image.Image,
+    gray_threshold: int = 200,
+    min_area: int = 8,
+    blank_ratio: float = 0.01,
+) -> bool:
+    """Identify scanned pages with too few meaningful dark pixels."""
+    gray = np.array(image.convert("L"))
+    _, binary = cv2.threshold(gray, gray_threshold, 255, cv2.THRESH_BINARY_INV)
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    valid_pixels = sum(
+        int(stats[index, cv2.CC_STAT_AREA])
+        for index in range(1, num_labels)
+        if stats[index, cv2.CC_STAT_AREA] >= min_area
+    )
+    print(valid_pixels / gray.size,(valid_pixels / gray.size) < blank_ratio)
+    return (valid_pixels / gray.size) < blank_ratio
+
+
+def empty_rendered_page_reason(path: Path) -> str | None:
+    """Return why a rendered PNG has no usable page content."""
+    if path.stat().st_size == 0:
+        return "图片文件为 0 字节"
+    try:
+        with Image.open(path) as image:
+            if image.width == 0 or image.height == 0:
+                return "图片尺寸为空"
+            if is_blank_image(image):
+                return "有效笔画像素占比低于空白阈值"
+    except OSError as error:
+        return f"图片无法解码：{type(error).__name__}"
+    return None
+
+
 def convert_pdfs_to_images(
     input_dir: Path,
     *,
@@ -207,7 +240,17 @@ def convert_pdfs_to_images(
                 raise RuntimeError(f"PDF 未生成页面图片: {pdf_path}")
 
             pdf_images: list[Path] = []
+            skipped_pages = 0
             for page_number, page_path in enumerate(rendered_pages, start=1):
+                skip_reason = empty_rendered_page_reason(page_path)
+                if skip_reason:
+                    skipped_pages += 1
+                    logger.warning(
+                        f"跳过 PDF 页面 patient={patient_dir.name} pdf={patient_pdf.name} "
+                        f"page={page_number} reason={skip_reason}"
+                    )
+                    page_path.unlink()
+                    continue
                 image_path = image_dir / f"{page_number:06d}.png"
                 page_path.replace(image_path)
                 pdf_images.append(image_path)
@@ -218,6 +261,11 @@ def convert_pdfs_to_images(
                         "source_pdf": pdf_path.name,
                         "page": page_number,
                     }
+                )
+            if not pdf_images:
+                raise RuntimeError(
+                    f"PDF 没有可用页面图片: patient={patient_dir.name} pdf={patient_pdf.name} "
+                    f"skipped_pages={skipped_pages}"
                 )
             images_by_pdf[pdf_path] = pdf_images
         current_images = {path.name for path in images_by_pdf[pdf_path]}
@@ -230,7 +278,7 @@ def convert_pdfs_to_images(
         temporary_manifest.replace(manifest_path)
         logger.info(
             f"PDF 转图完成 patient={patient_dir.name} pdf={patient_pdf} "
-            f"pages={len(images_by_pdf[pdf_path])} image_dir={image_dir}"
+            f"pages={len(images_by_pdf[pdf_path])} skipped_pages={skipped_pages} image_dir={image_dir}"
         )
 
     image_count = sum(len(images) for images in images_by_pdf.values())
@@ -393,6 +441,9 @@ async def run(args: argparse.Namespace) -> int:
 
     async def merge_pdf(pdf_path: Path, pdf_images: list[Path]) -> list[dict[str, Any]]:
         extracted = [extracted_by_path[image_path] for image_path in pdf_images]
+        logger.debug(f"pdf_path={pdf_path.name} 提取的全部内容为 {extracted}")
+        # import pdb
+        # pdb.set_trace()
         async with semaphore:
             merged = await call_model(
                 merge_agent,
