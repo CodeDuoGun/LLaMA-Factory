@@ -34,6 +34,9 @@ if __package__ in (None, ""):
 PROMPT_PATH = PROJECT_ROOT / "medical/prompts/zongyuan_cleaner.txt"
 EXTRACTION_PROMPT_PATH = PROJECT_ROOT / "medical/data_utils/prompts/extract_prompt.txt"
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+LIU_GENSHANG_DOCTOR_NAME = "刘根尚"
+LIU_GENSHANG_DOCTOR_ID = "820"
+LIU_GENSHANG_START_TIME_CUTOFF = datetime(2026, 2, 1)
 CLEANER_OUTPUT_FIELDS = (
     "patient_appeal",
     "new_medical_history",
@@ -132,8 +135,8 @@ def build_output_schema() -> type:
         marriage_history=(Literal["已婚", "未婚", ""], Field(..., description="婚姻状态")),
         birth_detail=(str, Field(..., description="明确的孕产或生育事实；无信息时为空字符串")),
         diagnosis_illness=(non_empty_text, Field(..., description="非空的西医诊断")),
-        diagnosis_sickness=(non_empty_text, Field(..., description="非空的中医病名")),
-        diagnosis_disease=(non_empty_text, Field(..., description="非空的中医证候")),
+        diagnosis_sickness=(str, Field(..., description="中医病名；无法判断时为空字符串")),
+        diagnosis_disease=(str, Field(..., description="中医证候；无法判断时为空字符串")),
         diagnosis_illness_reason=(non_empty_text, Field(..., description="西医诊断的来源或修正依据")),
         diagnosis_disease_reason=(non_empty_text, Field(..., description="中医证候的来源或修正依据")),
         diagnosis_sickness_reason=(non_empty_text, Field(..., description="中医病名的来源或修正依据")),
@@ -203,8 +206,8 @@ def _visit_time(record: dict[str, Any]) -> str:
     return _text(record.get("see_doc_time") or record.get("start_time") or record.get("created_at"))
 
 
-def _visit_datetime(record: dict[str, Any]) -> datetime | None:
-    value = _visit_time(record)
+def _parse_datetime(value: Any) -> datetime | None:
+    value = _text(value)
     if not value:
         return None
     normalized = value.replace("年", "-").replace("月", "-").replace("日", "")
@@ -218,6 +221,17 @@ def _visit_datetime(record: dict[str, Any]) -> datetime | None:
             except ValueError:
                 continue
     return None
+
+
+def _visit_datetime(record: dict[str, Any]) -> datetime | None:
+    return _parse_datetime(_visit_time(record))
+
+
+def _is_liu_genshang(record: dict[str, Any]) -> bool:
+    return (
+        _text(record.get("doctor_name")) == LIU_GENSHANG_DOCTOR_NAME
+        or _text(record.get("doctor_id")) == LIU_GENSHANG_DOCTOR_ID
+    )
 
 
 def _patient_key(record: dict[str, Any]) -> str:
@@ -581,10 +595,23 @@ async def clean_file(args: argparse.Namespace) -> int:
             raise ValueError(f"第 {line_number} 行必须是 JSON 对象；原文件未覆盖")
         records[line_number] = record
 
+    eligible_records: dict[int, dict[str, Any]] = {}
+    skipped_start_time_count = 0
+    for line_number, record in records.items():
+        start_time = _parse_datetime(record.get("start_time")) if _is_liu_genshang(record) else None
+        if start_time is not None and start_time.date() < LIU_GENSHANG_START_TIME_CUTOFF.date():
+            skipped_start_time_count += 1
+            print(
+                f"[跳过] 第 {line_number} 行：刘根尚医生 start_time={_text(record.get('start_time'))} "
+                "早于 2026-02-01"
+            )
+            continue
+        eligible_records[line_number] = record
+
     skip_ai_fields = not args.reclean
     line_numbers = []
     skipped_ai_count = 0
-    for line_number, record in records.items():
+    for line_number, record in eligible_records.items():
         ai_fields = get_ai_fields(record) if skip_ai_fields else []
         if ai_fields:
             skipped_ai_count += 1
@@ -602,7 +629,7 @@ async def clean_file(args: argparse.Namespace) -> int:
         for line_number in skipped_limit_lines:
             print(f"[跳过] 第 {line_number} 行：超出 --limit {args.limit} 条处理上限")
         line_numbers = line_numbers[: args.limit]
-    previous_contexts = build_previous_visit_contexts(records)
+    previous_contexts = build_previous_visit_contexts(eligible_records)
 
     target_lines: list[str] = []
     target_records: dict[int, dict[str, Any]] = {}
@@ -623,6 +650,7 @@ async def clean_file(args: argparse.Namespace) -> int:
 
     print(
         f"记录 {len(records)} 条，因已有 ai_* 字段跳过 {skipped_ai_count} 条，"
+        f"因刘根尚医生 start_time 早于 2026-02-01 跳过 {skipped_start_time_count} 条，"
         f"因 --limit 上限跳过 {skipped_limit_count} 条，"
         f"本次计划处理 {len(line_numbers)} 条"
     )
@@ -750,15 +778,15 @@ if __name__ == "__main__":
    medical/processed_data/doctor_二期总院_钱彦方/medical_records_ai.jsonl 
     # 批量跑
     PYTHONPATH=. python medical/data_utils/raw_data_clear/clear_zongyuan_withai.py \
-  --input "medical/processed_data/doctor_二期总院_杨宗艳/medical_records_ai.jsonl" \
+  --input "medical/processed_data/doctor_二期总院_刘根尚/medical_records_ai.jsonl" \
   --limit 10000 \
   --batchsize 6
 
     # 重新跑失败记录
     PYTHONPATH=. python medical/data_utils/raw_data_clear/clear_zongyuan_withai.py \
-    --input medical/processed_data/doctor_二期总院_杨宗艳/medical_records_ai_failed.jsonl \
-    --merge-target medical/processed_data/doctor_二期总院_杨宗艳/medical_records_ai.jsonl \
-    --failed-output medical/processed_data/doctor_二期总院_杨宗艳/medical_records_ai_failed_remaining.jsonl \
+    --input medical/processed_data/doctor_二期总院_刘根尚/medical_records_ai_failed.jsonl \
+    --merge-target medical/processed_data/doctor_二期总院_刘根尚/medical_records_ai.jsonl \
+    --failed-output medical/processed_data/doctor_二期总院_刘根尚/medical_records_ai_failed_remaining.jsonl \
     --reclean \
     --batchsize 3
     """

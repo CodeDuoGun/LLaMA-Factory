@@ -38,7 +38,7 @@ from medical.data_utils.raw_data_clear.clear_xiqu_records import normalize_numbe
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "medical/processed_data"
 DEFAULT_PHASE2_DATA_DIR = PROJECT_ROOT / "medical/data/二期总院"
-PHASE2_DOCTORS = {"冯春祥", "崔霞", "杨宗艳", "王素梅", "钱彦方"}
+PHASE2_DOCTORS = {"冯春祥", "崔霞", "杨宗艳", "王素梅", "钱彦方", "刘根尚"}
 DOCTOR_ID_BY_NAME = {doctor_name: doctor_id for doctor_id, doctor_name in DOCTORS_MAPPING.items()}
 PHASE2_RECORD_REQUIRED_COLUMNS = (
     "就诊ID",
