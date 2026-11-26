@@ -55,6 +55,32 @@ PDF_SUFFIX = ".pdf"
 PIAO_IMAGE_PROMPT_PATH = PROJECT_ROOT / "medical/data_utils/prompts/piao_recordimg_clean.txt"
 PIAO_MERGE_PROMPT_PATH = PROJECT_ROOT / "medical/data_utils/prompts/piao_record_merge_clean.txt"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+COMPOUND_DRUGS = {
+    "炒三仙": ("炒山楂", "炒神曲", "炒麦芽"),
+    "焦三仙": ("焦山楂", "焦神曲", "焦麦芽"),
+    "焦四仙": ("焦山楂", "焦神曲", "焦麦芽", "焦槟榔"),
+    "谷麦芽": ("谷芽", "麦芽"),
+    "炒谷麦芽": ("炒谷芽", "炒麦芽"),
+    "桃红": ("桃仁", "红花"),
+    "桃杏仁": ("桃仁", "杏仁"),
+    "二冬": ("天冬", "麦冬"),
+    "生熟地": ("生地黄", "熟地黄"),
+    "乳没": ("乳香", "没药"),
+    "醋乳没": ("醋乳香", "醋没药"),
+    "青陈皮": ("青皮", "陈皮"),
+    "羌独活": ("羌活", "独活"),
+    "姜枣": ("生姜", "大枣"),
+    "茅芦根": ("白茅根", "芦根"),
+    "芦茅根": ("白茅根", "芦根"),
+    "赤白芍": ("赤芍", "白芍"),
+    "苍白术": ("苍术", "白术"),
+    "炒苍白术": ("炒苍术", "炒白术"),
+}
+HEALTH_PRODUCT_DRUGS = frozenset({"参一胶囊", "益肺清化膏", "芪珍胶囊"})
+CHINESE_NUMERAL_TRANSLATION = str.maketrans(
+    "壹贰貳叁參肆伍陆陸柒捌玖拾佰仟萬億〇",
+    "一二二三三四五六六七八九十百千万亿零",
+)
 
 
 def load_prompts() -> tuple[str, str]:
@@ -286,6 +312,38 @@ def convert_pdfs_to_images(
     return images_by_pdf
 
 
+def normalize_drug_num(value: Any, *, compound: bool = False) -> str:
+    """Normalize financial Chinese numerals and per-drug dose prefixes."""
+    amount = ("" if value is None else str(value)).strip().translate(CHINESE_NUMERAL_TRANSLATION)
+    if compound:
+        amount = re.sub(r"^(?:各|或|每味|每种|均)\s*", "", amount)
+    return amount
+
+
+def postprocess_prescriptions(record: dict[str, Any]) -> dict[str, Any]:
+    """Expand compound drug names and normalize prescription metadata."""
+    for prescription in record.get("ps") or []:
+        items = prescription.get("prescription_items")
+        if not isinstance(items, dict) or not isinstance(items.get("drugList"), list):
+            continue
+        drugs = []
+        for drug in items["drugList"]:
+            if not isinstance(drug, dict):
+                drugs.append(drug)
+                continue
+            name = str(drug.get("drug_name") or "").strip()
+            names = COMPOUND_DRUGS.get(name)
+            amount = normalize_drug_num(drug.get("drug_num"), compound=bool(names))
+            if name in HEALTH_PRODUCT_DRUGS:
+                prescription["drug_process_name"] = "保健品"
+            if names:
+                drugs.extend({**drug, "drug_name": part, "drug_num": amount} for part in names)
+            else:
+                drugs.append({**drug, "drug_num": amount})
+        items["drugList"] = drugs
+    return record
+
+
 def make_record(item: dict[str, Any], source_pdf: Path, visit_order: int, doctor_name: str) -> dict[str, Any]:
     """Map one structured visit to the existing schema using PDF name and visit date as its order number."""
     record = {
@@ -307,7 +365,7 @@ def make_record(item: dict[str, Any], source_pdf: Path, visit_order: int, doctor
     for prescription_index, prescription in enumerate(record["ps"], start=1):
         prescription["order_sn"] = order_sn
         prescription["prescription_order_id"] = f"{order_sn}_p{prescription_index:02d}"
-    return record
+    return postprocess_prescriptions(record)
 
 
 def parse_args() -> argparse.Namespace:
